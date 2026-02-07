@@ -19,7 +19,7 @@ Why this exists:
 Status:
 - Early but functional prototype.
 - One script, two tuned configs, and local model assets present.
-- No automated tests yet.
+- Regression tests for release line `v1.1.x` now exist under `tests/`.
 - No threshold calibration/classification pipeline yet (scoring only).
 
 Latest known commit:
@@ -28,7 +28,11 @@ Latest known commit:
 ## 3) Repository Map
 
 Key files:
-- `binoculars_llamacpp.py`: main scoring CLI.
+- `binoculars.py`: main scoring CLI.
+- `binoculars.sh`: venv-activating wrapper that can be run from any directory.
+- `config.binoculars.json`: master profile map (`fast`/`long`) + default profile.
+- `tests/test_regression_v1_1_x.py`: regression checks for heatmap formatting and profile resolution behavior.
+- `tests/fixtures/Athens.md`: stable fixture copy used by regression tests.
 - `config.llama31.cuda12gb.fast.json`: default config for <= ~4096 tokens.
 - `config.llama31.cuda12gb.long.json`: safer long-doc config for <= ~8192 tokens.
 - `initial-scoping.md`: conversation-derived technical scoping, rationale, and tuning lessons.
@@ -40,7 +44,7 @@ Local assets (present on this machine):
 
 ## 4) How the Implementation Works
 
-High-level flow in `binoculars_llamacpp.py`:
+High-level flow in `binoculars.py`:
 1. Load JSON config and validate required sections (`observer`, `performer`).
 2. Read input markdown from file or stdin.
 3. Tokenize text with each model in `vocab_only=True` mode.
@@ -90,10 +94,7 @@ venv/bin/pip install numpy llama-cpp-python
 
 Run example:
 ```bash
-venv/bin/python binoculars_llamacpp.py \
-  --config config.llama31.cuda12gb.fast.json \
-  --input your_doc.md \
-  --json
+venv/bin/python binoculars.py --config fast your_doc.md --json
 ```
 
 ## 7) Output Contract
@@ -108,6 +109,12 @@ JSON output includes:
 
 Important:
 - The script returns scores only. No built-in thresholding/classification labels.
+
+Heatmap markdown output (`--heatmap`) includes:
+- In-text note indices that link to the `Notes Table` section.
+- A consolidated `Notes Table` with columns in this order:
+  `Index | Label | % contribution | Paragraph | logPPL | delta_vs_doc | delta_if_removed | Transitions | Chars | Tokens`.
+- Console heatmap output is terminal-oriented (ANSI colors + plain `[N]` note markers + line-drawing table), and strips markdown hard-break `\` markers before newlines for readability.
 
 ## 8) Lessons Learned / Gotchas
 
