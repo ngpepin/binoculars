@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import types
@@ -147,8 +148,8 @@ class TestRegressionV11X(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.binoculars.resolve_profile_config_path(str(master_cfg), "unknown")
 
-    def test_console_heatmap_rendering_format_v1_1_x(self):
-        text = "Para one.\\\nQuoted line.\n\nPara two.\n\nPara three."
+    def test_markdown_heatmap_strips_hardbreak_backslashes_v1_1_x(self):
+        text = "Para one.\\\nQuoted line.\n\nPara two.\\ \"Dialog\"\n\nPara three."
         spans = self.binoculars.split_markdown_paragraph_spans(text)
         self.assertEqual(len(spans), 3)
 
@@ -179,7 +180,7 @@ class TestRegressionV11X(unittest.TestCase):
             "rows": rows,
         }
 
-        out = self.binoculars.build_heatmap_output_console(
+        md = self.binoculars.build_heatmap_markdown(
             text=text,
             source_label="fixture.md",
             paragraph_profile=profile,
@@ -191,8 +192,66 @@ class TestRegressionV11X(unittest.TestCase):
             logxppl=2.5,
             xppl=12.182,
             binoculars_score=0.8,
-            force_color=False,
         )
+
+        self.assertNotIn("\\\n", md)
+        self.assertNotIn("\\ \"", md)
+        self.assertIn('"Dialog"', md)
+
+    def test_console_heatmap_rendering_format_v1_1_x(self):
+        text = "Para one.\\\nQuoted line.\n\nPara two.\\ \"Dialog\"\n\nPara three."
+        spans = self.binoculars.split_markdown_paragraph_spans(text)
+        self.assertEqual(len(spans), 3)
+
+        rows = []
+        logppls = [3.0, 1.0, 2.5]
+        deltas = [-0.2, 0.3, -0.1]
+        for i, (span, lp, d) in enumerate(zip(spans, logppls, deltas), start=1):
+            s, e = span
+            rows.append(
+                {
+                    "paragraph_id": i,
+                    "char_start": s,
+                    "char_end": e,
+                    "token_start": i * 10,
+                    "token_end": i * 10 + 5,
+                    "transitions": 5,
+                    "logPPL": float(lp),
+                    "delta_vs_doc_logPPL": float(lp - 2.0),
+                    "delta_doc_logPPL_if_removed": float(d),
+                }
+            )
+
+        profile = {
+            "unit": "paragraph",
+            "total_paragraphs": 3,
+            "paragraphs_with_transitions": 3,
+            "doc_logPPL": 2.0,
+            "rows": rows,
+        }
+
+        old_columns = os.environ.get("COLUMNS")
+        os.environ["COLUMNS"] = "100"
+        try:
+            out = self.binoculars.build_heatmap_output_console(
+                text=text,
+                source_label="fixture.md",
+                paragraph_profile=profile,
+                top_k=1,
+                observer_logppl=2.0,
+                observer_ppl=7.389,
+                performer_logppl=2.2,
+                performer_ppl=9.025,
+                logxppl=2.5,
+                xppl=12.182,
+                binoculars_score=0.8,
+                force_color=False,
+            )
+        finally:
+            if old_columns is None:
+                os.environ.pop("COLUMNS", None)
+            else:
+                os.environ["COLUMNS"] = old_columns
 
         self.assertIn("Notes Table", out)
         self.assertIn("[1]", out)
@@ -202,7 +261,11 @@ class TestRegressionV11X(unittest.TestCase):
         self.assertIn("└", out)
         self.assertNotIn("[[#Notes Table|", out)
         self.assertNotIn("\\\n", out)
+        self.assertNotIn("\\ \"", out)
+        self.assertNotIn("\n\n\n", out)
         self.assertNotIn("\x1b[", out)
+        for line in out.splitlines():
+            self.assertLessEqual(len(line), 85)
 
 
 if __name__ == "__main__":

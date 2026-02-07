@@ -23,6 +23,7 @@ import gc
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -666,7 +667,7 @@ def build_heatmap_output_markdown(
     out.append(f"- Observer logPPL: `{observer_logppl:.6f}` (PPL `{observer_ppl:.3f}`)")
     out.append(f"- Performer logPPL: `{performer_logppl:.6f}` (PPL `{performer_ppl:.3f}`)")
     out.append(f"- Cross logXPPL: `{logxppl:.6f}` (XPPL `{xppl:.3f}`)")
-    out.append(f"- Binoculars score B: `{binoculars_score:.6f}`")
+    out.append(f"- Binoculars score B (high is more human-like): `{binoculars_score:.6f}`")
     out.append(f"- Red sections: {len(low_rows)} lowest paragraph logPPL")
     out.append(f"- Green sections: {len(high_rows)} highest paragraph logPPL")
     out.append("")
@@ -679,9 +680,9 @@ def build_heatmap_output_markdown(
         s = row["char_start"]
         e = row["char_end"]
         if s > pos:
-            text_parts.append(text[pos:s])
+            text_parts.append(_normalize_console_text(text[pos:s]))
         ann = annotations.get(row["paragraph_id"])
-        seg = text[s:e]
+        seg = _normalize_console_text(text[s:e])
         if ann is None:
             text_parts.append(seg)
         else:
@@ -692,7 +693,7 @@ def build_heatmap_output_markdown(
             )
         pos = e
     if pos < len(text):
-        text_parts.append(text[pos:])
+        text_parts.append(_normalize_console_text(text[pos:]))
 
     out.append("".join(text_parts))
 
@@ -722,11 +723,74 @@ def build_heatmap_output_markdown(
 
 
 def _normalize_console_text(text: str) -> str:
-    # Remove markdown hard-break markers (backslash + newline) for cleaner terminal output.
-    return text.replace("\\\n", "\n")
+    # Normalize markdown hard-break markers for cleaner terminal output.
+    # Handles both backslash+newline and backslash+spaces patterns seen in prose/dialogue.
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"\\[ \t]*\n", "\n", t)
+    t = re.sub(r"(?<=\S)\\(?=\s)", "", t)
+    return t
 
 
-def _draw_console_table(headers: List[str], rows: List[List[str]]) -> str:
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _visible_len(s: str) -> int:
+    return len(ANSI_RE.sub("", s))
+
+
+def _wrap_ansi_line(line: str, width: int) -> List[str]:
+    if width <= 0 or _visible_len(line) <= width:
+        return [line]
+
+    tokens = re.findall(r"\S+\s*", line)
+    if not tokens:
+        return [line]
+
+    lines: List[str] = []
+    cur = ""
+    for tok in tokens:
+        if not cur:
+            cur = tok
+            continue
+        if _visible_len(cur) + _visible_len(tok) <= width:
+            cur += tok
+        else:
+            lines.append(cur.rstrip())
+            cur = tok.lstrip()
+    if cur:
+        lines.append(cur.rstrip())
+
+    return lines or [line]
+
+
+def _wrap_console_text(text: str, width: int) -> str:
+    out_lines: List[str] = []
+    for raw_line in text.split("\n"):
+        if raw_line.strip() == "":
+            if out_lines and out_lines[-1] != "":
+                out_lines.append("")
+            continue
+        out_lines.extend(_wrap_ansi_line(raw_line, width))
+    while out_lines and out_lines[-1] == "":
+        out_lines.pop()
+    return "\n".join(out_lines)
+
+
+def _console_target_width() -> int:
+    cols = shutil.get_terminal_size(fallback=(120, 24)).columns
+    target = int(cols * 0.85)
+    return max(72, target)
+
+
+def _truncate_cell(value: str, max_len: int) -> str:
+    if max_len <= 1:
+        return value[:max_len]
+    if len(value) <= max_len:
+        return value
+    return value[: max_len - 1] + "…"
+
+
+def _draw_console_table(headers: List[str], rows: List[List[str]], max_width: Optional[int] = None) -> str:
     widths: List[int] = []
     for idx, h in enumerate(headers):
         max_cell = len(h)
@@ -734,18 +798,38 @@ def _draw_console_table(headers: List[str], rows: List[List[str]]) -> str:
             max_cell = max(max_cell, len(row[idx]))
         widths.append(max_cell)
 
+    if max_width is not None:
+        # Minimal readable widths for compact heatmap table columns.
+        mins = [3, 3, 7, 4, 7, 7, 7]
+        total = sum(widths) + (3 * len(widths)) + 1
+        if total > max_width:
+            widths = [max(widths[i], mins[i]) for i in range(len(widths))]
+            total = sum(widths) + (3 * len(widths)) + 1
+            while total > max_width:
+                changed = False
+                for i in range(len(widths) - 1, -1, -1):
+                    if widths[i] > mins[i]:
+                        widths[i] -= 1
+                        total -= 1
+                        changed = True
+                        if total <= max_width:
+                            break
+                if not changed:
+                    break
+
     def border(left: str, mid: str, right: str, fill: str = "─") -> str:
         return left + mid.join(fill * (w + 2) for w in widths) + right
 
     def row_line(cells: List[str]) -> str:
         out_cells = []
         for i, c in enumerate(cells):
-            if i in {0, 3, 7}:  # index, paragraph, transitions
-                out_cells.append(c.rjust(widths[i]))
+            c_fmt = _truncate_cell(c, widths[i])
+            if i in {0, 3}:  # index, paragraph
+                out_cells.append(c_fmt.rjust(widths[i]))
             elif i in {4, 5, 6}:  # numeric score columns
-                out_cells.append(c.rjust(widths[i]))
+                out_cells.append(c_fmt.rjust(widths[i]))
             else:
-                out_cells.append(c.ljust(widths[i]))
+                out_cells.append(c_fmt.ljust(widths[i]))
         return "│ " + " │ ".join(out_cells) + " │"
 
     out: List[str] = []
@@ -756,6 +840,120 @@ def _draw_console_table(headers: List[str], rows: List[List[str]]) -> str:
         out.append(row_line(r))
     out.append(border("└", "┴", "┘"))
     return "\n".join(out)
+
+
+def _wrap_line(line: str, width: int) -> List[str]:
+    if len(line) <= width:
+        return [line]
+    words = re.findall(r"\S+\s*", line)
+    if not words:
+        return [line]
+    out: List[str] = []
+    cur = ""
+    for w in words:
+        if not cur:
+            cur = w
+            continue
+        if len(cur) + len(w) <= width:
+            cur += w
+        else:
+            out.append(cur.rstrip())
+            cur = w.lstrip()
+    if cur:
+        out.append(cur.rstrip())
+    return out
+
+
+def _format_summary_lines(lines: List[str], width: int) -> List[str]:
+    out: List[str] = []
+    for line in lines:
+        wrapped = _wrap_line(line, width)
+        out.extend(wrapped)
+    return out
+
+
+def _build_console_text_body(
+    text: str,
+    rows: List[Dict[str, Any]],
+    annotations: Dict[int, Dict[str, Any]],
+    red: str,
+    green: str,
+    reset: str,
+) -> str:
+    text_parts: List[str] = []
+    pos = 0
+    for row in sorted(rows, key=lambda r: r["char_start"]):
+        s = row["char_start"]
+        e = row["char_end"]
+        if s > pos:
+            text_parts.append(_normalize_console_text(text[pos:s]))
+        ann = annotations.get(row["paragraph_id"])
+        seg = _normalize_console_text(text[s:e])
+        if ann is None:
+            text_parts.append(seg)
+        else:
+            color = red if ann["label"] == "LOW" else green
+            text_parts.append(f"{color}{seg}{reset}[{ann['note_num']}]")
+        pos = e
+    if pos < len(text):
+        text_parts.append(_normalize_console_text(text[pos:]))
+    return "".join(text_parts)
+
+
+def _build_console_table_rows(endnotes: List[Dict[str, Any]]) -> List[List[str]]:
+    table_rows: List[List[str]] = []
+    for info in endnotes:
+        pct = info["pct_contribution"]
+        pct_str = f"{pct:+.2f}%" if np.isfinite(pct) else "n/a"
+        table_rows.append(
+            [
+                str(info["note_num"]),
+                info["label"],
+                pct_str,
+                str(info["paragraph_id"]),
+                f"{info['logPPL']:.6f}",
+                f"{info['delta_vs_doc_logPPL']:+.6f}",
+                f"{info['delta_doc_logPPL_if_removed']:+.6f}",
+            ]
+        )
+    return table_rows
+
+
+def _build_console_table(max_width: int, endnotes: List[Dict[str, Any]]) -> str:
+    headers = [
+        "Idx",
+        "Lbl",
+        "%Contrib",
+        "Para",
+        "logPPL",
+        "dDoc",
+        "dRm",
+    ]
+    table_rows = _build_console_table_rows(endnotes)
+    return _draw_console_table(headers, table_rows, max_width=max_width)
+
+
+def _build_summary_block(
+    observer_logppl: float,
+    observer_ppl: float,
+    performer_logppl: float,
+    performer_ppl: float,
+    logxppl: float,
+    xppl: float,
+    binoculars_score: float,
+    low_count: int,
+    high_count: int,
+    width: int,
+) -> List[str]:
+    lines = [
+        f"- Observer logPPL: {observer_logppl:.6f} (PPL {observer_ppl:.3f})",
+        f"- Performer logPPL: {performer_logppl:.6f} (PPL {performer_ppl:.3f})",
+        f"- Cross logXPPL: {logxppl:.6f} (XPPL {xppl:.3f})",
+        f"- Binoculars score B (high is more human-like): {binoculars_score:.6f}",
+        f"- Red sections: {low_count} lowest paragraph logPPL",
+        f"- Green sections: {high_count} highest paragraph logPPL",
+    ]
+    return _format_summary_lines(lines, width)
 
 
 def build_heatmap_output_console(
@@ -795,77 +993,45 @@ def build_heatmap_output_console(
     red = "\033[31m" if use_color else ""
     green = "\033[32m" if use_color else ""
     reset = "\033[0m" if use_color else ""
+    width = _console_target_width()
 
     out: List[str] = []
     out.append("Perplexity Heatmap")
     out.append("")
-    out.append(f"Source: {source_label}")
+    out.extend(_wrap_line(f"Source: {source_label}", width))
     out.append("")
     out.append("Summary")
-    out.append(f"- Observer logPPL: {observer_logppl:.6f} (PPL {observer_ppl:.3f})")
-    out.append(f"- Performer logPPL: {performer_logppl:.6f} (PPL {performer_ppl:.3f})")
-    out.append(f"- Cross logXPPL: {logxppl:.6f} (XPPL {xppl:.3f})")
-    out.append(f"- Binoculars score B: {binoculars_score:.6f}")
-    out.append(f"- Red sections: {len(low_rows)} lowest paragraph logPPL")
-    out.append(f"- Green sections: {len(high_rows)} highest paragraph logPPL")
+    out.extend(
+        _build_summary_block(
+            observer_logppl=observer_logppl,
+            observer_ppl=observer_ppl,
+            performer_logppl=performer_logppl,
+            performer_ppl=performer_ppl,
+            logxppl=logxppl,
+            xppl=xppl,
+            binoculars_score=binoculars_score,
+            low_count=len(low_rows),
+            high_count=len(high_rows),
+            width=width,
+        )
+    )
     out.append("")
     out.append("Text")
     out.append("")
 
-    text_parts: List[str] = []
-    pos = 0
-    for row in sorted(rows, key=lambda r: r["char_start"]):
-        s = row["char_start"]
-        e = row["char_end"]
-        if s > pos:
-            text_parts.append(_normalize_console_text(text[pos:s]))
-        ann = annotations.get(row["paragraph_id"])
-        seg = _normalize_console_text(text[s:e])
-        if ann is None:
-            text_parts.append(seg)
-        else:
-            color = red if ann["label"] == "LOW" else green
-            text_parts.append(f"{color}{seg}{reset}[{ann['note_num']}]")
-        pos = e
-    if pos < len(text):
-        text_parts.append(_normalize_console_text(text[pos:]))
-
-    out.append("".join(text_parts))
+    text_body = _build_console_text_body(
+        text=text,
+        rows=rows,
+        annotations=annotations,
+        red=red,
+        green=green,
+        reset=reset,
+    )
+    out.append(_wrap_console_text(text_body, width))
     out.append("")
     out.append("Notes Table")
     out.append("")
-
-    headers = [
-        "Index",
-        "Label",
-        "% contribution",
-        "Paragraph",
-        "logPPL",
-        "delta_vs_doc",
-        "delta_if_removed",
-        "Transitions",
-        "Chars",
-        "Tokens",
-    ]
-    table_rows: List[List[str]] = []
-    for info in endnotes:
-        pct = info["pct_contribution"]
-        pct_str = f"{pct:+.2f}%" if np.isfinite(pct) else "n/a"
-        table_rows.append(
-            [
-                str(info["note_num"]),
-                info["label"],
-                pct_str,
-                str(info["paragraph_id"]),
-                f"{info['logPPL']:.6f}",
-                f"{info['delta_vs_doc_logPPL']:+.6f}",
-                f"{info['delta_doc_logPPL_if_removed']:+.6f}",
-                str(info["transitions"]),
-                f"{info['char_start']}:{info['char_end']}",
-                f"{info['token_start']}:{info['token_end']}",
-            ]
-        )
-    out.append(_draw_console_table(headers, table_rows))
+    out.append(_build_console_table(max_width=width, endnotes=endnotes))
     out.append("")
 
     return "\n".join(out)
@@ -1151,7 +1317,7 @@ def run(
         f"Observer logPPL: {result['observer']['logPPL']:.6f}  PPL: {result['observer']['PPL']:.3f}\n"
         f"Performer logPPL: {result['performer']['logPPL']:.6f}  PPL: {result['performer']['PPL']:.3f}\n"
         f"Cross logXPPL: {result['cross']['logXPPL']:.6f}  XPPL: {result['cross']['XPPL']:.3f}\n"
-        f"Binoculars score B: {result['binoculars']['score']:.6f}\n"
+        f"Binoculars score B (high is more human-like): {result['binoculars']['score']:.6f}\n"
     )
     if (not as_json) and ("diagnostics" in result):
         hotspots = result["diagnostics"]["low_perplexity_spans"]["top_low_perplexity_hotspots"]

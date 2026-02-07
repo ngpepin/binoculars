@@ -114,7 +114,7 @@ Heatmap markdown output (`--heatmap`) includes:
 - In-text note indices that link to the `Notes Table` section.
 - A consolidated `Notes Table` with columns in this order:
   `Index | Label | % contribution | Paragraph | logPPL | delta_vs_doc | delta_if_removed | Transitions | Chars | Tokens`.
-- Console heatmap output is terminal-oriented (ANSI colors + plain `[N]` note markers + line-drawing table), and strips markdown hard-break `\` markers before newlines for readability.
+- Console heatmap output is terminal-oriented (ANSI colors + plain `[N]` note markers + line-drawing table), strips markdown hard-break `\` markers, collapses excessive blank lines, and wraps content to ~85% of terminal width.
 
 ## 8) Lessons Learned / Gotchas
 

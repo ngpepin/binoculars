@@ -104,6 +104,7 @@ Output behavior:
   - ANSI color highlights (red/green)
   - plain note markers like `[1]` (non-clickable)
   - notes table rendered with line-drawing characters
+  - wrapped to ~85% of terminal width with normalized spacing
 - Written to `<input_stem>_heatmap.md` in the same source directory
 - Previous file auto-backed up as `<name>.<timestamp>.bak`
 
