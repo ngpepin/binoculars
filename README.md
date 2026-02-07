@@ -108,6 +108,22 @@ Output behavior:
 - Written to `<input_stem>_heatmap.md` in the same source directory
 - Previous file auto-backed up as `<name>.<timestamp>.bak`
 
+## GUI Mode
+
+`--gui <file>` opens an interactive editor/analyzer window with:
+- Buttons: `Analyze`, `Save`, `Quit`
+- A one-line status bar starting with: `Binocular score B (high is more human-like): ...`
+- Paragraph heatmap coloring after each analysis:
+  - **Red** = lower paragraph logPPL (more AI-like)
+  - **Green** = higher paragraph logPPL (more human-like)
+- Hover tooltips on colored segments with the same stats shown in the notes table format
+- Edit tracking in **yellow** for changed text since last analysis
+
+Behavior:
+- `Analyze` scores the full current editor text, refreshes coloring/tooltips, clears yellow edit tags, and preserves cursor position.
+- `Save` writes `<stem>_edited_YYYYMMDDHHMM.md` in the source file directory.
+- `Quit` closes the window.
+
 ## Repository Layout
 
 - `binoculars.py`: main scoring CLI
@@ -187,6 +203,12 @@ Heatmap:
 ./binoculars.sh --config fast --input samples/Athens.md --heatmap --diagnose-top-k 8
 ```
 
+GUI editor:
+
+```bash
+./binoculars.sh --config fast --gui samples/Athens.md
+```
+
 Run from any directory:
 
 ```bash
@@ -203,6 +225,7 @@ cd ~
   - `--input INPUT`
 - Do not provide both at once.
 - If no input is provided, stdin is used (`-` behavior).
+- `--gui` is mutually exclusive with `--input`, positional `INPUT`, `--output`, `--json`, and `--heatmap`.
 
 ## Regression Tests (v1.1.x)
 

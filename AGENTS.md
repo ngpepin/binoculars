@@ -109,6 +109,7 @@ JSON output includes:
 
 Important:
 - The script returns scores only. No built-in thresholding/classification labels.
+- GUI mode (`--gui <file>`) opens an editor/analyzer window with Analyze/Save/Quit controls, status line updates, red/green heatmap highlighting, hover stats tooltips, and yellow edit-tracking until the next Analyze.
 
 Heatmap markdown output (`--heatmap`) includes:
 - In-text note indices that link to the `Notes Table` section.

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import difflib
 import gc
 import json
 import os
@@ -26,6 +27,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 
@@ -1064,16 +1066,14 @@ def backup_existing_file(path: str) -> Optional[str]:
 # Main pipeline
 # ----------------------------
 
-def run(
+def analyze_text_document(
     cfg_path: str,
-    input_path: Optional[str],
-    output_path: Optional[str],
-    as_json: bool,
+    text: str,
+    input_label: str,
     diagnose_paragraphs: bool,
     diagnose_top_k: int,
-    diagnose_print_text: bool,
-    heatmap: bool,
-) -> int:
+    need_paragraph_profile: bool,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
     cfg, tcfg, ccfg = load_config(cfg_path)
 
     observer_section = cfg["observer"]
@@ -1084,10 +1084,9 @@ def run(
     if not obs_path or not perf_path:
         raise ValueError("observer.model_path and performer.model_path are required.")
 
-    text = read_text(input_path)
     text_bytes = text.encode("utf-8", errors="replace")
 
-    # Tokenize with vocab_only model(s) to decide n_ctx and ensure tokenizer alignment
+    # Tokenize with vocab_only model(s) to decide n_ctx and ensure tokenizer alignment.
     tokens_obs = tokenize_with_vocab_only(obs_path, text_bytes, tcfg)
     tokens_obs = maybe_truncate_tokens(tokens_obs, tcfg.max_tokens)
 
@@ -1095,9 +1094,6 @@ def run(
     tokens_perf = maybe_truncate_tokens(tokens_perf, tcfg.max_tokens)
 
     if tokens_obs != tokens_perf:
-        # Strict behavior: refuse, because logits are position/token dependent.
-        # You can relax this by truncating to the common prefix length, but it's safer to fail.
-        # If you want prefix mode, implement common-prefix truncation here.
         raise ValueError(
             "Tokenizer mismatch: the two models do not tokenize the input identically. "
             "Use two models from the same family/tokenizer (e.g., base + instruct sibling)."
@@ -1109,7 +1105,6 @@ def run(
 
     needed_ctx = len(tokens)
 
-    # Cache directory
     if ccfg.dir:
         cache_dir = ccfg.dir
         ensure_dir(cache_dir)
@@ -1121,10 +1116,11 @@ def run(
     cache_dtype = np.float16 if ccfg.dtype == "float16" else np.float32
     logits1_path = os.path.join(cache_dir, "observer_logits.dat")
 
-    # ----------------------------
-    # 1) Load observer (M1), eval, compute logPPL, save logits to disk, unload
-    # ----------------------------
+    paragraph_profile: Optional[Dict[str, Any]] = None
+    diag_result: Optional[Dict[str, Any]] = None
+
     obs = None
+    perf = None
     try:
         n_ctx_obs = infer_n_ctx(observer_section, needed_ctx)
 
@@ -1141,14 +1137,12 @@ def run(
         obs.eval(tokens)
 
         n_vocab_obs = obs.n_vocab()
-        scores1 = obs.scores[:needed_ctx, :n_vocab_obs]  # view
-        # Compute logPPL from scores1 and tokens
+        scores1 = obs.scores[:needed_ctx, :n_vocab_obs]
         observer_losses = compute_transition_losses(scores1, tokens)
         logppl_obs = float(np.mean(observer_losses))
         ppl_obs = float(np.exp(logppl_obs))
 
-        paragraph_profile = None
-        if diagnose_paragraphs or heatmap:
+        if diagnose_paragraphs or need_paragraph_profile:
             paragraph_profile = compute_paragraph_profile(
                 text=text,
                 tcfg=tcfg,
@@ -1156,7 +1150,7 @@ def run(
                 tokens=tokens,
                 transition_losses=observer_losses,
             )
-        diag_result = None
+
         if diagnose_paragraphs and paragraph_profile is not None:
             rows = list(paragraph_profile.get("rows", []))
             rows.sort(key=lambda r: r["delta_doc_logPPL_if_removed"], reverse=True)
@@ -1169,21 +1163,14 @@ def run(
                 "top_low_perplexity_hotspots": rows[: max(1, int(diagnose_top_k))],
             }
 
-        # Save logits for positions 0..needed_ctx-2 (we only use up to N-2)
-        # (scores1 row i predicts token[i+1], last row unused for scoring)
         save_arr = scores1[:needed_ctx - 1, :n_vocab_obs]
         save_logits_memmap(logits1_path, save_arr, cache_dtype)
 
-    finally:
         close_llama(obs)
         del obs
         gc.collect()
+        obs = None
 
-    # ----------------------------
-    # 2) Load performer (M2), eval, compute logXPPL using saved M1 logits, unload
-    # ----------------------------
-    perf = None
-    try:
         n_ctx_perf = infer_n_ctx(performer_section, needed_ctx)
 
         perf_cfg = dict(performer_section)
@@ -1205,12 +1192,9 @@ def run(
                 "Binoculars cross-entropy requires aligned vocab."
             )
 
-        scores2 = perf.scores[:needed_ctx, :n_vocab_perf]  # view
-
-        # Optional: performer perplexity (informational)
+        scores2 = perf.scores[:needed_ctx, :n_vocab_perf]
         logppl_perf, ppl_perf = compute_logppl_from_scores(scores2, tokens)
 
-        # Load observer logits memmap and compute cross logXPPL
         logits1_mm = load_logits_memmap(
             logits1_path,
             shape=(needed_ctx - 1, n_vocab_obs),
@@ -1219,12 +1203,11 @@ def run(
         logxppl, xppl = compute_cross_logxppl(logits1_mm, scores2, tokens)
         del logits1_mm
 
-        # Binoculars ratio
         B = float(logppl_obs / logxppl) if logxppl != 0.0 else float("inf")
 
-        result = {
+        result: Dict[str, Any] = {
             "input": {
-                "path": input_path if input_path else "<stdin>",
+                "path": input_label,
                 "chars": len(text),
                 "tokens": len(tokens),
                 "transitions": len(tokens) - 1,
@@ -1256,53 +1239,22 @@ def run(
         }
         if diag_result is not None:
             result["diagnostics"] = {"low_perplexity_spans": diag_result}
-        if heatmap:
-            if as_json:
-                raise ValueError("--heatmap cannot be combined with --json.")
-            if paragraph_profile is None:
-                raise ValueError("Internal error: paragraph profile missing for heatmap generation.")
-            heatmap_md = build_heatmap_markdown(
-                text=text,
-                source_label=input_path if input_path else "<stdin>",
-                paragraph_profile=paragraph_profile,
-                top_k=diagnose_top_k,
-                observer_logppl=logppl_obs,
-                observer_ppl=ppl_obs,
-                performer_logppl=logppl_perf,
-                performer_ppl=ppl_perf,
-                logxppl=logxppl,
-                xppl=xppl,
-                binoculars_score=B,
-            )
-            heatmap_console = build_heatmap_output_console(
-                text=text,
-                source_label=input_path if input_path else "<stdin>",
-                paragraph_profile=paragraph_profile,
-                top_k=diagnose_top_k,
-                observer_logppl=logppl_obs,
-                observer_ppl=ppl_obs,
-                performer_logppl=logppl_perf,
-                performer_ppl=ppl_perf,
-                logxppl=logxppl,
-                xppl=xppl,
-                binoculars_score=B,
-            )
-            heatmap_path = infer_heatmap_output_path(input_path)
-            backup_path = backup_existing_file(heatmap_path)
-            if backup_path is not None:
-                print(f"[heatmap] backed up {heatmap_path} -> {backup_path}", file=sys.stderr)
-            with open(heatmap_path, "w", encoding="utf-8") as f:
-                f.write(heatmap_md)
-            print(heatmap_console)
-            print(f"[heatmap] wrote {heatmap_path}", file=sys.stderr)
-            return 0
+
+        return result, paragraph_profile
 
     finally:
+        close_llama(obs)
         close_llama(perf)
-        del perf
+        try:
+            del obs
+        except Exception:
+            pass
+        try:
+            del perf
+        except Exception:
+            pass
         gc.collect()
 
-        # Clean cache unless told to keep
         if not ccfg.keep:
             try:
                 if os.path.exists(logits1_path):
@@ -1311,6 +1263,404 @@ def run(
                 pass
             if temp_dir_ctx is not None:
                 temp_dir_ctx.cleanup()
+
+
+def launch_gui(cfg_path: str, gui_input_path: str, top_k: int) -> int:
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+    except Exception as exc:
+        raise ValueError("Tkinter is required for --gui mode but could not be imported.") from exc
+
+    src_path = os.path.abspath(gui_input_path)
+    if not os.path.isfile(src_path):
+        raise ValueError(f"--gui file not found: {src_path}")
+
+    with open(src_path, "r", encoding="utf-8") as f:
+        initial_text = f.read()
+
+    try:
+        root = tk.Tk()
+    except Exception as exc:
+        raise ValueError("Unable to start GUI window. Check your display environment.") from exc
+
+    root.title(f"Binoculars Editor - {os.path.basename(src_path)}")
+    root.geometry("1200x800")
+    root.configure(bg="#141414")
+
+    toolbar = tk.Frame(root, bg="#141414")
+    toolbar.pack(side="top", fill="x", padx=10, pady=8)
+
+    editor_frame = tk.Frame(root, bg="#141414")
+    editor_frame.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 8))
+
+    status_var = tk.StringVar(value="Ready. Press Analyze to score and highlight this document.")
+    status_label = tk.Label(
+        root,
+        textvariable=status_var,
+        anchor="w",
+        bg="#1f1f1f",
+        fg="#d9d9d9",
+        padx=8,
+        pady=6,
+    )
+    status_label.pack(side="bottom", fill="x")
+
+    text_widget = tk.Text(
+        editor_frame,
+        wrap="word",
+        undo=True,
+        bg="#101010",
+        fg="#efefef",
+        insertbackground="#efefef",
+        relief="flat",
+        padx=12,
+        pady=12,
+    )
+    scroll_y = tk.Scrollbar(editor_frame, orient="vertical", command=text_widget.yview)
+    text_widget.configure(yscrollcommand=scroll_y.set)
+    scroll_y.pack(side="right", fill="y")
+    text_widget.pack(side="left", fill="both", expand=True)
+
+    text_widget.tag_configure("edited", foreground="#ffd54f")
+
+    state: Dict[str, Any] = {
+        "baseline_text": initial_text,
+        "segment_tags": [],
+        "tooltip": None,
+        "pending_edit_job": None,
+        "internal_update": False,
+        "analyzing": False,
+        "progress_popup": None,
+    }
+
+    def current_text() -> str:
+        return text_widget.get("1.0", "end-1c")
+
+    def hide_tooltip() -> None:
+        tip = state.get("tooltip")
+        if tip is not None:
+            try:
+                tip.destroy()
+            except Exception:
+                pass
+            state["tooltip"] = None
+
+    def tooltip_text(info: Dict[str, Any]) -> str:
+        pct = info.get("pct_contribution", float("nan"))
+        pct_str = f"{pct:+.2f}%" if np.isfinite(pct) else "n/a"
+        return (
+            f"Index: {info['note_num']}\n"
+            f"Label: {info['label']}\n"
+            f"% contribution: {pct_str}\n"
+            f"Paragraph: {info['paragraph_id']}\n"
+            f"logPPL: {info['logPPL']:.6f}\n"
+            f"delta_vs_doc: {info['delta_vs_doc_logPPL']:+.6f}\n"
+            f"delta_if_removed: {info['delta_doc_logPPL_if_removed']:+.6f}\n"
+            f"Transitions: {info['transitions']}\n"
+            f"Chars: {info['char_start']}:{info['char_end']}\n"
+            f"Tokens: {info['token_start']}:{info['token_end']}"
+        )
+
+    def show_tooltip(event: Any, info: Dict[str, Any]) -> None:
+        hide_tooltip()
+        tip = tk.Toplevel(root)
+        tip.wm_overrideredirect(True)
+        tip.attributes("-topmost", True)
+        lbl = tk.Label(
+            tip,
+            text=tooltip_text(info),
+            justify="left",
+            bg="#202020",
+            fg="#f2f2f2",
+            bd=1,
+            relief="solid",
+            padx=8,
+            pady=6,
+        )
+        lbl.pack()
+        tip.geometry(f"+{event.x_root + 14}+{event.y_root + 12}")
+        state["tooltip"] = tip
+
+    def move_tooltip(event: Any) -> None:
+        tip = state.get("tooltip")
+        if tip is not None:
+            tip.geometry(f"+{event.x_root + 14}+{event.y_root + 12}")
+
+    def clear_segment_tags() -> None:
+        hide_tooltip()
+        for tag in state["segment_tags"]:
+            try:
+                text_widget.tag_remove(tag, "1.0", "end")
+                text_widget.tag_delete(tag)
+            except Exception:
+                pass
+        state["segment_tags"] = []
+
+    def apply_edited_diff() -> None:
+        state["pending_edit_job"] = None
+        if state["internal_update"]:
+            return
+        baseline = state["baseline_text"]
+        curr = current_text()
+        text_widget.tag_remove("edited", "1.0", "end")
+        if baseline == curr:
+            return
+        matcher = difflib.SequenceMatcher(a=baseline, b=curr, autojunk=False)
+        for op, _i1, _i2, j1, j2 in matcher.get_opcodes():
+            if op in {"replace", "insert"} and j2 > j1:
+                text_widget.tag_add("edited", f"1.0+{j1}c", f"1.0+{j2}c")
+        text_widget.tag_raise("edited")
+
+    def on_modified(_event: Any) -> None:
+        if state["internal_update"]:
+            text_widget.edit_modified(False)
+            return
+        if not text_widget.edit_modified():
+            return
+        text_widget.edit_modified(False)
+        pending = state.get("pending_edit_job")
+        if pending is not None:
+            try:
+                root.after_cancel(pending)
+            except Exception:
+                pass
+        state["pending_edit_job"] = root.after(80, apply_edited_diff)
+
+    def apply_heatmap_profile(profile: Dict[str, Any], observer_logppl: float) -> None:
+        clear_segment_tags()
+        rows = list(profile.get("rows", []))
+        if not rows:
+            return
+        _, _, annotations, _endnotes = _prepare_heatmap_annotations(
+            rows=rows,
+            top_k=top_k,
+            observer_logppl=observer_logppl,
+        )
+        for row in sorted(rows, key=lambda r: r["char_start"]):
+            ann = annotations.get(row["paragraph_id"])
+            if ann is None:
+                continue
+            tag = f"heat_seg_{ann['note_num']}"
+            start = f"1.0+{row['char_start']}c"
+            end = f"1.0+{row['char_end']}c"
+            color = "#ff6b6b" if ann["label"] == "LOW" else "#39d97f"
+            text_widget.tag_configure(tag, foreground=color)
+            text_widget.tag_add(tag, start, end)
+            text_widget.tag_bind(tag, "<Enter>", lambda e, info=dict(ann): show_tooltip(e, info))
+            text_widget.tag_bind(tag, "<Motion>", move_tooltip)
+            text_widget.tag_bind(tag, "<Leave>", lambda _e: hide_tooltip())
+            state["segment_tags"].append(tag)
+        text_widget.tag_raise("edited")
+
+    def set_controls(enabled: bool) -> None:
+        btn_state = "normal" if enabled else "disabled"
+        analyze_btn.configure(state=btn_state)
+        save_btn.configure(state=btn_state)
+        quit_btn.configure(state=btn_state)
+        text_widget.configure(state="normal" if enabled else "disabled")
+
+    def show_progress_popup() -> None:
+        popup = tk.Toplevel(root)
+        popup.title("Analyzing")
+        popup.transient(root)
+        popup.resizable(False, False)
+        popup.grab_set()
+        msg = tk.Label(
+            popup,
+            text="The text is being analyzed by the binoculars...",
+            padx=18,
+            pady=14,
+        )
+        msg.pack()
+        popup.update_idletasks()
+        x = root.winfo_rootx() + (root.winfo_width() // 2) - (popup.winfo_width() // 2)
+        y = root.winfo_rooty() + (root.winfo_height() // 2) - (popup.winfo_height() // 2)
+        popup.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        state["progress_popup"] = popup
+
+    def close_progress_popup() -> None:
+        popup = state.get("progress_popup")
+        if popup is None:
+            return
+        try:
+            popup.grab_release()
+        except Exception:
+            pass
+        try:
+            popup.destroy()
+        except Exception:
+            pass
+        state["progress_popup"] = None
+
+    def finish_analysis_error(message: str) -> None:
+        close_progress_popup()
+        state["analyzing"] = False
+        set_controls(True)
+        status_var.set(f"Analyze failed: {message}")
+        messagebox.showerror("Analyze Error", message)
+
+    def finish_analysis_success(
+        analyzed_text: str,
+        cursor_idx: str,
+        result: Dict[str, Any],
+        profile: Optional[Dict[str, Any]],
+    ) -> None:
+        close_progress_popup()
+        state["internal_update"] = True
+        try:
+            text_widget.tag_remove("edited", "1.0", "end")
+            if profile is not None:
+                apply_heatmap_profile(profile, result["observer"]["logPPL"])
+            state["baseline_text"] = analyzed_text
+            try:
+                text_widget.mark_set("insert", cursor_idx)
+                text_widget.see("insert")
+            except Exception:
+                pass
+            text_widget.edit_modified(False)
+        finally:
+            state["internal_update"] = False
+
+        status_var.set(
+            "Binocular score B (high is more human-like): "
+            f"{result['binoculars']['score']:.6f} | "
+            f"Observer logPPL: {result['observer']['logPPL']:.6f} | "
+            f"Performer logPPL: {result['performer']['logPPL']:.6f} | "
+            f"Cross logXPPL: {result['cross']['logXPPL']:.6f}"
+        )
+        state["analyzing"] = False
+        set_controls(True)
+
+    def on_analyze() -> None:
+        if state["analyzing"]:
+            return
+        analyzed_text = current_text()
+        cursor_idx = text_widget.index("insert")
+        state["analyzing"] = True
+        status_var.set("Analyzing current text...")
+        set_controls(False)
+        show_progress_popup()
+
+        def worker() -> None:
+            try:
+                result, profile = analyze_text_document(
+                    cfg_path=cfg_path,
+                    text=analyzed_text,
+                    input_label=src_path,
+                    diagnose_paragraphs=False,
+                    diagnose_top_k=top_k,
+                    need_paragraph_profile=True,
+                )
+            except Exception as exc:
+                root.after(0, lambda: finish_analysis_error(str(exc)))
+                return
+            root.after(0, lambda: finish_analysis_success(analyzed_text, cursor_idx, result, profile))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_save() -> None:
+        content = current_text()
+        src_dir = os.path.dirname(src_path) or "."
+        stem, _ext = os.path.splitext(os.path.basename(src_path))
+        stamp = datetime.now().strftime("%Y%m%d%H%M")
+        out_path = os.path.join(src_dir, f"{stem}_edited_{stamp}.md")
+        idx = 1
+        while os.path.exists(out_path):
+            idx += 1
+            out_path = os.path.join(src_dir, f"{stem}_edited_{stamp}_{idx}.md")
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        status_var.set(f"Saved edited file: {out_path}")
+
+    def on_quit() -> None:
+        if state.get("pending_edit_job") is not None:
+            try:
+                root.after_cancel(state["pending_edit_job"])
+            except Exception:
+                pass
+        hide_tooltip()
+        close_progress_popup()
+        root.destroy()
+
+    analyze_btn = tk.Button(toolbar, text="Analyze", command=on_analyze, width=12)
+    save_btn = tk.Button(toolbar, text="Save", command=on_save, width=12)
+    quit_btn = tk.Button(toolbar, text="Quit", command=on_quit, width=12)
+    analyze_btn.pack(side="left", padx=(0, 8))
+    save_btn.pack(side="left", padx=(0, 8))
+    quit_btn.pack(side="left")
+
+    state["internal_update"] = True
+    text_widget.insert("1.0", initial_text)
+    text_widget.edit_modified(False)
+    state["internal_update"] = False
+    text_widget.bind("<<Modified>>", on_modified)
+    text_widget.focus_set()
+    root.protocol("WM_DELETE_WINDOW", on_quit)
+    root.mainloop()
+    return 0
+
+
+def run(
+    cfg_path: str,
+    input_path: Optional[str],
+    output_path: Optional[str],
+    as_json: bool,
+    diagnose_paragraphs: bool,
+    diagnose_top_k: int,
+    diagnose_print_text: bool,
+    heatmap: bool,
+) -> int:
+    text = read_text(input_path)
+    result, paragraph_profile = analyze_text_document(
+        cfg_path=cfg_path,
+        text=text,
+        input_label=input_path if input_path else "<stdin>",
+        diagnose_paragraphs=diagnose_paragraphs,
+        diagnose_top_k=diagnose_top_k,
+        need_paragraph_profile=heatmap,
+    )
+
+    if heatmap:
+        if as_json:
+            raise ValueError("--heatmap cannot be combined with --json.")
+        if paragraph_profile is None:
+            raise ValueError("Internal error: paragraph profile missing for heatmap generation.")
+        heatmap_md = build_heatmap_markdown(
+            text=text,
+            source_label=input_path if input_path else "<stdin>",
+            paragraph_profile=paragraph_profile,
+            top_k=diagnose_top_k,
+            observer_logppl=result["observer"]["logPPL"],
+            observer_ppl=result["observer"]["PPL"],
+            performer_logppl=result["performer"]["logPPL"],
+            performer_ppl=result["performer"]["PPL"],
+            logxppl=result["cross"]["logXPPL"],
+            xppl=result["cross"]["XPPL"],
+            binoculars_score=result["binoculars"]["score"],
+        )
+        heatmap_console = build_heatmap_output_console(
+            text=text,
+            source_label=input_path if input_path else "<stdin>",
+            paragraph_profile=paragraph_profile,
+            top_k=diagnose_top_k,
+            observer_logppl=result["observer"]["logPPL"],
+            observer_ppl=result["observer"]["PPL"],
+            performer_logppl=result["performer"]["logPPL"],
+            performer_ppl=result["performer"]["PPL"],
+            logxppl=result["cross"]["logXPPL"],
+            xppl=result["cross"]["XPPL"],
+            binoculars_score=result["binoculars"]["score"],
+        )
+        heatmap_path = infer_heatmap_output_path(input_path)
+        backup_path = backup_existing_file(heatmap_path)
+        if backup_path is not None:
+            print(f"[heatmap] backed up {heatmap_path} -> {backup_path}", file=sys.stderr)
+        with open(heatmap_path, "w", encoding="utf-8") as f:
+            f.write(heatmap_md)
+        print(heatmap_console)
+        print(f"[heatmap] wrote {heatmap_path}", file=sys.stderr)
+        return 0
 
     out_str = json_dump(result) if as_json else (
         f"Tokens: {result['input']['tokens']} (transitions={result['input']['transitions']})\n"
@@ -1351,7 +1701,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Binoculars-style scoring for markdown text using two llama.cpp models loaded sequentially.",
         usage=(
-            "%(prog)s [--master-config FILE] [--config PROFILE] [--input INPUT | INPUT] "
+            "%(prog)s [--master-config FILE] [--config PROFILE] [--gui INPUT] [--input INPUT | INPUT] "
             "[--output OUTPUT] [--json] "
             "[--diagnose-paragraphs] [--diagnose-top-k N] [--diagnose-print-text] [--heatmap]"
         ),
@@ -1359,6 +1709,7 @@ def main() -> int:
             "Examples:\n"
             "  %(prog)s --config fast samples/Athens.md\n"
             "  %(prog)s --config=long --input samples/Athens.md --heatmap\n"
+            "  %(prog)s --config fast --gui samples/Athens.md\n"
             "  %(prog)s samples/Athens.md   # uses default profile from config.binoculars.json"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
@@ -1372,6 +1723,11 @@ def main() -> int:
         "--config",
         default=None,
         help="Config profile label from master config (for example: fast or long).",
+    )
+    ap.add_argument(
+        "--gui",
+        default=None,
+        help="Open interactive GUI editor/analyzer for the provided markdown file.",
     )
     ap.add_argument("--input", default=None, help="Markdown file to score, or '-' for stdin.")
     ap.add_argument(
@@ -1409,6 +1765,15 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
+        _, cfg_path = resolve_profile_config_path(args.master_config, args.config)
+
+        if args.gui is not None:
+            if args.input is not None or args.input_positional:
+                raise ValueError("When using --gui, provide the input file only via --gui.")
+            if args.output is not None or args.json or args.heatmap:
+                raise ValueError("--gui cannot be combined with --output, --json, or --heatmap.")
+            return launch_gui(cfg_path=cfg_path, gui_input_path=args.gui, top_k=args.diagnose_top_k)
+
         if args.input is not None and args.input_positional:
             raise ValueError("Provide input either as --input or positional INPUT, not both.")
 
@@ -1423,8 +1788,6 @@ def main() -> int:
                 )
         else:
             input_path = "-"
-
-        _, cfg_path = resolve_profile_config_path(args.master_config, args.config)
 
         return run(
             cfg_path=cfg_path,
