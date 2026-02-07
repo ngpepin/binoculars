@@ -1,0 +1,38 @@
+{
+  "text": {
+    "add_bos": true,
+    "special_tokens": false,
+    "max_tokens": 8192
+  },
+  "cache": {
+    "dir": "/var/tmp/binoculars_llama31_cache",
+    "dtype": "float16",
+    "keep": false
+  },
+  "observer": {
+    "model_path": "/home/npepin/Projects/binoculars/models/Meta-Llama-3.1-8B-Q5_K_M-GGUF/meta-llama-3.1-8b-q5_k_m.gguf",
+    "n_ctx": 0,
+    "n_gpu_layers": 999,
+    "offload_kqv": false,
+    "flash_attn": true,
+    "n_threads": 8,
+    "n_batch": 512,
+    "n_ubatch": 256,
+    "use_mmap": true,
+    "use_mlock": false,
+    "verbose": false
+  },
+  "performer": {
+    "model_path": "/home/npepin/Projects/binoculars/models/Meta-Llama-3.1-8B-Instruct-Q5_K_M-GGUF/meta-llama-3.1-8b-instruct-q5_k_m.gguf",
+    "n_ctx": 0,
+    "n_gpu_layers": 999,
+    "offload_kqv": false,
+    "flash_attn": true,
+    "n_threads": 8,
+    "n_batch": 512,
+    "n_ubatch": 256,
+    "use_mmap": true,
+    "use_mlock": false,
+    "verbose": false
+  }
+}
