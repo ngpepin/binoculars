@@ -148,6 +148,41 @@ class TestRegressionV11X(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.binoculars.resolve_profile_config_path(str(master_cfg), "unknown")
 
+    def test_master_profile_object_entry_with_max_tokens_override_v1_1_x(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            fast_cfg = tmp / "fast.json"
+            long_cfg = tmp / "long.json"
+            master_cfg = tmp / "config.binoculars.json"
+
+            fast_cfg.write_text("{}", encoding="utf-8")
+            long_cfg.write_text("{}", encoding="utf-8")
+            master_cfg.write_text(
+                json.dumps(
+                    {
+                        "default": "fast",
+                        "profiles": {
+                            "fast": {
+                                "path": str(fast_cfg),
+                                "max_tokens": 1234,
+                            },
+                            "long": str(long_cfg),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            label, path, max_tokens = self.binoculars.resolve_profile_config(str(master_cfg), "fast")
+            self.assertEqual(label, "fast")
+            self.assertEqual(path, str(fast_cfg))
+            self.assertEqual(max_tokens, 1234)
+
+            label, path, max_tokens = self.binoculars.resolve_profile_config(str(master_cfg), "long")
+            self.assertEqual(label, "long")
+            self.assertEqual(path, str(long_cfg))
+            self.assertIsNone(max_tokens)
+
     def test_markdown_heatmap_strips_hardbreak_backslashes_v1_1_x(self):
         text = "Para one.\\\nQuoted line.\n\nPara two.\\ \"Dialog\"\n\nPara three."
         spans = self.binoculars.split_markdown_paragraph_spans(text)
@@ -266,6 +301,53 @@ class TestRegressionV11X(unittest.TestCase):
         self.assertNotIn("\x1b[", out)
         for line in out.splitlines():
             self.assertLessEqual(len(line), 85)
+
+    def test_changed_span_helper_v1_1_x(self):
+        self.assertEqual(
+            self.binoculars.changed_span_in_new_text("abcdef", "abcXdef"),
+            (3, 4),
+        )
+        self.assertEqual(
+            self.binoculars.changed_span_in_new_text("abcdef", "abdef"),
+            (2, 2),
+        )
+        self.assertEqual(
+            self.binoculars.changed_span_in_new_text("abcdef", "abXYdef"),
+            (2, 4),
+        )
+        self.assertEqual(
+            self.binoculars.changed_span_in_new_text("same", "same"),
+            (0, 0),
+        )
+
+    def test_spellcheck_helpers_v1_1_x(self):
+        dictionary = {
+            "hello",
+            "world",
+            "and",
+            "don't",
+            "co",
+            "operate",
+            "state",
+            "of",
+            "the",
+            "art",
+            "alpha",
+            "beta",
+        }
+
+        self.assertTrue(self.binoculars.is_word_spelled_correctly("hello", dictionary))
+        self.assertTrue(self.binoculars.is_word_spelled_correctly("DON'T", dictionary))
+        self.assertTrue(self.binoculars.is_word_spelled_correctly("state-of-the-art", dictionary))
+        self.assertTrue(self.binoculars.is_word_spelled_correctly("alpha/beta", dictionary))
+        self.assertTrue(self.binoculars.is_word_spelled_correctly("logPPL", dictionary))
+
+        self.assertFalse(self.binoculars.is_word_spelled_correctly("helo", dictionary))
+        self.assertFalse(self.binoculars.is_word_spelled_correctly("wrld", dictionary))
+
+        spans = self.binoculars.find_misspelled_spans("hello wrld and helo", dictionary)
+        words = ["hello wrld and helo"[s:e] for s, e in spans]
+        self.assertEqual(words, ["wrld", "helo"])
 
 
 if __name__ == "__main__":

@@ -111,8 +111,10 @@ Output behavior:
 ## GUI Mode
 
 `--gui <file>` opens an interactive editor/analyzer window with:
-- Buttons: `Analyze`, `Save`, `Quit`
+- Buttons: `Analyze`, `Save`, `Clear Priors`, `Quit`
 - A one-line status bar starting with: `Binocular score B (high is more human-like): ...`
+- Always-on English spell checking with red underlined misspellings (runs on open and while editing)
+- A right-side pane (~1/3 width) that renders the current text as markdown in real time (non-heatmap-colored preview)
 - Paragraph heatmap coloring after each analysis:
   - **Red** = lower paragraph logPPL (more AI-like)
   - **Green** = higher paragraph logPPL (more human-like)
@@ -120,8 +122,10 @@ Output behavior:
 - Edit tracking in **yellow** for changed text since last analysis
 
 Behavior:
-- `Analyze` scores the full current editor text, refreshes coloring/tooltips, clears yellow edit tags, and preserves cursor position.
+- Before `Analyze` runs, current red/green analysis highlights and current yellow edits are converted into faint background priors (red/green/yellow) so deltas remain visible.
+- `Analyze` scores the full current editor text, refreshes foreground coloring/tooltips, clears yellow edit tags, preserves cursor position, and updates status with `new` plus `[prior: ...]`.
 - `Save` writes `<stem>_edited_YYYYMMDDHHMM.md` in the source file directory.
+- `Clear Priors` removes only faint prior background highlights and keeps current foreground highlights.
 - `Quit` closes the window.
 
 ## Repository Layout
@@ -153,14 +157,20 @@ If using NVIDIA CUDA and you need GPU-enabled wheels, install `llama-cpp-python`
 
 ## Configuration Model
 
-Master config (`config.binoculars.json`) maps profile labels to concrete config files:
+Master config (`config.binoculars.json`) maps profile labels to concrete config files and can override the token cap per profile:
 
 ```json
 {
   "default": "fast",
   "profiles": {
-    "fast": "/home/npepin/Projects/binoculars/config.llama31.cuda12gb.fast.json",
-    "long": "/home/npepin/Projects/binoculars/config.llama31.cuda12gb.long.json"
+    "fast": {
+      "path": "/home/npepin/Projects/binoculars/config.llama31.cuda12gb.fast.json",
+      "max_tokens": 4096
+    },
+    "long": {
+      "path": "/home/npepin/Projects/binoculars/config.llama31.cuda12gb.long.json",
+      "max_tokens": 8192
+    }
   }
 }
 ```
@@ -168,7 +178,9 @@ Master config (`config.binoculars.json`) maps profile labels to concrete config 
 Notes:
 - `default` is used when `--config` is omitted.
 - `--config` takes the profile label (`fast` or `long`), not a JSON filepath.
+- `profiles.<label>.max_tokens` overrides `text.max_tokens` from the profile JSON for both CLI and GUI runs (`0` means uncapped/truncate disabled).
 - If you move the repo, update absolute paths in `config.binoculars.json`.
+- Backward compatibility: legacy string entries (`"fast": "/path/to/config.json"`) are still supported.
 
 ## Usage
 
@@ -255,5 +267,5 @@ Optional:
 
 - Tokenizer/vocab mismatch between models is a hard failure by design.
 - Long contexts can be expensive in memory due to `logits_all=True` and large vocab.
-- `text.max_tokens` in profile configs is the main control for context/memory pressure.
+- `max_tokens` in the selected master profile (or fallback `text.max_tokens` in the profile JSON) is the main control for context/memory pressure.
 - Use detector outputs as risk signals, not standalone judgments.

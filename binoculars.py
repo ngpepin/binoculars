@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
-import difflib
 import gc
 import json
 import os
@@ -29,7 +28,7 @@ import sys
 import tempfile
 import threading
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List, Set
 
 import numpy as np
 from llama_cpp import Llama
@@ -38,6 +37,121 @@ from llama_cpp import Llama
 # ----------------------------
 # Utilities
 # ----------------------------
+
+SPELL_WORD_RE = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)*(?:[-/][A-Za-z]+(?:['’][A-Za-z]+)*)*")
+_ENGLISH_WORDLIST_PATHS = [
+    "/usr/share/dict/american-english",
+    "/usr/share/dict/british-english",
+    "/usr/share/dict/words",
+    "/usr/dict/words",
+]
+_ENGLISH_WORDS_CACHE: Optional[Set[str]] = None
+
+
+def load_english_words() -> Set[str]:
+    global _ENGLISH_WORDS_CACHE
+    if _ENGLISH_WORDS_CACHE is not None:
+        return _ENGLISH_WORDS_CACHE
+
+    words: Set[str] = set()
+    for path in _ENGLISH_WORDLIST_PATHS:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for raw in f:
+                    w = raw.strip()
+                    if not w or w.startswith("#"):
+                        continue
+                    words.add(w.lower())
+        except Exception:
+            continue
+
+    # Minimal fallback so spellcheck remains functional even when system dictionaries are absent.
+    if not words:
+        words = {
+            "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have", "he",
+            "in", "is", "it", "of", "on", "or", "that", "the", "to", "was", "were", "with", "you",
+            "i", "we", "they", "this", "not", "but", "if", "then", "their", "there", "his", "her",
+        }
+
+    _ENGLISH_WORDS_CACHE = words
+    return _ENGLISH_WORDS_CACHE
+
+
+def _word_candidates(word: str) -> Set[str]:
+    w = word.replace("’", "'").lower()
+    out: Set[str] = {w}
+    if w.endswith("'s") and len(w) > 2:
+        out.add(w[:-2])
+    if w.endswith("s'") and len(w) > 2:
+        out.add(w[:-1])
+    if w.endswith("in'") and len(w) > 3:
+        out.add(w[:-1] + "g")
+    return {c for c in out if c}
+
+
+def is_word_spelled_correctly(word: str, dictionary: Set[str]) -> bool:
+    if not word:
+        return True
+    if any(ch.isdigit() for ch in word):
+        return True
+
+    normalized = word.replace("’", "'")
+    if normalized.isupper() and len(normalized) <= 6:
+        return True
+    if re.search(r"[a-z][A-Z]|[A-Z][a-z].*[A-Z]", normalized):
+        # Likely identifier/acronym-like token.
+        return True
+
+    parts = re.split(r"[-/]", normalized)
+    for part in parts:
+        if not part:
+            continue
+        if len(part) <= 1:
+            continue
+        candidates = _word_candidates(part)
+        if not any(c in dictionary for c in candidates):
+            return False
+    return True
+
+
+def find_misspelled_spans(text: str, dictionary: Set[str]) -> List[Tuple[int, int]]:
+    spans: List[Tuple[int, int]] = []
+    if not dictionary:
+        return spans
+    for m in SPELL_WORD_RE.finditer(text):
+        tok = m.group(0)
+        if not is_word_spelled_correctly(tok, dictionary):
+            spans.append((m.start(), m.end()))
+    return spans
+
+
+def changed_span_in_new_text(old_text: str, new_text: str) -> Tuple[int, int]:
+    """
+    Return the changed span [start, end) within new_text between two versions.
+    If there is no insertion/replacement content in new_text (for example pure deletion),
+    end can equal start.
+    """
+    if old_text == new_text:
+        return (0, 0)
+
+    old_len = len(old_text)
+    new_len = len(new_text)
+
+    start = 0
+    common_prefix = min(old_len, new_len)
+    while start < common_prefix and old_text[start] == new_text[start]:
+        start += 1
+
+    old_end = old_len
+    new_end = new_len
+    while old_end > start and new_end > start and old_text[old_end - 1] == new_text[new_end - 1]:
+        old_end -= 1
+        new_end -= 1
+
+    return (start, new_end)
+
 
 def logsumexp_1d(x: np.ndarray) -> float:
     """Stable logsumexp for 1D array."""
@@ -117,7 +231,7 @@ def default_master_config_path() -> str:
     return os.path.join(script_dir, "config.binoculars.json")
 
 
-def load_master_config(path: str) -> Tuple[str, Dict[str, str]]:
+def load_master_config_detailed(path: str) -> Tuple[str, Dict[str, Dict[str, Any]]]:
     with open(path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
@@ -129,12 +243,40 @@ def load_master_config(path: str) -> Tuple[str, Dict[str, str]]:
     if not isinstance(profiles_raw, dict) or not profiles_raw:
         raise ValueError("Master config must contain a non-empty 'profiles' object.")
 
-    profiles: Dict[str, str] = {}
-    for label, p in profiles_raw.items():
+    profiles: Dict[str, Dict[str, Any]] = {}
+    for label, entry_raw in profiles_raw.items():
         key = str(label).strip()
-        val = str(p).strip()
-        if key and val:
-            profiles[key] = val
+        if not key:
+            continue
+
+        cfg_path = ""
+        max_tokens_override: Optional[int] = None
+
+        if isinstance(entry_raw, str):
+            cfg_path = entry_raw.strip()
+        elif isinstance(entry_raw, dict):
+            cfg_path = str(entry_raw.get("path", "")).strip()
+            if "max_tokens" in entry_raw and entry_raw.get("max_tokens") is not None:
+                try:
+                    max_tokens_override = int(entry_raw.get("max_tokens"))
+                except Exception as exc:
+                    raise ValueError(
+                        f"Master config profile '{key}' has invalid max_tokens={entry_raw.get('max_tokens')!r}."
+                    ) from exc
+                if max_tokens_override < 0:
+                    raise ValueError(
+                        f"Master config profile '{key}' has max_tokens={max_tokens_override}; expected >= 0."
+                    )
+        else:
+            continue
+
+        if not cfg_path:
+            continue
+
+        entry: Dict[str, Any] = {"path": cfg_path}
+        if max_tokens_override is not None:
+            entry["max_tokens"] = max_tokens_override
+        profiles[key] = entry
 
     if not profiles:
         raise ValueError("Master config 'profiles' has no valid entries.")
@@ -150,22 +292,48 @@ def load_master_config(path: str) -> Tuple[str, Dict[str, str]]:
     return default_label, profiles
 
 
+def load_master_config(path: str) -> Tuple[str, Dict[str, str]]:
+    default_label, profiles_detailed = load_master_config_detailed(path)
+    profiles: Dict[str, str] = {label: str(entry["path"]) for label, entry in profiles_detailed.items()}
+    return default_label, profiles
+
+
 def resolve_profile_config_path(master_cfg_path: str, profile_label: Optional[str]) -> Tuple[str, str]:
+    label, cfg_path, _max_tokens_override = resolve_profile_config(master_cfg_path, profile_label)
+    return label, cfg_path
+
+
+def resolve_profile_config(
+    master_cfg_path: str,
+    profile_label: Optional[str],
+) -> Tuple[str, str, Optional[int]]:
     if not os.path.isfile(master_cfg_path):
         raise ValueError(f"Master config file not found: {master_cfg_path}")
 
-    default_label, profiles = load_master_config(master_cfg_path)
-    label = (profile_label or "").strip() or default_label
-    if label not in profiles:
+    default_label, profiles = load_master_config_detailed(master_cfg_path)
+    selected_label = (profile_label or "").strip() or default_label
+    if selected_label not in profiles:
         raise ValueError(
-            f"Unknown --config profile '{label}'. Available profiles: {', '.join(sorted(profiles.keys()))}"
+            f"Unknown --config profile '{selected_label}'. Available profiles: {', '.join(sorted(profiles.keys()))}"
         )
 
-    cfg_path = profiles[label]
+    selected = profiles[selected_label]
+    cfg_path = str(selected["path"])
     if not os.path.isfile(cfg_path):
-        raise ValueError(f"Config profile '{label}' points to missing file: {cfg_path}")
+        raise ValueError(f"Config profile '{selected_label}' points to missing file: {cfg_path}")
 
-    return label, cfg_path
+    max_tokens_override_raw = selected.get("max_tokens")
+    max_tokens_override: Optional[int]
+    if max_tokens_override_raw is None:
+        max_tokens_override = None
+    else:
+        max_tokens_override = int(max_tokens_override_raw)
+        if max_tokens_override < 0:
+            raise ValueError(
+                f"Config profile '{selected_label}' has max_tokens={max_tokens_override}; expected >= 0."
+            )
+
+    return selected_label, cfg_path, max_tokens_override
 
 
 def load_config(path: str) -> Tuple[Dict[str, Any], TextConfig, CacheConfig]:
@@ -234,6 +402,40 @@ def maybe_truncate_tokens(tokens: List[int], max_tokens: int) -> List[int]:
         # Keep the first max_tokens tokens (simple truncation).
         return tokens[:max_tokens]
     return tokens
+
+
+def estimate_char_end_for_token_limit(
+    text: str,
+    model: Llama,
+    tcfg: TextConfig,
+    token_limit: int,
+) -> int:
+    """
+    Return the largest character offset such that tokenizing text[:offset]
+    yields at most token_limit tokens (under current tokenizer settings).
+    """
+    if token_limit <= 0:
+        return len(text)
+    if not text:
+        return 0
+
+    lo = 0
+    hi = len(text)
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        prefix_tokens = model.tokenize(
+            text[:mid].encode("utf-8", errors="replace"),
+            add_bos=tcfg.add_bos,
+            special=tcfg.special_tokens,
+        )
+        n = len(prefix_tokens)
+        if n <= token_limit:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
 
 
 def infer_n_ctx(model_section: Dict[str, Any], needed: int) -> int:
@@ -1073,8 +1275,13 @@ def analyze_text_document(
     diagnose_paragraphs: bool,
     diagnose_top_k: int,
     need_paragraph_profile: bool,
+    text_max_tokens_override: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
     cfg, tcfg, ccfg = load_config(cfg_path)
+    if text_max_tokens_override is not None:
+        if int(text_max_tokens_override) < 0:
+            raise ValueError(f"text_max_tokens_override={text_max_tokens_override} must be >= 0.")
+        tcfg.max_tokens = int(text_max_tokens_override)
 
     observer_section = cfg["observer"]
     performer_section = cfg["performer"]
@@ -1087,11 +1294,11 @@ def analyze_text_document(
     text_bytes = text.encode("utf-8", errors="replace")
 
     # Tokenize with vocab_only model(s) to decide n_ctx and ensure tokenizer alignment.
-    tokens_obs = tokenize_with_vocab_only(obs_path, text_bytes, tcfg)
-    tokens_obs = maybe_truncate_tokens(tokens_obs, tcfg.max_tokens)
+    tokens_obs_full = tokenize_with_vocab_only(obs_path, text_bytes, tcfg)
+    tokens_obs = maybe_truncate_tokens(tokens_obs_full, tcfg.max_tokens)
 
-    tokens_perf = tokenize_with_vocab_only(perf_path, text_bytes, tcfg)
-    tokens_perf = maybe_truncate_tokens(tokens_perf, tcfg.max_tokens)
+    tokens_perf_full = tokenize_with_vocab_only(perf_path, text_bytes, tcfg)
+    tokens_perf = maybe_truncate_tokens(tokens_perf_full, tcfg.max_tokens)
 
     if tokens_obs != tokens_perf:
         raise ValueError(
@@ -1100,6 +1307,7 @@ def analyze_text_document(
         )
 
     tokens = tokens_obs
+    truncated_by_limit = len(tokens_obs_full) > len(tokens)
     if len(tokens) < 2:
         raise ValueError("Text is too short after tokenization (need at least 2 tokens).")
 
@@ -1150,6 +1358,18 @@ def analyze_text_document(
                 tokens=tokens,
                 transition_losses=observer_losses,
             )
+            analyzed_char_end = len(text)
+            if truncated_by_limit:
+                analyzed_char_end = estimate_char_end_for_token_limit(
+                    text=text,
+                    model=obs,
+                    tcfg=tcfg,
+                    token_limit=len(tokens),
+                )
+            paragraph_profile["analyzed_char_end"] = int(max(0, min(len(text), analyzed_char_end)))
+            paragraph_profile["truncated_by_limit"] = bool(truncated_by_limit)
+            paragraph_profile["analyzed_tokens"] = int(len(tokens))
+            paragraph_profile["tokens_before_limit"] = int(len(tokens_obs_full))
 
         if diagnose_paragraphs and paragraph_profile is not None:
             rows = list(paragraph_profile.get("rows", []))
@@ -1210,8 +1430,11 @@ def analyze_text_document(
                 "path": input_label,
                 "chars": len(text),
                 "tokens": len(tokens),
+                "tokens_before_limit": len(tokens_obs_full),
                 "transitions": len(tokens) - 1,
                 "markdown_preserved": True,
+                "max_tokens_limit": int(tcfg.max_tokens),
+                "truncated_by_limit": bool(truncated_by_limit),
             },
             "observer": {
                 "model_path": obs_path,
@@ -1265,9 +1488,15 @@ def analyze_text_document(
                 temp_dir_ctx.cleanup()
 
 
-def launch_gui(cfg_path: str, gui_input_path: str, top_k: int) -> int:
+def launch_gui(
+    cfg_path: str,
+    gui_input_path: str,
+    top_k: int,
+    text_max_tokens_override: Optional[int] = None,
+) -> int:
     try:
         import tkinter as tk
+        import tkinter.font as tkfont
         from tkinter import messagebox
     except Exception as exc:
         raise ValueError("Tkinter is required for --gui mode but could not be imported.") from exc
@@ -1284,33 +1513,93 @@ def launch_gui(cfg_path: str, gui_input_path: str, top_k: int) -> int:
     except Exception as exc:
         raise ValueError("Unable to start GUI window. Check your display environment.") from exc
 
+    def maximize_root_window() -> None:
+        # Ubuntu and different WMs expose maximize via different APIs.
+        try:
+            root.attributes("-zoomed", True)
+            return
+        except Exception:
+            pass
+        try:
+            root.state("zoomed")
+            return
+        except Exception:
+            pass
+        try:
+            root.update_idletasks()
+            root.geometry(f"{root.winfo_screenwidth()}x{root.winfo_screenheight()}+0+0")
+        except Exception:
+            root.geometry("1600x1000")
+
+    def choose_preview_font_family() -> str:
+        preferred = ("Noto Sans", "Ubuntu", "DejaVu Sans", "Cantarell", "TkDefaultFont")
+        try:
+            available = set(tkfont.families(root))
+        except Exception:
+            return "TkDefaultFont"
+        for family in preferred:
+            if family in available:
+                return family
+        return "TkDefaultFont"
+
     root.title(f"Binoculars Editor - {os.path.basename(src_path)}")
     root.geometry("1200x800")
-    root.configure(bg="#141414")
+    root.configure(bg="#000000")
+    maximize_root_window()
+    preview_font_family = choose_preview_font_family()
+    preview_font_size = 13
 
-    toolbar = tk.Frame(root, bg="#141414")
+    toolbar = tk.Frame(root, bg="#000000")
     toolbar.pack(side="top", fill="x", padx=10, pady=8)
 
-    editor_frame = tk.Frame(root, bg="#141414")
-    editor_frame.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 8))
+    split_pane = tk.PanedWindow(
+        root,
+        orient="horizontal",
+        bg="#000000",
+        bd=0,
+        sashwidth=8,
+        showhandle=False,
+    )
+    split_pane.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 8))
+
+    editor_frame = tk.Frame(split_pane, bg="#000000")
+    preview_frame = tk.Frame(split_pane, bg="#2a2a2a")
+    split_pane.add(editor_frame, minsize=420)
+    split_pane.add(preview_frame, minsize=280)
 
     status_var = tk.StringVar(value="Ready. Press Analyze to score and highlight this document.")
     status_label = tk.Label(
         root,
         textvariable=status_var,
         anchor="w",
-        bg="#1f1f1f",
+        bg="#101010",
         fg="#d9d9d9",
         padx=8,
         pady=6,
     )
     status_label.pack(side="bottom", fill="x")
 
+    line_numbers = tk.Text(
+        editor_frame,
+        width=6,
+        wrap="none",
+        state="disabled",
+        bg="#0a0a0a",
+        fg="#7d7d7d",
+        relief="flat",
+        padx=6,
+        pady=12,
+        takefocus=0,
+        highlightthickness=0,
+        borderwidth=0,
+    )
+    line_numbers.pack(side="left", fill="y")
+
     text_widget = tk.Text(
         editor_frame,
         wrap="word",
         undo=True,
-        bg="#101010",
+        bg="#000000",
         fg="#efefef",
         insertbackground="#efefef",
         relief="flat",
@@ -1322,13 +1611,63 @@ def launch_gui(cfg_path: str, gui_input_path: str, top_k: int) -> int:
     scroll_y.pack(side="right", fill="y")
     text_widget.pack(side="left", fill="both", expand=True)
 
+    preview_text = tk.Text(
+        preview_frame,
+        wrap="word",
+        state="disabled",
+        bg="#2a2a2a",
+        fg="#e4e4e4",
+        insertbackground="#e4e4e4",
+        font=(preview_font_family, preview_font_size),
+        relief="flat",
+        padx=12,
+        pady=12,
+    )
+    preview_scroll = tk.Scrollbar(preview_frame, orient="vertical", command=preview_text.yview)
+    preview_text.configure(yscrollcommand=preview_scroll.set)
+    preview_scroll.pack(side="right", fill="y")
+    preview_text.pack(side="left", fill="both", expand=True)
+
+    preview_text.tag_configure("md_h1", font=(preview_font_family, preview_font_size + 7, "bold"), spacing3=7)
+    preview_text.tag_configure("md_h2", font=(preview_font_family, preview_font_size + 4, "bold"), spacing3=6)
+    preview_text.tag_configure("md_h3", font=(preview_font_family, preview_font_size + 2, "bold"), spacing3=5)
+    preview_text.tag_configure("md_bold", font=(preview_font_family, preview_font_size, "bold"))
+    preview_text.tag_configure("md_italic", font=(preview_font_family, preview_font_size, "italic"))
+    preview_text.tag_configure("md_code_inline", font=("TkFixedFont", 11), background="#1f1f1f")
+    preview_text.tag_configure("md_code_block", font=("TkFixedFont", 11), background="#1f1f1f")
+    preview_text.tag_configure("md_quote", foreground="#c9d1d9")
+    preview_text.tag_configure("md_list", foreground="#e4e4e4")
+    preview_text.tag_configure("md_hr", foreground="#8a8a8a")
+    preview_text.tag_configure("md_link", foreground="#9fc3ff", underline=1)
+    preview_text.tag_configure("preview_heat_low", background="#3a2323")
+    preview_text.tag_configure("preview_heat_high", background="#223a2a")
+    preview_text.tag_configure("preview_active_line", background="#3d3d3d")
+
     text_widget.tag_configure("edited", foreground="#ffd54f")
+    text_widget.tag_configure("misspelled", underline=1, underlinefg="#ff4d4d")
+    text_widget.tag_configure("unscored", foreground="#c3c3c3")
+    english_words = load_english_words()
 
     state: Dict[str, Any] = {
         "baseline_text": initial_text,
+        "prev_text": initial_text,
         "segment_tags": [],
+        "segment_labels": {},
+        "prior_bg_tags": [],
+        "prior_counter": 0,
+        "last_b_score": None,
+        "spell_version": 0,
+        "last_spell_spans": None,
         "tooltip": None,
         "pending_edit_job": None,
+        "pending_line_numbers_job": None,
+        "pending_spell_job": None,
+        "pending_preview_job": None,
+        "pending_focus_job": None,
+        "preview_line_map": {},
+        "analyze_cursor_idx": "1.0",
+        "analyze_yview_top": 0.0,
+        "line_count": 0,
         "internal_update": False,
         "analyzing": False,
         "progress_popup": None,
@@ -1336,6 +1675,47 @@ def launch_gui(cfg_path: str, gui_input_path: str, top_k: int) -> int:
 
     def current_text() -> str:
         return text_widget.get("1.0", "end-1c")
+
+    def refresh_line_numbers_now() -> None:
+        state["pending_line_numbers_job"] = None
+        try:
+            line_count = max(1, int(text_widget.index("end-1c").split(".")[0]))
+        except Exception:
+            line_count = 1
+
+        if int(state.get("line_count", 0)) != line_count:
+            gutter_width = max(4, len(str(line_count)) + 1)
+            line_numbers.configure(state="normal", width=gutter_width)
+            line_numbers.delete("1.0", "end")
+            line_numbers.insert("1.0", "\n".join(str(i) for i in range(1, line_count + 1)))
+            line_numbers.configure(state="disabled")
+            state["line_count"] = line_count
+
+        try:
+            first = text_widget.yview()[0]
+            line_numbers.yview_moveto(first)
+        except Exception:
+            pass
+
+    def queue_line_numbers_refresh(delay_ms: int = 80) -> None:
+        pending = state.get("pending_line_numbers_job")
+        if pending is not None:
+            try:
+                root.after_cancel(pending)
+            except Exception:
+                pass
+        state["pending_line_numbers_job"] = root.after(delay_ms, refresh_line_numbers_now)
+
+    def line_number_for_char_end(text: str, analyzed_char_end: int) -> int:
+        if not text:
+            return 1
+        total_lines = text.count("\n") + 1
+        if analyzed_char_end >= len(text):
+            return total_lines
+        if analyzed_char_end <= 0:
+            return 1
+        last_idx = min(len(text) - 1, analyzed_char_end - 1)
+        return text.count("\n", 0, last_idx + 1) + 1
 
     def hide_tooltip() -> None:
         tip = state.get("tooltip")
@@ -1345,6 +1725,237 @@ def launch_gui(cfg_path: str, gui_input_path: str, top_k: int) -> int:
             except Exception:
                 pass
             state["tooltip"] = None
+
+    inline_pattern = re.compile(
+        r"`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|_[^_\n]+_|\[[^\]\n]+\]\([^)]+\)"
+    )
+
+    def preview_insert_inline(raw: str, base_tags: Tuple[str, ...] = ()) -> None:
+        pos = 0
+        for m in inline_pattern.finditer(raw):
+            if m.start() > pos:
+                preview_text.insert("end", raw[pos:m.start()], base_tags)
+            token = m.group(0)
+            tags = list(base_tags)
+            if token.startswith("`") and token.endswith("`"):
+                tags.append("md_code_inline")
+                preview_text.insert("end", token[1:-1], tuple(tags))
+            elif token.startswith("**") and token.endswith("**"):
+                tags.append("md_bold")
+                preview_text.insert("end", token[2:-2], tuple(tags))
+            elif token.startswith("*") and token.endswith("*"):
+                tags.append("md_italic")
+                preview_text.insert("end", token[1:-1], tuple(tags))
+            elif token.startswith("_") and token.endswith("_"):
+                tags.append("md_italic")
+                preview_text.insert("end", token[1:-1], tuple(tags))
+            elif token.startswith("["):
+                mm = re.match(r"\[([^\]]+)\]\(([^)]+)\)", token)
+                if mm:
+                    tags.append("md_link")
+                    preview_text.insert("end", mm.group(1), tuple(tags))
+                else:
+                    preview_text.insert("end", token, base_tags)
+            else:
+                preview_text.insert("end", token, base_tags)
+            pos = m.end()
+        if pos < len(raw):
+            preview_text.insert("end", raw[pos:], base_tags)
+
+    def render_markdown_preview_now() -> None:
+        state["pending_preview_job"] = None
+        raw = current_text().replace("\r\n", "\n").replace("\r", "\n")
+
+        preview_text.configure(state="normal")
+        preview_text.delete("1.0", "end")
+
+        in_code_block = False
+        line_map: Dict[int, int] = {}
+        for src_line_num, line in enumerate(raw.split("\n"), start=1):
+            try:
+                line_map[src_line_num] = max(1, int(preview_text.index("end-1c").split(".")[0]))
+            except Exception:
+                line_map[src_line_num] = 1
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                in_code_block = not in_code_block
+                continue
+
+            if in_code_block:
+                preview_text.insert("end", line + "\n", ("md_code_block",))
+                continue
+
+            if stripped == "":
+                preview_text.insert("end", "\n")
+                continue
+
+            hm = re.match(r"^(#{1,6})\s+(.*)$", line)
+            if hm:
+                level = min(len(hm.group(1)), 3)
+                preview_insert_inline(hm.group(2), (f"md_h{level}",))
+                preview_text.insert("end", "\n\n")
+                continue
+
+            if re.match(r"^\s*([-*_])\1{2,}\s*$", line):
+                preview_text.insert("end", "─" * 34 + "\n\n", ("md_hr",))
+                continue
+
+            qm = re.match(r"^\s*>\s?(.*)$", line)
+            if qm:
+                preview_text.insert("end", "│ ", ("md_quote",))
+                preview_insert_inline(qm.group(1), ("md_quote",))
+                preview_text.insert("end", "\n")
+                continue
+
+            ulm = re.match(r"^(\s*)[-*+]\s+(.*)$", line)
+            if ulm:
+                indent = " " * len(ulm.group(1))
+                preview_text.insert("end", f"{indent}• ", ("md_list",))
+                preview_insert_inline(ulm.group(2), ("md_list",))
+                preview_text.insert("end", "\n")
+                continue
+
+            olm = re.match(r"^(\s*)(\d+)\.\s+(.*)$", line)
+            if olm:
+                indent = " " * len(olm.group(1))
+                preview_text.insert("end", f"{indent}{olm.group(2)}. ", ("md_list",))
+                preview_insert_inline(olm.group(3), ("md_list",))
+                preview_text.insert("end", "\n")
+                continue
+
+            preview_insert_inline(line)
+            preview_text.insert("end", "\n")
+
+        state["preview_line_map"] = line_map
+        preview_text.configure(state="disabled")
+        apply_preview_segment_backgrounds()
+        sync_preview_focus_now()
+
+    def queue_preview_render(delay_ms: int) -> None:
+        pending = state.get("pending_preview_job")
+        if pending is not None:
+            try:
+                root.after_cancel(pending)
+            except Exception:
+                pass
+        state["pending_preview_job"] = root.after(delay_ms, render_markdown_preview_now)
+
+    def clear_preview_segment_backgrounds() -> None:
+        preview_text.tag_remove("preview_heat_low", "1.0", "end")
+        preview_text.tag_remove("preview_heat_high", "1.0", "end")
+
+    def apply_preview_segment_backgrounds() -> None:
+        # Keep the preview unadorned except for the currently active line.
+        clear_preview_segment_backgrounds()
+
+    def line_heat_label(src_line: int) -> Optional[str]:
+        line_start = f"{src_line}.0"
+        line_end = f"{src_line}.0 lineend+1c"
+        saw_high = False
+        for tag in state.get("segment_tags", []):
+            label = state.get("segment_labels", {}).get(tag)
+            if label not in ("LOW", "HIGH"):
+                continue
+            ranges = text_widget.tag_ranges(tag)
+            for i in range(0, len(ranges), 2):
+                r_start = ranges[i]
+                r_end = ranges[i + 1]
+                try:
+                    overlaps = text_widget.compare(r_end, ">", line_start) and text_widget.compare(
+                        r_start, "<", line_end
+                    )
+                except Exception:
+                    overlaps = False
+                if overlaps:
+                    if label == "LOW":
+                        return "LOW"
+                    saw_high = True
+        return "HIGH" if saw_high else None
+
+    def sync_preview_focus_now() -> None:
+        state["pending_focus_job"] = None
+
+        try:
+            src_line = int(text_widget.index("insert").split(".")[0])
+        except Exception:
+            src_line = 1
+
+        map_obj = state.get("preview_line_map")
+        preview_line_map = map_obj if isinstance(map_obj, dict) else {}
+
+        try:
+            preview_total = max(1, int(preview_text.index("end-1c").split(".")[0]))
+        except Exception:
+            preview_total = 1
+
+        mapped = preview_line_map.get(src_line, 0)
+        try:
+            preview_line = int(mapped)
+        except Exception:
+            preview_line = 0
+
+        if preview_line <= 0:
+            try:
+                src_total = max(1, int(text_widget.index("end-1c").split(".")[0]))
+            except Exception:
+                src_total = 1
+            frac = (max(src_line, 1) - 1) / max(src_total - 1, 1)
+            preview_line = int(round(frac * max(preview_total - 1, 0))) + 1
+
+        preview_line = max(1, min(preview_total, preview_line))
+        preview_text.tag_remove("preview_active_line", "1.0", "end")
+        clear_preview_segment_backgrounds()
+        label = line_heat_label(src_line)
+        if label == "LOW":
+            preview_text.tag_add("preview_heat_low", f"{preview_line}.0", f"{preview_line}.0 lineend+1c")
+            preview_text.tag_configure("preview_active_line", background="#4a3434")
+        elif label == "HIGH":
+            preview_text.tag_add("preview_heat_high", f"{preview_line}.0", f"{preview_line}.0 lineend+1c")
+            preview_text.tag_configure("preview_active_line", background="#31483a")
+        else:
+            preview_text.tag_configure("preview_active_line", background="#3d3d3d")
+        preview_text.tag_add(
+            "preview_active_line",
+            f"{preview_line}.0",
+            f"{preview_line}.0 lineend+1c",
+        )
+        preview_text.tag_raise("preview_heat_low")
+        preview_text.tag_raise("preview_heat_high")
+        preview_text.tag_raise("preview_active_line")
+
+        left_info = text_widget.dlineinfo("insert")
+        if left_info is not None and text_widget.winfo_height() > 1:
+            left_ratio = float(left_info[1]) / float(max(text_widget.winfo_height() - 1, 1))
+        else:
+            left_ratio = 0.35
+        left_ratio = max(0.0, min(0.95, left_ratio))
+
+        top, bottom = preview_text.yview()
+        visible = bottom - top
+        if visible <= 0.0:
+            visible = min(1.0, 30.0 / float(max(preview_total, 1)))
+        line_frac = (preview_line - 1) / float(max(preview_total - 1, 1))
+        top_target = line_frac - (left_ratio * visible)
+        max_top = max(0.0, 1.0 - visible)
+        top_target = max(0.0, min(max_top, top_target))
+        preview_text.yview_moveto(top_target)
+
+    def queue_preview_focus_sync(delay_ms: int = 30) -> None:
+        pending = state.get("pending_focus_job")
+        if pending is not None:
+            try:
+                root.after_cancel(pending)
+            except Exception:
+                pass
+        state["pending_focus_job"] = root.after(delay_ms, sync_preview_focus_now)
+
+    def on_editor_scroll(first: str, last: str) -> None:
+        scroll_y.set(first, last)
+        try:
+            line_numbers.yview_moveto(float(first))
+        except Exception:
+            pass
+        queue_preview_focus_sync(delay_ms=0)
 
     def tooltip_text(info: Dict[str, Any]) -> str:
         pct = info.get("pct_contribution", float("nan"))
@@ -1387,7 +1998,7 @@ def launch_gui(cfg_path: str, gui_input_path: str, top_k: int) -> int:
         if tip is not None:
             tip.geometry(f"+{event.x_root + 14}+{event.y_root + 12}")
 
-    def clear_segment_tags() -> None:
+    def clear_current_segment_tags() -> None:
         hide_tooltip()
         for tag in state["segment_tags"]:
             try:
@@ -1396,21 +2007,102 @@ def launch_gui(cfg_path: str, gui_input_path: str, top_k: int) -> int:
             except Exception:
                 pass
         state["segment_tags"] = []
+        state["segment_labels"] = {}
+        text_widget.tag_remove("unscored", "1.0", "end")
+        clear_preview_segment_backgrounds()
+
+    def clear_prior_backgrounds() -> None:
+        for tag in state["prior_bg_tags"]:
+            try:
+                text_widget.tag_remove(tag, "1.0", "end")
+                text_widget.tag_delete(tag)
+            except Exception:
+                pass
+        state["prior_bg_tags"] = []
+
+    def add_prior_background_from_ranges(ranges: Tuple[Any, ...], color: str) -> None:
+        if not ranges:
+            return
+        state["prior_counter"] += 1
+        tag = f"prior_bg_{state['prior_counter']}"
+        text_widget.tag_configure(tag, background=color)
+        for i in range(0, len(ranges), 2):
+            text_widget.tag_add(tag, ranges[i], ranges[i + 1])
+        text_widget.tag_lower(tag)
+        state["prior_bg_tags"].append(tag)
+
+    def snapshot_current_to_priors() -> None:
+        # Convert current foreground analysis and edit markers into faint background "prior" tags.
+        for tag in list(state["segment_tags"]):
+            ranges = text_widget.tag_ranges(tag)
+            label = state["segment_labels"].get(tag, "")
+            color = "#5a1f1f" if label == "LOW" else "#203026"
+            add_prior_background_from_ranges(ranges, color)
+        clear_current_segment_tags()
+
+        edited_ranges = text_widget.tag_ranges("edited")
+        add_prior_background_from_ranges(edited_ranges, "#3a3420")
+        text_widget.tag_remove("edited", "1.0", "end")
 
     def apply_edited_diff() -> None:
         state["pending_edit_job"] = None
         if state["internal_update"]:
             return
-        baseline = state["baseline_text"]
+        prev_text = state["prev_text"]
         curr = current_text()
-        text_widget.tag_remove("edited", "1.0", "end")
-        if baseline == curr:
+        if prev_text == curr:
             return
-        matcher = difflib.SequenceMatcher(a=baseline, b=curr, autojunk=False)
-        for op, _i1, _i2, j1, j2 in matcher.get_opcodes():
-            if op in {"replace", "insert"} and j2 > j1:
-                text_widget.tag_add("edited", f"1.0+{j1}c", f"1.0+{j2}c")
+        j1, j2 = changed_span_in_new_text(prev_text, curr)
+        if j2 > j1:
+            text_widget.tag_add("edited", f"1.0+{j1}c", f"1.0+{j2}c")
+        state["prev_text"] = curr
         text_widget.tag_raise("edited")
+        text_widget.tag_raise("misspelled")
+
+    def apply_spellcheck_spans(spans: List[Tuple[int, int]], version: int) -> None:
+        if version != state.get("spell_version"):
+            return
+        if state["internal_update"]:
+            return
+
+        if state.get("last_spell_spans") == spans:
+            return
+        state["last_spell_spans"] = list(spans)
+
+        text_widget.tag_remove("misspelled", "1.0", "end")
+        for s, e in spans:
+            text_widget.tag_add("misspelled", f"1.0+{s}c", f"1.0+{e}c")
+        text_widget.tag_raise("misspelled")
+        text_widget.tag_raise("edited")
+
+    def run_spellcheck_worker(version: int, text_snapshot: str) -> None:
+        spans = find_misspelled_spans(text_snapshot, english_words)
+        try:
+            root.after(0, lambda: apply_spellcheck_spans(spans, version))
+        except Exception:
+            pass
+
+    def queue_spellcheck(delay_ms: int) -> None:
+        pending_spell = state.get("pending_spell_job")
+        if pending_spell is not None:
+            try:
+                root.after_cancel(pending_spell)
+            except Exception:
+                pass
+
+        def launch() -> None:
+            state["pending_spell_job"] = None
+            if state["internal_update"]:
+                return
+            version = int(state.get("spell_version", 0))
+            text_snapshot = current_text()
+            threading.Thread(
+                target=run_spellcheck_worker,
+                args=(version, text_snapshot),
+                daemon=True,
+            ).start()
+
+        state["pending_spell_job"] = root.after(delay_ms, launch)
 
     def on_modified(_event: Any) -> None:
         if state["internal_update"]:
@@ -1425,38 +2117,59 @@ def launch_gui(cfg_path: str, gui_input_path: str, top_k: int) -> int:
                 root.after_cancel(pending)
             except Exception:
                 pass
-        state["pending_edit_job"] = root.after(80, apply_edited_diff)
+        state["pending_edit_job"] = root.after(90, apply_edited_diff)
+        queue_line_numbers_refresh(delay_ms=80)
+        state["spell_version"] = int(state.get("spell_version", 0)) + 1
+        queue_spellcheck(delay_ms=280)
+        queue_preview_render(delay_ms=120)
+        queue_preview_focus_sync(delay_ms=0)
 
     def apply_heatmap_profile(profile: Dict[str, Any], observer_logppl: float) -> None:
-        clear_segment_tags()
+        clear_current_segment_tags()
         rows = list(profile.get("rows", []))
-        if not rows:
-            return
-        _, _, annotations, _endnotes = _prepare_heatmap_annotations(
-            rows=rows,
-            top_k=top_k,
-            observer_logppl=observer_logppl,
-        )
-        for row in sorted(rows, key=lambda r: r["char_start"]):
-            ann = annotations.get(row["paragraph_id"])
-            if ann is None:
-                continue
-            tag = f"heat_seg_{ann['note_num']}"
-            start = f"1.0+{row['char_start']}c"
-            end = f"1.0+{row['char_end']}c"
-            color = "#ff6b6b" if ann["label"] == "LOW" else "#39d97f"
-            text_widget.tag_configure(tag, foreground=color)
-            text_widget.tag_add(tag, start, end)
-            text_widget.tag_bind(tag, "<Enter>", lambda e, info=dict(ann): show_tooltip(e, info))
-            text_widget.tag_bind(tag, "<Motion>", move_tooltip)
-            text_widget.tag_bind(tag, "<Leave>", lambda _e: hide_tooltip())
-            state["segment_tags"].append(tag)
+        if rows:
+            _, _, annotations, _endnotes = _prepare_heatmap_annotations(
+                rows=rows,
+                top_k=top_k,
+                observer_logppl=observer_logppl,
+            )
+            for row in sorted(rows, key=lambda r: r["char_start"]):
+                ann = annotations.get(row["paragraph_id"])
+                if ann is None:
+                    continue
+                tag = f"heat_seg_{ann['note_num']}"
+                start = f"1.0+{row['char_start']}c"
+                end = f"1.0+{row['char_end']}c"
+                color = "#ff4d4d" if ann["label"] == "LOW" else "#39d97f"
+                text_widget.tag_configure(tag, foreground=color)
+                text_widget.tag_add(tag, start, end)
+                text_widget.tag_bind(tag, "<Enter>", lambda e, info=dict(ann): show_tooltip(e, info))
+                text_widget.tag_bind(tag, "<Motion>", move_tooltip)
+                text_widget.tag_bind(tag, "<Leave>", lambda _e: hide_tooltip())
+                state["segment_tags"].append(tag)
+                state["segment_labels"][tag] = ann["label"]
+
+        analyzed_char_end_raw = profile.get("analyzed_char_end")
+        if analyzed_char_end_raw is not None:
+            try:
+                analyzed_char_end = int(analyzed_char_end_raw)
+            except Exception:
+                analyzed_char_end = len(current_text())
+            doc_len = len(current_text())
+            analyzed_char_end = max(0, min(doc_len, analyzed_char_end))
+            if analyzed_char_end < doc_len:
+                text_widget.tag_add("unscored", f"1.0+{analyzed_char_end}c", "end-1c")
+                text_widget.tag_raise("unscored")
+
+        text_widget.tag_raise("misspelled")
         text_widget.tag_raise("edited")
+        apply_preview_segment_backgrounds()
 
     def set_controls(enabled: bool) -> None:
         btn_state = "normal" if enabled else "disabled"
         analyze_btn.configure(state=btn_state)
         save_btn.configure(state=btn_state)
+        clear_priors_btn.configure(state=btn_state)
         quit_btn.configure(state=btn_state)
         text_widget.configure(state="normal" if enabled else "disabled")
 
@@ -1502,7 +2215,6 @@ def launch_gui(cfg_path: str, gui_input_path: str, top_k: int) -> int:
 
     def finish_analysis_success(
         analyzed_text: str,
-        cursor_idx: str,
         result: Dict[str, Any],
         profile: Optional[Dict[str, Any]],
     ) -> None:
@@ -1513,30 +2225,79 @@ def launch_gui(cfg_path: str, gui_input_path: str, top_k: int) -> int:
             if profile is not None:
                 apply_heatmap_profile(profile, result["observer"]["logPPL"])
             state["baseline_text"] = analyzed_text
-            try:
-                text_widget.mark_set("insert", cursor_idx)
-                text_widget.see("insert")
-            except Exception:
-                pass
+            state["prev_text"] = analyzed_text
             text_widget.edit_modified(False)
         finally:
             state["internal_update"] = False
 
+        prior_b = state.get("last_b_score")
+        prior_b_text = f"{prior_b:.6f}" if isinstance(prior_b, (float, int)) else "n/a"
+        analyzed_char_end = len(analyzed_text)
+        if isinstance(profile, dict):
+            raw_end = profile.get("analyzed_char_end")
+            if raw_end is not None:
+                try:
+                    analyzed_char_end = int(raw_end)
+                except Exception:
+                    analyzed_char_end = len(analyzed_text)
+        analyzed_char_end = max(0, min(len(analyzed_text), analyzed_char_end))
+        last_line = line_number_for_char_end(analyzed_text, analyzed_char_end)
         status_var.set(
             "Binocular score B (high is more human-like): "
-            f"{result['binoculars']['score']:.6f} | "
+            f"{result['binoculars']['score']:.6f} [prior: {prior_b_text}] | "
+            f"Last Line: {last_line} | "
             f"Observer logPPL: {result['observer']['logPPL']:.6f} | "
             f"Performer logPPL: {result['performer']['logPPL']:.6f} | "
             f"Cross logXPPL: {result['cross']['logXPPL']:.6f}"
         )
+        state["last_b_score"] = float(result["binoculars"]["score"])
         state["analyzing"] = False
         set_controls(True)
+        restore_idx = str(state.get("analyze_cursor_idx", "1.0"))
+        restore_top = state.get("analyze_yview_top", 0.0)
+        try:
+            top = float(restore_top)
+        except Exception:
+            top = 0.0
+        top = max(0.0, min(1.0, top))
+        try:
+            text_widget.yview_moveto(top)
+        except Exception:
+            pass
+        try:
+            text_widget.mark_set("insert", restore_idx)
+        except Exception:
+            pass
+        queue_preview_focus_sync(delay_ms=0)
 
     def on_analyze() -> None:
         if state["analyzing"]:
             return
+
+        pending = state.get("pending_edit_job")
+        if pending is not None:
+            try:
+                root.after_cancel(pending)
+            except Exception:
+                pass
+            state["pending_edit_job"] = None
+            apply_edited_diff()
+
+        pending_spell = state.get("pending_spell_job")
+        if pending_spell is not None:
+            try:
+                root.after_cancel(pending_spell)
+            except Exception:
+                pass
+            state["pending_spell_job"] = None
+
+        snapshot_current_to_priors()
         analyzed_text = current_text()
         cursor_idx = text_widget.index("insert")
+        yview = text_widget.yview()
+        yview_top = float(yview[0]) if yview else 0.0
+        state["analyze_cursor_idx"] = cursor_idx
+        state["analyze_yview_top"] = yview_top
         state["analyzing"] = True
         status_var.set("Analyzing current text...")
         set_controls(False)
@@ -1551,11 +2312,12 @@ def launch_gui(cfg_path: str, gui_input_path: str, top_k: int) -> int:
                     diagnose_paragraphs=False,
                     diagnose_top_k=top_k,
                     need_paragraph_profile=True,
+                    text_max_tokens_override=text_max_tokens_override,
                 )
             except Exception as exc:
                 root.after(0, lambda: finish_analysis_error(str(exc)))
                 return
-            root.after(0, lambda: finish_analysis_success(analyzed_text, cursor_idx, result, profile))
+            root.after(0, lambda: finish_analysis_success(analyzed_text, result, profile))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1573,10 +2335,34 @@ def launch_gui(cfg_path: str, gui_input_path: str, top_k: int) -> int:
             f.write(content)
         status_var.set(f"Saved edited file: {out_path}")
 
+    def on_clear_priors() -> None:
+        clear_prior_backgrounds()
+        status_var.set("Cleared prior background highlights.")
+
     def on_quit() -> None:
         if state.get("pending_edit_job") is not None:
             try:
                 root.after_cancel(state["pending_edit_job"])
+            except Exception:
+                pass
+        if state.get("pending_spell_job") is not None:
+            try:
+                root.after_cancel(state["pending_spell_job"])
+            except Exception:
+                pass
+        if state.get("pending_line_numbers_job") is not None:
+            try:
+                root.after_cancel(state["pending_line_numbers_job"])
+            except Exception:
+                pass
+        if state.get("pending_preview_job") is not None:
+            try:
+                root.after_cancel(state["pending_preview_job"])
+            except Exception:
+                pass
+        if state.get("pending_focus_job") is not None:
+            try:
+                root.after_cancel(state["pending_focus_job"])
             except Exception:
                 pass
         hide_tooltip()
@@ -1585,17 +2371,38 @@ def launch_gui(cfg_path: str, gui_input_path: str, top_k: int) -> int:
 
     analyze_btn = tk.Button(toolbar, text="Analyze", command=on_analyze, width=12)
     save_btn = tk.Button(toolbar, text="Save", command=on_save, width=12)
+    clear_priors_btn = tk.Button(toolbar, text="Clear Priors", command=on_clear_priors, width=12)
     quit_btn = tk.Button(toolbar, text="Quit", command=on_quit, width=12)
     analyze_btn.pack(side="left", padx=(0, 8))
     save_btn.pack(side="left", padx=(0, 8))
+    clear_priors_btn.pack(side="left", padx=(0, 8))
     quit_btn.pack(side="left")
 
     state["internal_update"] = True
     text_widget.insert("1.0", initial_text)
     text_widget.edit_modified(False)
     state["internal_update"] = False
+    refresh_line_numbers_now()
+    text_widget.configure(yscrollcommand=on_editor_scroll)
     text_widget.bind("<<Modified>>", on_modified)
+    text_widget.bind("<KeyRelease>", lambda _e: queue_preview_focus_sync(delay_ms=0), add="+")
+    text_widget.bind("<ButtonRelease-1>", lambda _e: queue_preview_focus_sync(delay_ms=0), add="+")
+    text_widget.bind("<MouseWheel>", lambda _e: queue_preview_focus_sync(delay_ms=0), add="+")
+    text_widget.bind("<Button-4>", lambda _e: queue_preview_focus_sync(delay_ms=0), add="+")
+    text_widget.bind("<Button-5>", lambda _e: queue_preview_focus_sync(delay_ms=0), add="+")
+    text_widget.mark_set("insert", "1.0")
+    text_widget.see("1.0")
+    state["spell_version"] = int(state.get("spell_version", 0)) + 1
+    queue_spellcheck(delay_ms=0)
+    queue_preview_render(delay_ms=0)
+    queue_preview_focus_sync(delay_ms=0)
     text_widget.focus_set()
+    root.after(
+        50,
+        lambda: split_pane.sash_place(0, int(root.winfo_width() * 0.67), 0)
+        if root.winfo_width() > 0
+        else None,
+    )
     root.protocol("WM_DELETE_WINDOW", on_quit)
     root.mainloop()
     return 0
@@ -1610,6 +2417,7 @@ def run(
     diagnose_top_k: int,
     diagnose_print_text: bool,
     heatmap: bool,
+    text_max_tokens_override: Optional[int] = None,
 ) -> int:
     text = read_text(input_path)
     result, paragraph_profile = analyze_text_document(
@@ -1619,6 +2427,7 @@ def run(
         diagnose_paragraphs=diagnose_paragraphs,
         diagnose_top_k=diagnose_top_k,
         need_paragraph_profile=heatmap,
+        text_max_tokens_override=text_max_tokens_override,
     )
 
     if heatmap:
@@ -1765,14 +2574,19 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        _, cfg_path = resolve_profile_config_path(args.master_config, args.config)
+        _, cfg_path, text_max_tokens_override = resolve_profile_config(args.master_config, args.config)
 
         if args.gui is not None:
             if args.input is not None or args.input_positional:
                 raise ValueError("When using --gui, provide the input file only via --gui.")
             if args.output is not None or args.json or args.heatmap:
                 raise ValueError("--gui cannot be combined with --output, --json, or --heatmap.")
-            return launch_gui(cfg_path=cfg_path, gui_input_path=args.gui, top_k=args.diagnose_top_k)
+            return launch_gui(
+                cfg_path=cfg_path,
+                gui_input_path=args.gui,
+                top_k=args.diagnose_top_k,
+                text_max_tokens_override=text_max_tokens_override,
+            )
 
         if args.input is not None and args.input_positional:
             raise ValueError("Provide input either as --input or positional INPUT, not both.")
@@ -1798,6 +2612,7 @@ def main() -> int:
             diagnose_top_k=args.diagnose_top_k,
             diagnose_print_text=args.diagnose_print_text,
             heatmap=args.heatmap,
+            text_max_tokens_override=text_max_tokens_override,
         )
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

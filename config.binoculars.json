@@ -1,5 +1,5 @@
 {
-  "default": "fast",
+  "default": "long",
   "profiles": {
     "fast": "/home/npepin/Projects/binoculars/config.llama31.cuda12gb.fast.json",
     "long": "/home/npepin/Projects/binoculars/config.llama31.cuda12gb.long.json"

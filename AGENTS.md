@@ -30,7 +30,7 @@ Latest known commit:
 Key files:
 - `binoculars.py`: main scoring CLI.
 - `binoculars.sh`: venv-activating wrapper that can be run from any directory.
-- `config.binoculars.json`: master profile map (`fast`/`long`) + default profile.
+- `config.binoculars.json`: master profile map (`fast`/`long`) + default profile + optional per-profile `max_tokens` override.
 - `tests/test_regression_v1_1_x.py`: regression checks for heatmap formatting and profile resolution behavior.
 - `tests/fixtures/Athens.md`: stable fixture copy used by regression tests.
 - `config.llama31.cuda12gb.fast.json`: default config for <= ~4096 tokens.
@@ -81,6 +81,12 @@ Both configs:
 - Use `n_ctx: 0` (auto = token count).
 - Use cache dtype `float16` to reduce disk/RAM pressure.
 
+Master config override behavior:
+- `config.binoculars.json` may define each profile as an object with:
+  - `path`: concrete config JSON
+  - `max_tokens`: optional non-negative override for `text.max_tokens` (applies to both CLI and GUI)
+- Legacy string entries in `profiles` are still supported for backward compatibility.
+
 ## 6) Environment and Bootstrap
 
 Observed local state:
@@ -109,7 +115,7 @@ JSON output includes:
 
 Important:
 - The script returns scores only. No built-in thresholding/classification labels.
-- GUI mode (`--gui <file>`) opens an editor/analyzer window with Analyze/Save/Quit controls, status line updates, red/green heatmap highlighting, hover stats tooltips, and yellow edit-tracking until the next Analyze.
+- GUI mode (`--gui <file>`) opens an editor/analyzer window with Analyze/Save/Clear Priors/Quit controls, status line updates (including `[prior: ...]`), always-on English spell checking (red underline), red/green heatmap highlighting, hover stats tooltips, and yellow edit-tracking that converts to faint prior background on Analyze.
 
 Heatmap markdown output (`--heatmap`) includes:
 - In-text note indices that link to the `Notes Table` section.
