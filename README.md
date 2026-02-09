@@ -2,7 +2,7 @@
 
 Local, likelihood-based AI text forensics using two `llama.cpp` models (observer + performer), inspired by the Binoculars approach.
 
-See: https://arxiv.org/abs/2401.12070
+See paper (also included in repo under background/) : https://arxiv.org/abs/2401.12070
 
 This project focuses on faithful local scoring with full logits, not API approximations.
 
@@ -36,27 +36,29 @@ Additional local design notes:
 
 Let a tokenized document be:
 
-$$x_1, x_2, \dots, x_T$$
+$$
+x_1,\, x_2,\, \dots,\, x_T
+$$
 
 with observer model $M_o$ and performer model $M_p$.
 
-Observer log-perplexity:
+**Observer log-perplexity:**
 
-$$\log PPL_{M_o}(x)
-=
--\frac{1}{T-1}\sum_{t=1}^{T-1}\log p_{M_o}(x_{t+1}\mid x_{\le t})$$
+$$
+\log \mathrm{PPL}_{M_o}(x) = -\frac{1}{T-1} \sum_{t=1}^{T-1} \log p_{M_o}(x_{t+1} \mid x_{\leq t})
+$$
 
-Cross log-perplexity:
+**Cross log-perplexity:**
 
-$$\log XPPL_{M_o,M_p}(x)
-=
--\frac{1}{T-1}\sum_{t=1}^{T-1}
-\sum_{v\in V}
-p_{M_o}(v\mid x_{\le t})\log p_{M_p}(v\mid x_{\le t})$$
+$$
+\log \mathrm{XPPL}_{M_o, M_p}(x) = -\frac{1}{T-1} \sum_{t=1}^{T-1} \sum_{v \in V} p_{M_o}(v \mid x_{\leq t}) \log p_{M_p}(v \mid x_{\leq t})
+$$
 
-Binoculars score:
+**Binoculars score:**
 
-$$B(x)=\frac{\log PPL_{M_o}(x)}{\log XPPL_{M_o,M_p}(x)}$$
+$$
+B(x) = \frac{\log \mathrm{PPL}_{M_o}(x)}{\log \mathrm{XPPL}_{M_o, M_p}(x)}
+$$
 
 Current UI/CLI interpretation used by this repo:
 
