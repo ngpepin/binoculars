@@ -18,6 +18,7 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import bisect
 from datetime import datetime
 import gc
 import json
@@ -1579,16 +1580,34 @@ def launch_gui(
     )
     status_label.pack(side="bottom", fill="x")
 
-    line_numbers = tk.Text(
+    debug_var = tk.StringVar(value="")
+    debug_label = tk.Label(
+        toolbar,
+        textvariable=debug_var,
+        anchor="e",
+        bg="#000000",
+        fg="#8ea3b8",
+        padx=4,
+    )
+    debug_label.pack(side="right", padx=(8, 0))
+
+    line_bars = tk.Canvas(
         editor_frame,
-        width=6,
-        wrap="none",
-        state="disabled",
-        bg="#0a0a0a",
-        fg="#7d7d7d",
+        width=66,
+        bg="#000000",
+        highlightthickness=0,
+        borderwidth=0,
         relief="flat",
-        padx=6,
-        pady=12,
+        takefocus=0,
+    )
+    line_bars.pack(side="left", fill="y")
+
+    line_number_font = tkfont.nametofont("TkFixedFont")
+    line_numbers = tk.Canvas(
+        editor_frame,
+        width=56,
+        bg="#0a0a0a",
+        relief="flat",
         takefocus=0,
         highlightthickness=0,
         borderwidth=0,
@@ -1615,6 +1634,7 @@ def launch_gui(
         preview_frame,
         wrap="word",
         state="disabled",
+        takefocus=0,
         bg="#2a2a2a",
         fg="#e4e4e4",
         insertbackground="#e4e4e4",
@@ -1623,7 +1643,7 @@ def launch_gui(
         padx=12,
         pady=12,
     )
-    preview_scroll = tk.Scrollbar(preview_frame, orient="vertical", command=preview_text.yview)
+    preview_scroll = tk.Scrollbar(preview_frame, orient="vertical")
     preview_text.configure(yscrollcommand=preview_scroll.set)
     preview_scroll.pack(side="right", fill="y")
     preview_text.pack(side="left", fill="both", expand=True)
@@ -1661,17 +1681,28 @@ def launch_gui(
         "tooltip": None,
         "pending_edit_job": None,
         "pending_line_numbers_job": None,
+        "pending_line_bars_job": None,
         "pending_spell_job": None,
         "pending_preview_job": None,
         "pending_focus_job": None,
         "preview_line_map": {},
+        "line_contrib_map": {},
+        "line_contrib_max_abs": 0.0,
+        "line_contrib_last_line": 0,
+        "line_contrib_top_lines": set(),
+        "prior_line_contrib_maps": [],
         "analyze_cursor_idx": "1.0",
         "analyze_yview_top": 0.0,
         "line_count": 0,
+        "sash_initialized": False,
         "internal_update": False,
         "analyzing": False,
         "progress_popup": None,
+        "debug_enabled": bool(os.environ.get("BINOCULARS_GUI_DEBUG")),
+        "preview_view_offset_lines": int(os.environ.get("BINOCULARS_PREVIEW_VIEW_OFFSET_LINES", "-3")),
     }
+    if not state.get("debug_enabled", False):
+        debug_label.pack_forget()
 
     def current_text() -> str:
         return text_widget.get("1.0", "end-1c")
@@ -1683,19 +1714,61 @@ def launch_gui(
         except Exception:
             line_count = 1
 
+        try:
+            line_numbers.delete("all")
+        except Exception:
+            return
+
         if int(state.get("line_count", 0)) != line_count:
-            gutter_width = max(4, len(str(line_count)) + 1)
-            line_numbers.configure(state="normal", width=gutter_width)
-            line_numbers.delete("1.0", "end")
-            line_numbers.insert("1.0", "\n".join(str(i) for i in range(1, line_count + 1)))
-            line_numbers.configure(state="disabled")
+            digits = max(2, len(str(line_count)))
+            try:
+                char_w = int(line_number_font.measure("0"))
+            except Exception:
+                char_w = 8
+            gutter_px = max(48, (digits * char_w) + 14)
+            try:
+                line_numbers.configure(width=gutter_px)
+            except Exception:
+                pass
             state["line_count"] = line_count
 
         try:
-            first = text_widget.yview()[0]
-            line_numbers.yview_moveto(first)
+            canvas_h = max(1, int(line_numbers.winfo_height()))
+            canvas_w = max(24, int(line_numbers.winfo_width()))
         except Exception:
-            pass
+            canvas_h = 1
+            canvas_w = 56
+        x = canvas_w - 6
+
+        try:
+            line_idx = text_widget.index("@0,0")
+        except Exception:
+            queue_line_bars_refresh(delay_ms=0)
+            return
+
+        while True:
+            dline = text_widget.dlineinfo(line_idx)
+            if dline is None:
+                break
+            y = float(dline[1])
+            h = float(dline[3])
+            if y > canvas_h:
+                break
+            try:
+                line_no = int(str(line_idx).split(".")[0])
+            except Exception:
+                line_no = 1
+            line_numbers.create_text(
+                x,
+                y + (h / 2.0),
+                text=str(line_no),
+                fill="#7d7d7d",
+                font=line_number_font,
+                anchor="e",
+            )
+            line_idx = text_widget.index(f"{line_idx}+1line")
+
+        queue_line_bars_refresh(delay_ms=0)
 
     def queue_line_numbers_refresh(delay_ms: int = 80) -> None:
         pending = state.get("pending_line_numbers_job")
@@ -1716,6 +1789,200 @@ def launch_gui(
             return 1
         last_idx = min(len(text) - 1, analyzed_char_end - 1)
         return text.count("\n", 0, last_idx + 1) + 1
+
+    def refresh_line_bars_now() -> None:
+        state["pending_line_bars_job"] = None
+        try:
+            line_bars.delete("all")
+        except Exception:
+            return
+
+        current_map_obj = state.get("line_contrib_map")
+        current_map = current_map_obj if isinstance(current_map_obj, dict) else {}
+        try:
+            current_max_abs = float(state.get("line_contrib_max_abs", 0.0))
+        except Exception:
+            current_max_abs = 0.0
+        if not np.isfinite(current_max_abs):
+            current_max_abs = 0.0
+
+        prior_entries_obj = state.get("prior_line_contrib_maps")
+        prior_entries_raw = prior_entries_obj if isinstance(prior_entries_obj, list) else []
+        prior_entries: List[Tuple[Dict[int, float], float]] = []
+        for entry in prior_entries_raw:
+            if not isinstance(entry, dict):
+                continue
+            map_obj = entry.get("map")
+            if not isinstance(map_obj, dict) or not map_obj:
+                continue
+            try:
+                max_abs = float(entry.get("max_abs", 0.0))
+            except Exception:
+                max_abs = 0.0
+            if not np.isfinite(max_abs) or max_abs <= 0.0:
+                continue
+            prior_entries.append((map_obj, max_abs))
+
+        if (not current_map or current_max_abs <= 0.0) and not prior_entries:
+            return
+
+        try:
+            canvas_w = max(8, int(line_bars.winfo_width()))
+            canvas_h = max(1, int(line_bars.winfo_height()))
+        except Exception:
+            return
+        max_bar_w = max(6, canvas_w - 4)
+
+        try:
+            line_idx = text_widget.index("@0,0")
+        except Exception:
+            return
+
+        while True:
+            dline = text_widget.dlineinfo(line_idx)
+            if dline is None:
+                break
+            y = float(dline[1])
+            h = float(dline[3])
+            if y > canvas_h:
+                break
+            try:
+                line_no = int(str(line_idx).split(".")[0])
+            except Exception:
+                line_no = 1
+            pad = max(1, int(h * 0.2))
+            y0 = int(y + pad)
+            y1 = int(y + h - pad)
+            if y1 <= y0:
+                y1 = y0 + 1
+
+            # Draw prior maps first as faint backgrounds.
+            for prior_map, prior_max_abs in prior_entries:
+                raw_prior = prior_map.get(line_no, 0.0)
+                try:
+                    prior_v = float(raw_prior)
+                except Exception:
+                    prior_v = 0.0
+                if not np.isfinite(prior_v) or abs(prior_v) <= 0.0:
+                    continue
+                frac = min(1.0, abs(prior_v) / prior_max_abs)
+                bar_w = max(1, int(round(frac * max_bar_w)))
+                x1 = canvas_w - 2
+                x0 = max(2, x1 - bar_w)
+                color = "#6a3a3a" if prior_v > 0 else "#2d5d3f"
+                line_bars.create_rectangle(x0, y0, x1, y1, fill=color, width=0)
+
+            top_lines_obj = state.get("line_contrib_top_lines")
+            top_lines = top_lines_obj if isinstance(top_lines_obj, set) else set()
+
+            raw_v = current_map.get(line_no, 0.0)
+            try:
+                val = float(raw_v)
+            except Exception:
+                val = 0.0
+            if np.isfinite(val) and abs(val) > 0.0 and current_max_abs > 0.0:
+                frac = min(1.0, abs(val) / current_max_abs)
+                if line_no not in top_lines:
+                    # Keep non-highlighted lines informative but visually secondary.
+                    frac *= 0.45
+                bar_w = max(1, int(round(frac * max_bar_w)))
+                x1 = canvas_w - 2
+                x0 = max(2, x1 - bar_w)
+                if line_no in top_lines:
+                    color = "#cf4242" if val > 0 else "#35b05f"
+                else:
+                    color = "#8e4848" if val > 0 else "#3a7450"
+                line_bars.create_rectangle(x0, y0, x1, y1, fill=color, width=0)
+
+            line_idx = text_widget.index(f"{line_idx}+1line")
+
+    def queue_line_bars_refresh(delay_ms: int = 60) -> None:
+        pending = state.get("pending_line_bars_job")
+        if pending is not None:
+            try:
+                root.after_cancel(pending)
+            except Exception:
+                pass
+        state["pending_line_bars_job"] = root.after(delay_ms, refresh_line_bars_now)
+
+    def _char_pos_to_line(line_starts: List[int], char_pos: int) -> int:
+        if not line_starts:
+            return 1
+        clamped = max(0, int(char_pos))
+        return max(1, bisect.bisect_right(line_starts, clamped))
+
+    def rebuild_line_contribution_map(
+        rows: List[Dict[str, Any]],
+        annotations: Dict[int, Dict[str, Any]],
+        analyzed_char_end: int,
+    ) -> None:
+        text = current_text()
+        if not rows or not annotations:
+            state["line_contrib_map"] = {}
+            state["line_contrib_max_abs"] = 0.0
+            state["line_contrib_last_line"] = 0
+            state["line_contrib_top_lines"] = set()
+            queue_line_bars_refresh(delay_ms=0)
+            return
+
+        line_starts: List[int] = [0]
+        for i, ch in enumerate(text):
+            if ch == "\n":
+                line_starts.append(i + 1)
+
+        contrib: Dict[int, float] = {}
+        top_lines: Set[int] = set()
+        text_len = len(text)
+        limit = max(0, min(text_len, int(analyzed_char_end)))
+        last_line = line_number_for_char_end(text, limit)
+        for row in rows:
+            para_id = int(row.get("paragraph_id", -1))
+            ann = annotations.get(para_id)
+            label = str(ann.get("label", "")).upper() if ann is not None else ""
+            try:
+                if ann is not None:
+                    delta = float(
+                        ann.get("delta_doc_logPPL_if_removed", row.get("delta_doc_logPPL_if_removed", 0.0))
+                    )
+                else:
+                    delta = float(row.get("delta_doc_logPPL_if_removed", 0.0))
+            except Exception:
+                continue
+            if not np.isfinite(delta) or delta == 0.0:
+                continue
+            if label not in ("LOW", "HIGH"):
+                label = "LOW" if delta > 0 else "HIGH"
+            magnitude = abs(delta)
+            signed = magnitude if label == "LOW" else (-magnitude if label == "HIGH" else delta)
+            if ann is None:
+                signed *= 0.40
+            try:
+                c_start = int(row.get("char_start", 0))
+                c_end = int(row.get("char_end", c_start))
+            except Exception:
+                continue
+            c_start = max(0, min(text_len, c_start))
+            c_end = max(c_start, min(text_len, c_end, limit))
+            if c_start >= limit:
+                continue
+            if c_end <= c_start:
+                continue
+
+            start_line = _char_pos_to_line(line_starts, c_start)
+            end_line = _char_pos_to_line(line_starts, max(c_start, c_end - 1))
+            if ann is not None:
+                for ln in range(start_line, end_line + 1):
+                    top_lines.add(ln)
+            n_lines = max(1, end_line - start_line + 1)
+            share = signed / float(n_lines)
+            for ln in range(start_line, end_line + 1):
+                contrib[ln] = float(contrib.get(ln, 0.0) + share)
+
+        state["line_contrib_map"] = contrib
+        state["line_contrib_max_abs"] = max((abs(v) for v in contrib.values()), default=0.0)
+        state["line_contrib_last_line"] = int(last_line)
+        state["line_contrib_top_lines"] = top_lines
+        queue_line_bars_refresh(delay_ms=0)
 
     def hide_tooltip() -> None:
         tip = state.get("tooltip")
@@ -1840,13 +2107,139 @@ def launch_gui(
                 pass
         state["pending_preview_job"] = root.after(delay_ms, render_markdown_preview_now)
 
+    def set_debug_text(message: str) -> None:
+        if state.get("debug_enabled", False):
+            debug_var.set(message)
+        else:
+            debug_var.set("")
+
+    def toggle_debug_overlay(_event: Any = None) -> str:
+        enabled = not bool(state.get("debug_enabled", False))
+        state["debug_enabled"] = enabled
+        if enabled:
+            debug_label.pack(side="right", padx=(8, 0))
+            set_debug_text("Debug overlay enabled")
+        else:
+            debug_label.pack_forget()
+            set_debug_text("")
+        return "break"
+
+    def source_line_to_preview_line(src_line: int) -> int:
+        map_obj = state.get("preview_line_map")
+        preview_line_map = map_obj if isinstance(map_obj, dict) else {}
+        if not preview_line_map:
+            try:
+                total_src = max(1, int(text_widget.index("end-1c").split(".")[0]))
+            except Exception:
+                total_src = 1
+            try:
+                total_preview = max(1, int(preview_text.index("end-1c").split(".")[0]))
+            except Exception:
+                total_preview = 1
+            frac = (max(1, int(src_line)) - 1) / float(max(total_src - 1, 1))
+            return int(round(frac * max(total_preview - 1, 0))) + 1
+
+        line = max(1, int(src_line))
+        mapped = preview_line_map.get(line)
+        if mapped is not None:
+            try:
+                return max(1, int(mapped))
+            except Exception:
+                pass
+
+        nearest = max((k for k in preview_line_map.keys() if k <= line), default=1)
+        try:
+            base = int(preview_line_map.get(nearest, 1))
+        except Exception:
+            base = 1
+        return max(1, base)
+
+    def preview_view_offset_lines() -> int:
+        try:
+            return int(state.get("preview_view_offset_lines", -3))
+        except Exception:
+            return -3
+
+    def apply_preview_view_offset() -> None:
+        offset = preview_view_offset_lines()
+        if offset == 0:
+            return
+        try:
+            # GUI calibration: apply the configured offset in the opposite direction.
+            preview_text.yview_scroll(-offset, "units")
+        except Exception:
+            pass
+
+    def set_preview_active_line_for_src_line(src_line: int) -> None:
+        preview_line = source_line_to_preview_line(src_line)
+        try:
+            preview_total = max(1, int(preview_text.index("end-1c").split(".")[0]))
+        except Exception:
+            preview_total = 1
+        preview_line = max(1, min(preview_total, preview_line))
+        preview_text.tag_remove("preview_active_line", "1.0", "end")
+        label = line_heat_label(src_line)
+        if label == "LOW":
+            preview_text.tag_configure("preview_active_line", background="#4a3434")
+        elif label == "HIGH":
+            preview_text.tag_configure("preview_active_line", background="#31483a")
+        else:
+            preview_text.tag_configure("preview_active_line", background="#606060")
+        preview_text.tag_add(
+            "preview_active_line",
+            f"{preview_line}.0",
+            f"{preview_line}.0 lineend+1c",
+        )
+        preview_text.tag_raise("preview_heat_low")
+        preview_text.tag_raise("preview_heat_high")
+        preview_text.tag_raise("preview_active_line")
+
     def clear_preview_segment_backgrounds() -> None:
         preview_text.tag_remove("preview_heat_low", "1.0", "end")
         preview_text.tag_remove("preview_heat_high", "1.0", "end")
 
     def apply_preview_segment_backgrounds() -> None:
-        # Keep the preview unadorned except for the currently active line.
         clear_preview_segment_backgrounds()
+        map_obj = state.get("preview_line_map")
+        preview_line_map = map_obj if isinstance(map_obj, dict) else {}
+        if not preview_line_map:
+            return
+
+        for tag in state.get("segment_tags", []):
+            label = state.get("segment_labels", {}).get(tag, "")
+            if label == "LOW":
+                preview_tag = "preview_heat_low"
+            elif label == "HIGH":
+                preview_tag = "preview_heat_high"
+            else:
+                continue
+
+            ranges = text_widget.tag_ranges(tag)
+            for i in range(0, len(ranges), 2):
+                r_start = ranges[i]
+                r_end = ranges[i + 1]
+                try:
+                    start_line = int(str(r_start).split(".")[0])
+                    end_line = int(str(text_widget.index(f"{r_end}-1c")).split(".")[0])
+                except Exception:
+                    continue
+                if end_line < start_line:
+                    continue
+                for src_line in range(start_line, end_line + 1):
+                    mapped = preview_line_map.get(src_line)
+                    if mapped is None:
+                        continue
+                    try:
+                        preview_line = int(mapped)
+                    except Exception:
+                        continue
+                    preview_text.tag_add(
+                        preview_tag,
+                        f"{preview_line}.0",
+                        f"{preview_line}.0 lineend+1c",
+                    )
+        preview_text.tag_lower("preview_heat_low")
+        preview_text.tag_lower("preview_heat_high")
 
     def line_heat_label(src_line: int) -> Optional[str]:
         line_start = f"{src_line}.0"
@@ -1879,49 +2272,9 @@ def launch_gui(
             src_line = int(text_widget.index("insert").split(".")[0])
         except Exception:
             src_line = 1
-
-        map_obj = state.get("preview_line_map")
-        preview_line_map = map_obj if isinstance(map_obj, dict) else {}
-
-        try:
-            preview_total = max(1, int(preview_text.index("end-1c").split(".")[0]))
-        except Exception:
-            preview_total = 1
-
-        mapped = preview_line_map.get(src_line, 0)
-        try:
-            preview_line = int(mapped)
-        except Exception:
-            preview_line = 0
-
-        if preview_line <= 0:
-            try:
-                src_total = max(1, int(text_widget.index("end-1c").split(".")[0]))
-            except Exception:
-                src_total = 1
-            frac = (max(src_line, 1) - 1) / max(src_total - 1, 1)
-            preview_line = int(round(frac * max(preview_total - 1, 0))) + 1
-
-        preview_line = max(1, min(preview_total, preview_line))
-        preview_text.tag_remove("preview_active_line", "1.0", "end")
-        clear_preview_segment_backgrounds()
-        label = line_heat_label(src_line)
-        if label == "LOW":
-            preview_text.tag_add("preview_heat_low", f"{preview_line}.0", f"{preview_line}.0 lineend+1c")
-            preview_text.tag_configure("preview_active_line", background="#4a3434")
-        elif label == "HIGH":
-            preview_text.tag_add("preview_heat_high", f"{preview_line}.0", f"{preview_line}.0 lineend+1c")
-            preview_text.tag_configure("preview_active_line", background="#31483a")
-        else:
-            preview_text.tag_configure("preview_active_line", background="#3d3d3d")
-        preview_text.tag_add(
-            "preview_active_line",
-            f"{preview_line}.0",
-            f"{preview_line}.0 lineend+1c",
-        )
-        preview_text.tag_raise("preview_heat_low")
-        preview_text.tag_raise("preview_heat_high")
-        preview_text.tag_raise("preview_active_line")
+        set_preview_active_line_for_src_line(src_line)
+        preview_line = source_line_to_preview_line(src_line)
+        preview_idx = f"{preview_line}.0"
 
         left_info = text_widget.dlineinfo("insert")
         if left_info is not None and text_widget.winfo_height() > 1:
@@ -1930,15 +2283,44 @@ def launch_gui(
             left_ratio = 0.35
         left_ratio = max(0.0, min(0.95, left_ratio))
 
+        info = preview_text.dlineinfo(preview_idx)
+        if info is None:
+            try:
+                preview_text.see(preview_idx)
+            except Exception:
+                pass
+            info = preview_text.dlineinfo(preview_idx)
+
         top, bottom = preview_text.yview()
         visible = bottom - top
         if visible <= 0.0:
-            visible = min(1.0, 30.0 / float(max(preview_total, 1)))
-        line_frac = (preview_line - 1) / float(max(preview_total - 1, 1))
-        top_target = line_frac - (left_ratio * visible)
-        max_top = max(0.0, 1.0 - visible)
-        top_target = max(0.0, min(max_top, top_target))
-        preview_text.yview_moveto(top_target)
+            visible = 0.25
+        if info is not None and preview_text.winfo_height() > 1:
+            current_ratio = float(info[1]) / float(max(preview_text.winfo_height() - 1, 1))
+            delta = current_ratio - left_ratio
+            if abs(delta) > 0.02:
+                top_target = top + (delta * visible)
+                max_top = max(0.0, 1.0 - visible)
+                top_target = max(0.0, min(max_top, top_target))
+                preview_text.yview_moveto(top_target)
+                apply_preview_view_offset()
+        else:
+            try:
+                preview_text.see(preview_idx)
+                apply_preview_view_offset()
+            except Exception:
+                pass
+
+        info2 = preview_text.dlineinfo(preview_idx)
+        if info2 is not None and preview_text.winfo_height() > 1:
+            preview_ratio = float(info2[1]) / float(max(preview_text.winfo_height() - 1, 1))
+        else:
+            preview_ratio = float("nan")
+        set_debug_text(
+            f"mode=focus src_insert={src_line} prev_insert={preview_line} offset={preview_view_offset_lines()} "
+            f"left_ratio={left_ratio:.3f} preview_ratio={preview_ratio:.3f} "
+            f"left_top={text_widget.yview()[0]:.3f} preview_top={preview_text.yview()[0]:.3f}"
+        )
 
     def queue_preview_focus_sync(delay_ms: int = 30) -> None:
         pending = state.get("pending_focus_job")
@@ -1949,13 +2331,84 @@ def launch_gui(
                 pass
         state["pending_focus_job"] = root.after(delay_ms, sync_preview_focus_now)
 
-    def on_editor_scroll(first: str, last: str) -> None:
-        scroll_y.set(first, last)
+    def sync_preview_scroll_lock(left_first: Optional[float] = None) -> None:
+        if left_first is None:
+            try:
+                yview = text_widget.yview()
+                left_first = float(yview[0]) if yview else 0.0
+            except Exception:
+                left_first = 0.0
+        left_first = max(0.0, min(1.0, float(left_first)))
         try:
-            line_numbers.yview_moveto(float(first))
+            src_top_idx = str(text_widget.index("@0,0"))
+        except Exception:
+            src_top_idx = "1.0"
+        try:
+            src_top_line, src_top_col = [int(x) for x in src_top_idx.split(".", 1)]
+        except Exception:
+            src_top_line, src_top_col = 1, 0
+
+        preview_top_line = source_line_to_preview_line(src_top_line)
+        preview_top_idx = f"{preview_top_line}.{max(0, src_top_col)}"
+        try:
+            preview_text.yview(preview_top_idx)
+            apply_preview_view_offset()
+        except Exception:
+            preview_text.yview_moveto(left_first)
+            apply_preview_view_offset()
+        set_preview_active_line_for_src_line(max(1, int(text_widget.index("insert").split(".")[0])))
+        set_debug_text(
+            f"mode=scroll src_top={src_top_idx} prev_top={preview_top_idx} offset={preview_view_offset_lines()} "
+            f"left_first={left_first:.3f} preview_first={preview_text.yview()[0]:.3f}"
+        )
+
+    def on_preview_scroll(*args: Any) -> None:
+        if not args:
+            return
+        op = str(args[0])
+        try:
+            if op == "moveto" and len(args) >= 2:
+                text_widget.yview_moveto(float(args[1]))
+            elif op == "scroll" and len(args) >= 3:
+                text_widget.yview_scroll(int(args[1]), str(args[2]))
+        except Exception:
+            return
+
+    def on_preview_mousewheel(event: Any) -> str:
+        delta = getattr(event, "delta", 0)
+        if delta == 0:
+            return "break"
+        steps = -1 if delta > 0 else 1
+        try:
+            text_widget.yview_scroll(steps, "units")
         except Exception:
             pass
-        queue_preview_focus_sync(delay_ms=0)
+        return "break"
+
+    def on_preview_button4(_event: Any) -> str:
+        try:
+            text_widget.yview_scroll(-1, "units")
+        except Exception:
+            pass
+        return "break"
+
+    def on_preview_button5(_event: Any) -> str:
+        try:
+            text_widget.yview_scroll(1, "units")
+        except Exception:
+            pass
+        return "break"
+
+    def on_editor_scroll(first: str, last: str) -> None:
+        scroll_y.set(first, last)
+        queue_line_numbers_refresh(delay_ms=0)
+        if text_widget.dlineinfo("insert") is not None:
+            queue_preview_focus_sync(delay_ms=0)
+        else:
+            try:
+                sync_preview_scroll_lock(float(first))
+            except Exception:
+                sync_preview_scroll_lock(None)
 
     def tooltip_text(info: Dict[str, Any]) -> str:
         pct = info.get("pct_contribution", float("nan"))
@@ -2008,7 +2461,12 @@ def launch_gui(
                 pass
         state["segment_tags"] = []
         state["segment_labels"] = {}
+        state["line_contrib_map"] = {}
+        state["line_contrib_max_abs"] = 0.0
+        state["line_contrib_last_line"] = 0
+        state["line_contrib_top_lines"] = set()
         text_widget.tag_remove("unscored", "1.0", "end")
+        queue_line_bars_refresh(delay_ms=0)
         clear_preview_segment_backgrounds()
 
     def clear_prior_backgrounds() -> None:
@@ -2019,6 +2477,8 @@ def launch_gui(
             except Exception:
                 pass
         state["prior_bg_tags"] = []
+        state["prior_line_contrib_maps"] = []
+        queue_line_bars_refresh(delay_ms=0)
 
     def add_prior_background_from_ranges(ranges: Tuple[Any, ...], color: str) -> None:
         if not ranges:
@@ -2033,6 +2493,19 @@ def launch_gui(
 
     def snapshot_current_to_priors() -> None:
         # Convert current foreground analysis and edit markers into faint background "prior" tags.
+        current_map_obj = state.get("line_contrib_map")
+        if isinstance(current_map_obj, dict) and current_map_obj:
+            try:
+                current_max = float(state.get("line_contrib_max_abs", 0.0))
+            except Exception:
+                current_max = 0.0
+            if np.isfinite(current_max) and current_max > 0.0:
+                prior_entries = state.get("prior_line_contrib_maps")
+                if not isinstance(prior_entries, list):
+                    prior_entries = []
+                prior_entries.append({"map": dict(current_map_obj), "max_abs": float(current_max)})
+                state["prior_line_contrib_maps"] = prior_entries[-8:]
+
         for tag in list(state["segment_tags"]):
             ranges = text_widget.tag_ranges(tag)
             label = state["segment_labels"].get(tag, "")
@@ -2127,19 +2600,43 @@ def launch_gui(
     def apply_heatmap_profile(profile: Dict[str, Any], observer_logppl: float) -> None:
         clear_current_segment_tags()
         rows = list(profile.get("rows", []))
+        doc_text = current_text()
+        doc_len = len(doc_text)
+        analyzed_char_end_raw = profile.get("analyzed_char_end")
+        if analyzed_char_end_raw is not None:
+            try:
+                analyzed_char_end = int(analyzed_char_end_raw)
+            except Exception:
+                analyzed_char_end = doc_len
+        else:
+            analyzed_char_end = doc_len
+        analyzed_char_end = max(0, min(doc_len, analyzed_char_end))
+
+        annotations: Dict[int, Dict[str, Any]] = {}
         if rows:
             _, _, annotations, _endnotes = _prepare_heatmap_annotations(
                 rows=rows,
                 top_k=top_k,
                 observer_logppl=observer_logppl,
             )
+        rebuild_line_contribution_map(rows, annotations, analyzed_char_end)
+        if rows and annotations:
             for row in sorted(rows, key=lambda r: r["char_start"]):
                 ann = annotations.get(row["paragraph_id"])
                 if ann is None:
                     continue
                 tag = f"heat_seg_{ann['note_num']}"
-                start = f"1.0+{row['char_start']}c"
-                end = f"1.0+{row['char_end']}c"
+                try:
+                    c_start = int(row.get("char_start", 0))
+                    c_end = int(row.get("char_end", c_start))
+                except Exception:
+                    continue
+                c_start = max(0, min(doc_len, c_start))
+                c_end = max(c_start, min(doc_len, c_end, analyzed_char_end))
+                if c_end <= c_start:
+                    continue
+                start = f"1.0+{c_start}c"
+                end = f"1.0+{c_end}c"
                 color = "#ff4d4d" if ann["label"] == "LOW" else "#39d97f"
                 text_widget.tag_configure(tag, foreground=color)
                 text_widget.tag_add(tag, start, end)
@@ -2149,17 +2646,11 @@ def launch_gui(
                 state["segment_tags"].append(tag)
                 state["segment_labels"][tag] = ann["label"]
 
-        analyzed_char_end_raw = profile.get("analyzed_char_end")
-        if analyzed_char_end_raw is not None:
-            try:
-                analyzed_char_end = int(analyzed_char_end_raw)
-            except Exception:
-                analyzed_char_end = len(current_text())
-            doc_len = len(current_text())
-            analyzed_char_end = max(0, min(doc_len, analyzed_char_end))
-            if analyzed_char_end < doc_len:
-                text_widget.tag_add("unscored", f"1.0+{analyzed_char_end}c", "end-1c")
-                text_widget.tag_raise("unscored")
+        last_line = line_number_for_char_end(doc_text, analyzed_char_end)
+        total_lines = max(1, int(text_widget.index("end-1c").split(".")[0]))
+        if last_line < total_lines:
+            text_widget.tag_add("unscored", f"{last_line + 1}.0", "end-1c")
+            text_widget.tag_raise("unscored")
 
         text_widget.tag_raise("misspelled")
         text_widget.tag_raise("edited")
@@ -2355,6 +2846,11 @@ def launch_gui(
                 root.after_cancel(state["pending_line_numbers_job"])
             except Exception:
                 pass
+        if state.get("pending_line_bars_job") is not None:
+            try:
+                root.after_cancel(state["pending_line_bars_job"])
+            except Exception:
+                pass
         if state.get("pending_preview_job") is not None:
             try:
                 root.after_cancel(state["pending_preview_job"])
@@ -2368,6 +2864,31 @@ def launch_gui(
         hide_tooltip()
         close_progress_popup()
         root.destroy()
+
+    def place_initial_sash(retries: int = 24) -> None:
+        try:
+            width = int(root.winfo_width())
+        except Exception:
+            width = 0
+        if width < 900 and retries > 0:
+            root.after(80, lambda: place_initial_sash(retries - 1))
+            return
+        if width <= 0:
+            width = 1200
+        target = int(width * 0.67)
+        min_left = 460
+        max_left = max(min_left, width - 320)
+        target = max(min_left, min(max_left, target))
+        try:
+            split_pane.sash_place(0, target, 0)
+            state["sash_initialized"] = True
+        except Exception:
+            pass
+
+    def on_root_configure(_event: Any) -> None:
+        if not state.get("sash_initialized", False):
+            place_initial_sash(retries=0)
+        queue_line_numbers_refresh(delay_ms=0)
 
     analyze_btn = tk.Button(toolbar, text="Analyze", command=on_analyze, width=12)
     save_btn = tk.Button(toolbar, text="Save", command=on_save, width=12)
@@ -2383,13 +2904,16 @@ def launch_gui(
     text_widget.edit_modified(False)
     state["internal_update"] = False
     refresh_line_numbers_now()
+    refresh_line_bars_now()
     text_widget.configure(yscrollcommand=on_editor_scroll)
+    preview_scroll.configure(command=on_preview_scroll)
+    preview_text.bind("<MouseWheel>", on_preview_mousewheel, add="+")
+    preview_text.bind("<Button-4>", on_preview_button4, add="+")
+    preview_text.bind("<Button-5>", on_preview_button5, add="+")
     text_widget.bind("<<Modified>>", on_modified)
     text_widget.bind("<KeyRelease>", lambda _e: queue_preview_focus_sync(delay_ms=0), add="+")
     text_widget.bind("<ButtonRelease-1>", lambda _e: queue_preview_focus_sync(delay_ms=0), add="+")
-    text_widget.bind("<MouseWheel>", lambda _e: queue_preview_focus_sync(delay_ms=0), add="+")
-    text_widget.bind("<Button-4>", lambda _e: queue_preview_focus_sync(delay_ms=0), add="+")
-    text_widget.bind("<Button-5>", lambda _e: queue_preview_focus_sync(delay_ms=0), add="+")
+    root.bind("<F9>", toggle_debug_overlay, add="+")
     text_widget.mark_set("insert", "1.0")
     text_widget.see("1.0")
     state["spell_version"] = int(state.get("spell_version", 0)) + 1
@@ -2397,12 +2921,8 @@ def launch_gui(
     queue_preview_render(delay_ms=0)
     queue_preview_focus_sync(delay_ms=0)
     text_widget.focus_set()
-    root.after(
-        50,
-        lambda: split_pane.sash_place(0, int(root.winfo_width() * 0.67), 0)
-        if root.winfo_width() > 0
-        else None,
-    )
+    root.bind("<Configure>", on_root_configure, add="+")
+    root.after_idle(lambda: place_initial_sash(24))
     root.protocol("WM_DELETE_WINDOW", on_quit)
     root.mainloop()
     return 0
