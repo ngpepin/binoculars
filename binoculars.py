@@ -1665,7 +1665,7 @@ def launch_gui(
 
     text_widget.tag_configure("edited", foreground="#ffd54f")
     text_widget.tag_configure("misspelled", underline=1, underlinefg="#ff4d4d")
-    text_widget.tag_configure("unscored", foreground="#c3c3c3")
+    text_widget.tag_configure("unscored", foreground="#dddddd")
     english_words = load_english_words()
 
     state: Dict[str, Any] = {

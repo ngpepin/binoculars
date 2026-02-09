@@ -4,3 +4,7 @@ initial-scoping.md
 samples
 *_heatmap.md
 *_headmap.md
+__pycache__
+__pycache__/
+**/__pycache__/
+*.pyc

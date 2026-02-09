@@ -86,7 +86,7 @@ Important: this is a scoring signal, not proof of authorship.
 
 ## Requirements
 
-- Linux/macOS shell
+- Linux or macOS shell
 - Python 3.10+
 - `numpy`
 - `llama-cpp-python`
