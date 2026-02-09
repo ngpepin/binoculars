@@ -2,9 +2,15 @@
 
 Local, likelihood-based AI text forensics using two `llama.cpp` models (observer + performer), inspired by the Binoculars approach.
 
+This project focuses on faithful local scoring with full logits, not API approximations.
+
 See paper (also included in repo under background/) : https://arxiv.org/abs/2401.12070
 
-This project focuses on faithful local scoring with full logits, not API approximations.
+<p align="center">
+  <img src="media/screenshot.png" width="700">
+  <br/>
+  <em>Screenshot of the GUI</em>
+</p>
 
 ## What This Does
 

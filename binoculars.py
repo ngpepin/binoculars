@@ -927,12 +927,19 @@ def build_heatmap_output_markdown(
     return "\n".join(out).rstrip() + "\n"
 
 
-def _normalize_console_text(text: str) -> str:
-    # Normalize markdown hard-break markers for cleaner terminal output.
-    # Handles both backslash+newline and backslash+spaces patterns seen in prose/dialogue.
+def _normalize_markdown_hardbreaks(text: str) -> str:
+    # Normalize markdown hard-break markers expressed as trailing backslashes.
     t = text.replace("\r\n", "\n").replace("\r", "\n")
     t = re.sub(r"\\[ \t]*\n", "\n", t)
+    t = re.sub(r"\\[ \t]*$", "", t)
+    # Also strip stray "\ " artifacts that can appear before quoted continuations.
     t = re.sub(r"(?<=\S)\\(?=\s)", "", t)
+    return t
+
+
+def _normalize_console_text(text: str) -> str:
+    # Console output should not show markdown hard-break markers as literal backslashes.
+    t = _normalize_markdown_hardbreaks(text)
     return t
 
 
@@ -1507,7 +1514,7 @@ def launch_gui(
         raise ValueError(f"--gui file not found: {src_path}")
 
     with open(src_path, "r", encoding="utf-8") as f:
-        initial_text = f.read()
+        initial_text = _normalize_markdown_hardbreaks(f.read())
 
     try:
         root = tk.Tk()
@@ -2031,7 +2038,7 @@ def launch_gui(
 
     def render_markdown_preview_now() -> None:
         state["pending_preview_job"] = None
-        raw = current_text().replace("\r\n", "\n").replace("\r", "\n")
+        raw = _normalize_markdown_hardbreaks(current_text())
 
         preview_text.configure(state="normal")
         preview_text.delete("1.0", "end")
