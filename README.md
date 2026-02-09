@@ -7,7 +7,7 @@ This project focuses on faithful local scoring with full logits, not API approxi
 See paper (also included in repo under background/) : https://arxiv.org/abs/2401.12070
 
 <p align="center">
-  <img src="media/screenshot.png" width="700">
+  <img src="media/screenshot.png" width="900">
   <br/>
   <em>Screenshot of the GUI</em>
 </p>
