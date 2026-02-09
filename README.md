@@ -1,18 +1,34 @@
-# Binoculars (Local Text Forensics with llama.cpp)
+# Binoculars
 
-`binoculars` is a local, likelihood-based AI text forensics tool inspired by the Binoculars approach.  
-It scores markdown/plain text with two related language models (observer + performer), computes Binoculars-style metrics, and can generate a paragraph-level perplexity heatmap.
+Local, likelihood-based AI text forensics using two `llama.cpp` models (observer + performer), inspired by the Binoculars approach.
 
-This repository is designed for:
-- Local/offline scoring
-- Reproducible config profiles (`fast`, `long`)
-- GPU-constrained workflows (models loaded sequentially)
+This project focuses on faithful local scoring with full logits, not API approximations.
 
-## Background
+## What This Does
 
-The approach is based on the Binoculars paper and related scoping work:
-- Paper PDF included in this repo under `background/2401.12070v3.pdf`
-- Additional local project scoping notes in `initial-scoping.md`
+Given input text, `binoculars` computes:
+
+- Observer log-perplexity: `logPPL`
+- Cross log-perplexity: `logXPPL` (observer distribution scored against performer distribution)
+- Binoculars ratio: `B = logPPL / logXPPL`
+
+It can also generate paragraph-level diagnostics and heatmaps.
+
+## Why Local / Full Logits
+
+The Binoculars-style cross-entropy term depends on full next-token distributions. In practice, this means:
+
+- `logits_all=True` is required
+- top-k API logprobs are not sufficient for faithful reconstruction
+- observer/performer tokenizer alignment must be exact
+
+Reference paper is included at:
+
+- `background/2401.12070v3.pdf`
+
+Additional local design notes:
+
+- `initial-scoping.md` (local, gitignored)
 
 ## Theory
 
@@ -22,167 +38,138 @@ Let a tokenized document be:
 x_1, x_2, \dots, x_T
 \]
 
-Use two aligned causal LMs (same tokenizer/vocab):
-- Observer model \(M_o\)
-- Performer model \(M_p\)
+with observer model \(M_o\) and performer model \(M_p\).
 
-### 1) Observer log-perplexity
+Observer log-perplexity:
 
 \[
-\log PPL_{M_o}(x) = -\frac{1}{T-1}\sum_{t=1}^{T-1}\log p_{M_o}(x_{t+1}\mid x_{\le t})
+\log PPL_{M_o}(x)
+=
+-\frac{1}{T-1}\sum_{t=1}^{T-1}\log p_{M_o}(x_{t+1}\mid x_{\le t})
 \]
 
-This is the mean next-token negative log-likelihood under the observer.
-
-### 2) Cross log-perplexity (distributional cross-entropy)
-
-At each position \(t\), let:
-- \(p_o(\cdot \mid x_{\le t})\): observer next-token distribution
-- \(p_p(\cdot \mid x_{\le t})\): performer next-token distribution
+Cross log-perplexity:
 
 \[
-\log XPPL_{M_o,M_p}(x)=
+\log XPPL_{M_o,M_p}(x)
+=
 -\frac{1}{T-1}\sum_{t=1}^{T-1}
 \sum_{v\in V}
-p_o(v\mid x_{\le t})\log p_p(v\mid x_{\le t})
+p_{M_o}(v\mid x_{\le t})\log p_{M_p}(v\mid x_{\le t})
 \]
 
-### 3) Binoculars ratio
+Binoculars score:
 
 \[
 B(x)=\frac{\log PPL_{M_o}(x)}{\log XPPL_{M_o,M_p}(x)}
 \]
 
-The script reports:
-- `observer.logPPL`, `observer.PPL`
-- `performer.logPPL`, `performer.PPL` (informational)
-- `cross.logXPPL`, `cross.XPPL`
-- `binoculars.score` (the ratio \(B\))
+Current UI/CLI interpretation used by this repo:
 
-## Interpretation Notes
+- Higher `B` is treated as more human-like
+- Lower paragraph `logPPL` is treated as more AI-like for heatmap coloring
 
-- Lower observer perplexity usually means text is more predictable to the observer LM.
-- In many settings, that can correlate with “more LM-like” text.
-- This is **not** a proof of authorship.
-- Reliable operational decisions require calibration (thresholds, ROC/FPR/TPR on your own data).
-
-## Implementation Design
-
-`binoculars.py` uses full logits from `llama-cpp-python` and evaluates models sequentially:
-
-1. Tokenize input with each model in `vocab_only` mode.
-2. Enforce exact tokenization match (hard fail on mismatch).
-3. Run observer with `logits_all=True`; compute observer metrics.
-4. Persist observer logits to memmap on disk.
-5. Unload observer; load performer.
-6. Compute cross-perplexity using observer memmap + performer logits.
-7. Compute Binoculars ratio.
-
-Why sequential loading:
-- Keeps VRAM lower by never holding both models fully resident at once.
-
-## Perplexity Heatmap
-
-`--heatmap` produces markdown with colored paragraph spans and a notes table:
-- **Red** = lowest paragraph logPPL (more predictable to observer)
-- **Green** = highest paragraph logPPL (less predictable to observer)
-
-Each highlighted span has a note index that links to the `Notes Table` section.  
-The notes table includes:
-- Index
-- Label (`LOW`/`HIGH`)
-- `% contribution` (signed effect on overall observer logPPL)
-- Paragraph id
-- `logPPL`
-- `delta_vs_doc`
-- `delta_if_removed`
-- Transition count
-- Character/token ranges
-
-Output behavior:
-- Printed to console in terminal-friendly format:
-  - ANSI color highlights (red/green)
-  - plain note markers like `[1]` (non-clickable)
-  - notes table rendered with line-drawing characters
-  - wrapped to ~85% of terminal width with normalized spacing
-- Written to `<input_stem>_heatmap.md` in the same source directory
-- Previous file auto-backed up as `<name>.<timestamp>.bak`
-
-## GUI Mode
-
-`--gui <file>` opens an interactive editor/analyzer window with:
-- Buttons: `Analyze`, `Save`, `Clear Priors`, `Quit`
-- A one-line status bar starting with: `Binocular score B (high is more human-like): ...`
-- Always-on English spell checking with red underlined misspellings (runs on open and while editing)
-- A right-side pane (~1/3 width) that renders the current text as markdown in real time (non-heatmap-colored preview)
-- Paragraph heatmap coloring after each analysis:
-  - **Red** = lower paragraph logPPL (more AI-like)
-  - **Green** = higher paragraph logPPL (more human-like)
-- Hover tooltips on colored segments with the same stats shown in the notes table format
-- Edit tracking in **yellow** for changed text since last analysis
-
-Behavior:
-- Before `Analyze` runs, current red/green analysis highlights and current yellow edits are converted into faint background priors (red/green/yellow) so deltas remain visible.
-- `Analyze` scores the full current editor text, refreshes foreground coloring/tooltips, clears yellow edit tags, preserves cursor position, and updates status with `new` plus `[prior: ...]`.
-- `Save` writes `<stem>_edited_YYYYMMDDHHMM.md` in the source file directory.
-- `Clear Priors` removes only faint prior background highlights and keeps current foreground highlights.
-- `Quit` closes the window.
+Important: this is a scoring signal, not proof of authorship.
 
 ## Repository Layout
 
-- `binoculars.py`: main scoring CLI
-- `binoculars.sh`: venv wrapper launcher
-- `binocular.sh`: convenience alias wrapper
-- `config.binoculars.json`: master profile map + default profile
-- `config.llama31.cuda12gb.fast.json`: tuned fast profile
-- `config.llama31.cuda12gb.long.json`: tuned long-doc profile
-- `background/2401.12070v3.pdf`: reference paper
-- `samples/`: example inputs
+- `binoculars.py`: main CLI + GUI application
+- `binoculars.sh`: wrapper that activates venv, auto-cleans old instances, forwards Ctrl-C
+- `binocular.sh`: alias wrapper (`exec binoculars.sh`)
+- `config.binoculars.json`: master profile selector (`default` + `profiles`)
+- `config.llama31.cuda12gb.fast.json`: fast profile (currently `text.max_tokens=4096`)
+- `config.llama31.cuda12gb.long.json`: long profile (currently `text.max_tokens=12288`)
+- `background/2401.12070v3.pdf`: background paper
+- `samples/`: sample markdown inputs
+- `tests/test_regression_v1_1_x.py`: regression suite
+- `tests/fixtures/`: fixture docs used by regression tests
 
 ## Requirements
 
-- Linux/macOS shell environment
-- Python 3.10+ (project currently tested on Python 3.10)
-- `llama-cpp-python`
+- Linux/macOS shell
+- Python 3.10+
 - `numpy`
-- GGUF model files referenced by your profile configs
+- `llama-cpp-python`
+- GGUF models on local disk
 
-Install dependencies (in venv):
+Install into repo venv:
 
 ```bash
 venv/bin/pip install numpy llama-cpp-python
 ```
 
-If using NVIDIA CUDA and you need GPU-enabled wheels, install `llama-cpp-python` from the appropriate CUDA wheel index for your system.
+## Model Files
 
-## Configuration Model
+Configs in this repo point to local model paths under `models/`, for example:
 
-Master config (`config.binoculars.json`) maps profile labels to concrete config files and can override the token cap per profile:
+- Base observer: Llama 3.1 8B Q5_K_M
+- Instruct performer: Llama 3.1 8B Instruct Q5_K_M
+
+You can use different models if tokenizer/vocab alignment is preserved.
+
+## Configuration
+
+### 1) Master profile config
+
+`config.binoculars.json` selects profile by label:
 
 ```json
 {
-  "default": "fast",
+  "default": "long",
   "profiles": {
-    "fast": {
-      "path": "/home/npepin/Projects/binoculars/config.llama31.cuda12gb.fast.json",
-      "max_tokens": 4096
-    },
-    "long": {
-      "path": "/home/npepin/Projects/binoculars/config.llama31.cuda12gb.long.json",
-      "max_tokens": 8192
-    }
+    "fast": "/abs/path/config.llama31.cuda12gb.fast.json",
+    "long": "/abs/path/config.llama31.cuda12gb.long.json"
   }
 }
 ```
 
-Notes:
-- `default` is used when `--config` is omitted.
-- `--config` takes the profile label (`fast` or `long`), not a JSON filepath.
-- `profiles.<label>.max_tokens` overrides `text.max_tokens` from the profile JSON for both CLI and GUI runs (`0` means uncapped/truncate disabled).
-- If you move the repo, update absolute paths in `config.binoculars.json`.
-- Backward compatibility: legacy string entries (`"fast": "/path/to/config.json"`) are still supported.
+`profiles` entries can be either:
 
-## Usage
+- string path (current repo default), or
+- object form:
+
+```json
+{
+  "path": "/abs/path/config.json",
+  "max_tokens": 8192
+}
+```
+
+`max_tokens` in object form (if present) overrides `text.max_tokens` in the concrete profile.
+
+### 2) Concrete observer/performer profile
+
+Each profile must define:
+
+- `observer`
+- `performer`
+
+Optional blocks:
+
+- `text` (`add_bos`, `special_tokens`, `max_tokens`)
+- `cache` (`dir`, `dtype`, `keep`)
+
+Notes:
+
+- `n_ctx: 0` means auto (`n_ctx = analyzed token count`)
+- `text.max_tokens > 0` truncates input token window
+- `cache.dtype` may be `float16` or `float32`
+
+## Execution Model
+
+`binoculars.py` loads models sequentially:
+
+1. Tokenize with observer/performer in `vocab_only=True`
+2. Hard-fail if tokenization differs
+3. Run observer with full logits
+4. Persist observer logits to memmap
+5. Unload observer, load performer
+6. Compute cross-entropy term from observer distribution vs performer logits
+7. Emit metrics, optional diagnostics/heatmap
+
+This keeps VRAM lower than concurrent dual-model loading.
+
+## CLI Usage
 
 Show help:
 
@@ -190,69 +177,172 @@ Show help:
 ./binoculars.sh --help
 ```
 
-Basic scoring (default profile from master config):
+Basic:
 
 ```bash
-./binoculars.sh samples/Athens.md --json
+./binoculars.sh samples/Athens.md
 ```
 
-Select profile explicitly:
+JSON:
 
 ```bash
-./binoculars.sh --config fast samples/Athens.md --json
-./binoculars.sh --config=long samples/Athens.md --json
-```
-
-Using explicit `--input`:
-
-```bash
-./binoculars.sh --config fast --input samples/Athens.md --json
+./binoculars.sh --config long samples/Athens.md --json
 ```
 
 Heatmap:
 
 ```bash
-./binoculars.sh --config fast --input samples/Athens.md --heatmap --diagnose-top-k 8
+./binoculars.sh --config fast --input samples/Athens.md --heatmap --diagnose-top-k 10
 ```
 
-GUI editor:
+Diagnostics:
 
 ```bash
-./binoculars.sh --config fast --gui samples/Athens.md
+./binoculars.sh --diagnose-paragraphs --diagnose-top-k 10 samples/Athens.md
+./binoculars.sh --diagnose-paragraphs --diagnose-print-text samples/Athens.md
 ```
 
 Run from any directory:
 
 ```bash
 cd ~
-/home/npepin/Projects/binoculars/binoculars.sh --config long /tmp/myfile.md --json
-# alias wrapper also works:
-/home/npepin/Projects/binoculars/binocular.sh --config=fast /tmp/myfile.md
+/home/npepin/Projects/binoculars/binoculars.sh --config long /tmp/doc.md --json
 ```
 
-## CLI Notes
-
-- Input can be provided either as:
-  - positional `INPUT`, or
-  - `--input INPUT`
-- Do not provide both at once.
-- If no input is provided, stdin is used (`-` behavior).
-- `--gui` is mutually exclusive with `--input`, positional `INPUT`, `--output`, `--json`, and `--heatmap`.
-
-## Regression Tests (v1.1.x)
-
-Run the regression suite:
+Alias wrapper:
 
 ```bash
-./venv/bin/python -m unittest -v tests/test_regression_v1_1_x.py
+/home/npepin/Projects/binoculars/binocular.sh --config fast /tmp/doc.md
 ```
 
-Fixtures:
-- `tests/fixtures/Athens.md` (copied from `samples/Athens.md` for test stability)
+### Input rules
+
+- Provide input either as:
+  - positional `INPUT`, or
+  - `--input INPUT`
+- If both are provided, command errors
+- If multiple positional paths are provided, only the first is used (warning emitted)
+- If no input is given, stdin (`-`) is used
+
+### CLI options
+
+- `--master-config FILE`: master profile mapping file
+- `--config PROFILE`: profile label (`fast`, `long`, etc.)
+- `--input FILE|-`: explicit input
+- `--output FILE`: write text output
+- `--json`: emit JSON result object
+- `--diagnose-paragraphs`: rank low-perplexity hotspot paragraphs
+- `--diagnose-top-k N`: hotspot count (also used by heatmap selection)
+- `--diagnose-print-text`: print full hotspot text segments
+- `--heatmap`: emit console + markdown heatmap output
+- `--gui FILE`: launch interactive GUI editor/analyzer
+
+`--heatmap` cannot be combined with `--json`.
+
+`--gui` is mutually exclusive with:
+
+- `--input`
+- positional `INPUT`
+- `--output`
+- `--json`
+- `--heatmap`
+
+## Heatmap Mode (`--heatmap`)
+
+When enabled:
+
+- console output shows:
+  - red/green highlights (ANSI)
+  - simple note markers like `[1]`
+  - line-drawing notes table
+  - wrapped layout (about 85% terminal width)
+- file output writes markdown to:
+  - `<input_stem>_heatmap.md` in the same directory as source input
+- existing heatmap file is backed up first:
+  - `<name>.YYYYMMDD_HHMMSS.bak` (timestamp format may vary by implementation helper)
+
+Heatmap semantics:
+
+- Red sections: lowest paragraph `logPPL`
+- Green sections: highest paragraph `logPPL`
+- Note table columns:
+  - `Index`
+  - `Label`
+  - `% contribution`
+  - `Paragraph`
+  - `logPPL`
+  - `delta_vs_doc`
+  - `delta_if_removed`
+  - `Transitions`
+  - `Chars`
+  - `Tokens`
+
+## GUI Mode (`--gui <file>`)
+
+Launches an editor/analyzer with:
+
+- Left pane: editable source text
+- Left gutter:
+  - logical line numbers
+  - red/green contribution bars per line
+- Right pane: live markdown preview
+- Controls:
+  - `Analyze`
+  - `Save`
+  - `Clear Priors`
+  - `Quit`
+- Status bar:
+  - `Binocular score B (high is more human-like): ...`
+  - includes prior score and `Last Line`
+
+### GUI behavior
+
+- `Analyze`:
+  - scores full current document
+  - preserves cursor and top-view position
+  - updates red/green foreground highlights
+  - updates hover tooltips
+  - updates status metrics
+- Edits since last analysis show in yellow
+- On next `Analyze`, previous highlights/edits become faint prior backgrounds
+- `Clear Priors` removes faint prior backgrounds only
+- `Save` writes:
+  - `<stem>_edited_YYYYMMDDHHMM.md`
+  - same directory as source
+- Always-on English spell checking:
+  - misspellings marked with red underline
+
+### Preview sync + debug controls
+
+Environment variables:
+
+- `BINOCULARS_GUI_DEBUG=1`
+  - starts with debug overlay enabled
+  - toggle in-app with `F9`
+- `BINOCULARS_PREVIEW_VIEW_OFFSET_LINES=-3`
+  - vertical view calibration for right pane
+  - changes preview viewport position only (not line mapping)
+
+## Wrapper behavior (`binoculars.sh`)
+
+`binoculars.sh`:
+
+- activates repo venv
+- runs `binoculars.py`
+- deactivates venv on exit
+- forwards Ctrl-C to child process
+- terminates prior running instances by default to free GPU/VRAM
+
+Disable auto-kill if needed:
+
+```bash
+BINOCULARS_DISABLE_AUTO_KILL=1 ./binoculars.sh ...
+```
 
 ## Output Contract (JSON)
 
 Top-level keys:
+
 - `input`
 - `observer`
 - `performer`
@@ -261,11 +351,62 @@ Top-level keys:
 - `cache`
 
 Optional:
-- `diagnostics.low_perplexity_spans` (when paragraph diagnostics enabled)
 
-## Operational Caveats
+- `diagnostics.low_perplexity_spans` (when `--diagnose-paragraphs` enabled)
 
-- Tokenizer/vocab mismatch between models is a hard failure by design.
-- Long contexts can be expensive in memory due to `logits_all=True` and large vocab.
-- `max_tokens` in the selected master profile (or fallback `text.max_tokens` in the profile JSON) is the main control for context/memory pressure.
-- Use detector outputs as risk signals, not standalone judgments.
+## Performance and Tuning Notes
+
+- Main memory pressure comes from full logits (`tokens x vocab`)
+- Long contexts are expensive even if VRAM appears available
+- `text.max_tokens` is the primary cap for runtime/memory safety
+- `n_ctx: 0` is usually best (auto-size to analyzed tokens)
+- Observer/performer are loaded sequentially by design
+
+Current shipped profile token limits:
+
+- `fast`: 4096
+- `long`: 12288
+
+Adjust these in profile JSONs based on your machine.
+
+## Troubleshooting
+
+Tokenizer mismatch error:
+
+- Use same-family model pair (base + instruct sibling)
+- Ensure both configs reference compatible tokenizer/vocab models
+
+Missing file errors:
+
+- Validate `config.binoculars.json` profile paths
+- Validate model paths in concrete config JSONs
+
+GUI unavailable:
+
+- Ensure Tkinter is installed for your Python environment
+
+Unexpected GPU memory contention:
+
+- Close other LLM processes, or rely on wrapper auto-kill
+- reduce `text.max_tokens`
+- reduce `n_batch` if needed
+
+## Tests
+
+Run regression suite:
+
+```bash
+./venv/bin/python -m unittest -v tests/test_regression_v1_1_x.py
+```
+
+## Limitations
+
+- No built-in calibrated classifier thresholds yet
+- No claim of definitive authorship attribution
+- Markdown is analyzed as text; no semantic markdown parsing
+- Long documents may require truncation due full-logit cost
+
+## Safety / Responsible Use
+
+Use outputs as probabilistic signals in a broader review workflow.  
+Do not use this tool as a sole basis for punitive or high-stakes decisions.
