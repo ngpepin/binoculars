@@ -163,16 +163,175 @@ GUI rewrite behavior:
 ## 9) Known Gaps / Next Development Priorities
 
 Priority backlog:
-1. Add chunk-aware GUI analysis for very large files (top priority):
-- After first successful `Analyze`, show `Analyze Next` when unscored tail remains.
-- `Analyze Next` should analyze remaining chunks sequentially and update the scored last-line marker.
-- Keep `Analyze Next` visible until full document chunk coverage is complete.
-- Define active chunk for status/readouts by priority:
-  - current selected line chunk,
-  - selected text block chunk,
-  - otherwise chunk containing majority of visible-window lines.
-- Pressing `Analyze` should analyze the active chunk.
-- Rewrite requests (red segment or highlighted block) should compute approximate B-impact for that requested block in the active chunk context.
+1. Implement chunk-aware GUI analysis for very large files (top priority).
+
+### 9.1) Chunk-Aware GUI Analysis: Functional Requirements
+
+1. `Analyze` behavior:
+- On first run, analyze the first analyzable chunk.
+- On subsequent runs, analyze the current active chunk (not always chunk 1).
+
+2. `Analyze Next` behavior:
+- Button appears only after first successful chunk analysis when unscored text remains.
+- Each click analyzes the next uncovered chunk after the highest covered tail.
+- Button remains visible until full document coverage is complete.
+
+3. Chunk-aware status readout:
+- Status-bar `B` and other metrics show values for the active chunk.
+- Active chunk selection priority:
+  - chunk containing currently selected text block,
+  - else chunk containing current insert/cursor line,
+  - else chunk containing majority of visible editor lines when selection/cursor anchor is off-screen.
+
+4. Rewrite behavior:
+- Right-click rewrite requests still target requested segment/block.
+- Approximate B-impact for options must use the active/requested chunk baseline metrics.
+
+5. Visuals:
+- Heatmap/line bars should show all analyzed chunks.
+- Unscored styling must apply to every not-yet-analyzed region (not just trailing tail).
+
+### 9.2) Recommended GUI State Model
+
+Add/maintain these GUI state fields in `launch_gui`:
+
+- `analysis_chunks`: list of chunk descriptors sorted by `char_start`.
+- `active_chunk_id`: stable identifier or list index for current active chunk.
+- `analysis_next_available`: bool.
+- `analysis_covered_until`: highest contiguous covered char from document start.
+- `analysis_last_line_by_chunk`: optional map chunk_id -> last scored line.
+
+Recommended chunk descriptor shape:
+
+```python
+{
+  "id": int,
+  "char_start": int,
+  "char_end": int,
+  "transitions": int,
+  "metrics": {
+    "binoculars_score": float,
+    "observer_logPPL": float,
+    "performer_logPPL": float,
+    "cross_logXPPL": float,
+  },
+  "profile": dict,   # paragraph profile adjusted to document-global char offsets
+}
+```
+
+### 9.3) Chunk Construction Strategy
+
+Use existing scoring engine, but analyze text slices:
+
+1. Determine target chunk start char:
+- first Analyze: `0`
+- Analyze Next: first uncovered char after `analysis_covered_until`
+- Analyze active chunk: `active_chunk.char_start`
+
+2. Build chunk text slice:
+- Start from chosen char start.
+- Respect paragraph boundaries where practical (avoid splitting mid-line if easy).
+- Let current `text.max_tokens` cap define maximum analyzable chunk size.
+
+3. Run existing analyzer on slice and shift offsets:
+- Call existing `analyze_text_document` on chunk text.
+- Shift returned paragraph row `char_start/char_end` by chunk `char_start` so GUI can render globally.
+
+### 9.4) Toolbar/UI Changes
+
+Add `Analyze Next` button in toolbar:
+
+- Hidden/disabled initially.
+- Show/enable after first chunk analysis if document has uncovered text.
+- Disable while analyzing/rewrite-busy like other controls.
+- Hide or disable permanently when full coverage reached.
+
+### 9.5) Active Chunk Resolver (Deterministic)
+
+Implement a pure helper with explicit priority:
+
+1. If `sel` exists and overlaps one or more analyzed chunks, choose chunk with maximum overlap.
+2. Else if insert line is visible and belongs to an analyzed chunk, choose it.
+3. Else compute visible line range via `@0,0` and bottom index; choose analyzed chunk with maximum visible-line overlap.
+4. If no analyzed chunk matches, fallback to nearest by char distance.
+
+Keep this helper reusable from:
+- status refresh
+- Analyze button handler
+- rewrite request handlers
+
+### 9.6) Analyze/Analyze Next Execution Flow
+
+1. Start worker with chosen chunk slice.
+2. On success:
+- merge/replace chunk descriptor in `analysis_chunks` by overlap rules.
+- recompute covered intervals and contiguous `analysis_covered_until`.
+- recompute active chunk.
+- recompute status line from active chunk metrics.
+
+3. Preserve existing edit/prior behavior:
+- keep stale suffix logic unchanged.
+- do not auto-trigger whole-document recomputation.
+
+### 9.7) Rendering + Unscored Regions
+
+Current renderer assumes one profile/tail. Replace with interval-based rendering:
+
+1. Merge analyzed chunk intervals.
+2. Apply segment tags for all chunk profiles.
+3. Apply `unscored` tag to complement intervals across full text.
+4. Rebuild line contribution map from combined rows/annotations from all analyzed chunks.
+
+### 9.8) Rewrite Approximation in Chunk Context
+
+When user requests rewrite:
+
+1. Resolve request chunk by overlap with span selection.
+2. Use chunk metrics (`B`, observer logPPL, cross logXPPL, transitions) as baseline for approximate scoring.
+3. Limit local approximation text context to chunk bounds (or clamp hard to chunk bounds) to avoid cross-chunk baseline mismatch.
+4. Preserve current safeguards for omitted lines/trailing newlines.
+
+### 9.9) Stepwise Implementation Plan
+
+Implement in this order to reduce risk:
+
+1. Add chunk state model + helpers (interval merge, active chunk resolver).
+2. Add `Analyze Next` button and visibility/state wiring.
+3. Refactor analysis success path to store/update chunk descriptors.
+4. Refactor rendering to support multi-chunk annotations + unscored complements.
+5. Switch status line source from singleton metrics to active chunk metrics.
+6. Wire rewrite handlers to chunk-aware baseline metrics.
+7. Add tests and update docs (`README.md`, `USERGUIDE-GUI.md`).
+
+### 9.10) Test Plan (Minimum)
+
+1. Unit tests for interval utilities:
+- merge chunk intervals,
+- complement/unscored intervals,
+- overlap-based chunk selection.
+
+2. Unit tests for active chunk resolver priority:
+- selection overlap wins,
+- then visible insert line,
+- then majority visible window.
+
+3. Regression tests:
+- `Analyze Next` appears/disappears correctly.
+- status line changes when cursor/selection moves between chunks.
+- rewrite approximation uses active chunk baseline.
+
+4. Manual GUI checks:
+- very large file with 3+ chunks,
+- interleaved edits + Analyze + Analyze Next + rewrites,
+- Clear Priors still works and does not alter chunk coverage.
+
+### 9.11) Definition of Done for This Feature
+
+Feature is done when:
+- Large docs can be fully covered via Analyze + Analyze Next without truncating workflow to one chunk.
+- Status metrics and rewrite approximations are chunk-correct and predictable.
+- UI clearly indicates scored/unscored regions across the full file.
+- Existing small-document single-pass behavior remains unchanged.
 
 2. Add calibration pipeline:
 - dataset runner + threshold selection + FPR/TPR reporting.
