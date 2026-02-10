@@ -1,10 +1,17 @@
 # Binoculars
 
-Local, likelihood-based AI text forensics using two `llama.cpp` models (observer + performer), inspired by the Binoculars approach.
+`Binoculars` is a local AI-text forensics and humanization workflow tool. It uses two related `llama.cpp` models (observer + performer) to compute faithful Binoculars-style scores from full logits, then helps you iteratively rewrite high-risk spans toward more human-like text in the GUI.
 
-This project focuses on faithful local scoring with full logits, not API approximations.
+If you need to evaluate or revise long-form text without handing documents to a hosted detector, this repo gives you a practical workflow:
 
-See paper (also included in repo under background/) : https://arxiv.org/abs/2401.12070
+- Keep data and models local by default.
+- Compute inspectable signals (`logPPL`, `logXPPL`, `B`) instead of opaque labels.
+- See exactly where score pressure comes from with paragraph-level heatmaps.
+- Generate 3 rewrite options for a flagged line or selected block and rank them by approximate B impact for fast humanization passes.
+- Re-run full Analyze only when needed for exact checkpoint scores.
+- Optionally use an OpenAI-compatible rewrite backend, with automatic fallback to internal local generation.
+
+Reference paper (also in `background/`): https://arxiv.org/abs/2401.12070
 
 <p align="center">
   <img src="media/screenshot.png" width="900">
@@ -492,3 +499,64 @@ Planned behavior (not yet implemented):
 
 Use outputs as probabilistic signals in a broader review workflow.  
 Do not use this tool as a sole basis for punitive or high-stakes decisions.
+
+## Appendix: GPTZero vs Binoculars (What Is Publicly Known)
+
+This appendix summarizes publicly available information about GPTZero and compares it to the Binoculars method implemented in this repo.
+
+### 1) What is known about how GPTZero works
+
+Public GPTZero materials describe an evolving detector stack:
+
+- GPTZero’s initial release (January 2023) emphasized `perplexity` and `burstiness` as core signals.
+- Current GPTZero docs describe a probabilistic, sentence-level and document-level deep-learning detector that does not rely only on perplexity/burstiness.
+- GPTZero publicly states its production system combines multiple components and outputs trinary sentence labels (`human`, `mixed`, `AI`) with confidence/uncertainty handling.
+
+What is not public in full detail:
+
+- exact model architecture(s),
+- exact training data composition,
+- post-processing and thresholding internals,
+- adversarial hardening implementation details.
+
+So, GPTZero is partially documented publicly, but the complete detector internals are proprietary.
+
+### 2) How Binoculars differs
+
+Binoculars is much more mechanistically explicit:
+
+- It is defined by transparent equations over two related language models:
+  - observer `logPPL`,
+  - observer-vs-performer `logXPPL`,
+  - ratio `B = logPPL / logXPPL`.
+- It is a zero-shot detection approach (no target-model-specific training required for the detector itself).
+- The paper reports strong low-FPR performance, including detection of over 90% generated samples at 0.01% FPR across studied settings.
+- The paper also reports head-to-head comparisons where Binoculars outperformed GPTZero in their 2023-timeframe evaluation setup.
+
+### 3) Why Binoculars can be in the same league as GPTZero
+
+From currently available evidence, it is reasonable to say Binoculars can be in the same competitive tier, with caveats:
+
+- The published Binoculars results show strong discrimination at very low false-positive rates, which is a key deployment criterion.
+- The mechanism is model-agnostic in the zero-shot sense and can generalize to unseen generators when assumptions hold.
+- The approach is inspectable and reproducible (equations + open implementation path), which helps calibration and operational trust.
+
+However, a careful statement is still required:
+
+- “As robust as GPTZero” is context-dependent and should be validated on your own domain, document lengths, and attack/perturbation conditions.
+- The Binoculars paper itself notes important limits (for example, degraded recall in some low-resource language settings, and no guarantee against motivated adversarial evasion).
+- Independent benchmark work also indicates that many detectors can degrade under perturbation, so robustness claims should always be treated as empirical and ongoing.
+
+Practical conclusion:
+
+- Binoculars is credibly “same-league” with commercial detectors in several reported settings, especially when low-FPR behavior is prioritized.
+- You should still run periodic, domain-specific benchmark checks (including perturbed/paraphrased text) before making strong operational claims.
+
+### 4) Sources
+
+- Binoculars paper (arXiv): https://arxiv.org/abs/2401.12070
+- Binoculars paper in repo: `background/2401.12070v3.pdf`
+- GPTZero technology page: https://gptzero.me/technology
+- GPTZero FAQ (method overview): https://gptzero.me/faqs/how-does-ai-detection-work
+- GPTZero original launch note (perplexity/burstiness framing): https://gptzero.me/news/first-release-of-gptzero-for-educators-january-3-2023
+- RAID benchmark (robustness context): https://arxiv.org/abs/2406.07958
