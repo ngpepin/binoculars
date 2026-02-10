@@ -474,6 +474,24 @@ Run regression suite:
 ./venv/bin/python -m unittest -v tests/test_regression_v1_1_x.py
 ```
 
+## License
+
+PolyForm Noncommercial License 1.0.0.
+This project implementation is licensed under the **PolyForm Noncommercial License 1.0.0** (see `LICENSE.md`).
+
+Important scope clarification:
+
+- This license covers the code, configuration, scripts, and documentation in this repository.
+- It does **not** claim ownership of, or restrict use of, the Binoculars approach described in the paper itself.
+
+Key points:
+
+- Noncommercial only: use, modification, and redistribution are permitted for noncommercial purposes.
+- Commercial use requires permission: any commercial use (including paid products or services incorporating this code) requires explicit permission from the author.
+- Attribution required: redistribution or use of substantial portions of this project must include clear credit and preserve the license/notice requirements described in `LICENSE.md`.
+
+For commercial use, contact the author to discuss potential participation and/or licensing.
+
 ## Limitations
 
 - No built-in calibrated classifier thresholds yet
