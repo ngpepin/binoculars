@@ -13,6 +13,9 @@ If you need to evaluate or revise long-form text without handing documents to a 
 
 Reference paper (also in `background/`): https://arxiv.org/abs/2401.12070
 
+Acknowledgment:
+Special thanks to the Binoculars paper authors for the foundational method this project builds on: Abhimanyu Hans, Avi Schwarzschild, Valeriia Cherepanova, Hamid Kazemi, Aniruddha Saha, Micah Goldblum, Jonas Geiping, and Tom Goldstein.
+
 <p align="center">
   <img src="media/screenshot.png" width="900">
   <br/>
