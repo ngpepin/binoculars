@@ -24,12 +24,15 @@ import gc
 import json
 import os
 import re
+import socket
 import shutil
 import sys
 import tempfile
 import threading
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List, Set
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Optional, Tuple, List, Set
 
 import numpy as np
 from llama_cpp import Llama
@@ -227,9 +230,251 @@ class CacheConfig:
     keep: bool = False         # keep cache files for debugging
 
 
+@dataclass
+class RewriteLLMConfig:
+    endpoint_url: str
+    model: str
+    api_key: str = ""
+    api_key_header: str = "Authorization"
+    api_key_prefix: str = "Bearer "
+    request_path: str = "/chat/completions"
+    timeout_s: float = 12.0
+    max_tokens: int = 180
+    temperature: float = 0.78
+    top_p: float = 0.95
+    context_chars_each_side: int = 1800
+    context_paragraphs_each_side: int = 2
+    context_window_max_chars: int = 5200
+    extra_headers: Dict[str, str] = field(default_factory=dict)
+    extra_body: Dict[str, Any] = field(default_factory=dict)
+
+
 def default_master_config_path() -> str:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(script_dir, "config.binoculars.json")
+
+
+def default_rewrite_llm_config_path() -> str:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(script_dir, "config.binoculars.llm.json")
+
+
+def _as_string_map(obj: Any) -> Dict[str, str]:
+    if not isinstance(obj, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for k, v in obj.items():
+        key = str(k).strip()
+        if not key:
+            continue
+        out[key] = str(v)
+    return out
+
+
+def _as_object_map(obj: Any) -> Dict[str, Any]:
+    if not isinstance(obj, dict):
+        return {}
+    return dict(obj)
+
+
+def _build_chat_completions_url(endpoint_url: str, request_path: str) -> str:
+    base = str(endpoint_url).strip()
+    if not base:
+        return ""
+    low = base.lower()
+    if low.endswith("/chat/completions"):
+        return base
+    req = str(request_path or "").strip() or "/chat/completions"
+    if not req.startswith("/"):
+        req = "/" + req
+    return base.rstrip("/") + req
+
+
+def load_optional_rewrite_llm_config(
+    path: Optional[str] = None,
+) -> Tuple[Optional[RewriteLLMConfig], Optional[str]]:
+    cfg_path = str(path or default_rewrite_llm_config_path()).strip()
+    if not cfg_path:
+        return None, None
+    if not os.path.isfile(cfg_path):
+        return None, None
+
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as exc:
+        return None, f"LLM config parse error ({cfg_path}): {exc}"
+
+    if not isinstance(raw, dict):
+        return None, f"LLM config must be a JSON object ({cfg_path})."
+
+    cfg_raw = raw.get("llm") if isinstance(raw.get("llm"), dict) else raw
+    if not isinstance(cfg_raw, dict):
+        return None, f"LLM config 'llm' section must be an object ({cfg_path})."
+
+    if not bool(cfg_raw.get("enabled", True)):
+        return None, None
+
+    endpoint_url = str(cfg_raw.get("endpoint_url", cfg_raw.get("endpoint", cfg_raw.get("url", "")))).strip()
+    model = str(cfg_raw.get("model", "")).strip()
+    if not endpoint_url or not model:
+        return None, f"LLM config missing endpoint_url or model ({cfg_path})."
+
+    api_key = str(cfg_raw.get("api_key", "")).strip()
+    api_key_env = str(cfg_raw.get("api_key_env", "")).strip()
+    if not api_key and api_key_env:
+        api_key = str(os.environ.get(api_key_env, "")).strip()
+    if not api_key and bool(cfg_raw.get("allow_openai_api_key_env", True)):
+        api_key = str(os.environ.get("OPENAI_API_KEY", "")).strip()
+
+    try:
+        timeout_s = float(cfg_raw.get("timeout_s", 12.0))
+    except Exception:
+        timeout_s = 12.0
+    if timeout_s <= 0:
+        timeout_s = 12.0
+
+    try:
+        max_tokens = int(cfg_raw.get("max_tokens", 180))
+    except Exception:
+        max_tokens = 180
+    max_tokens = max(24, min(max_tokens, 1200))
+
+    try:
+        temperature = float(cfg_raw.get("temperature", 0.78))
+    except Exception:
+        temperature = 0.78
+    temperature = max(0.0, min(temperature, 2.0))
+
+    try:
+        top_p = float(cfg_raw.get("top_p", 0.95))
+    except Exception:
+        top_p = 0.95
+    top_p = max(0.01, min(top_p, 1.0))
+
+    try:
+        context_chars_each_side = int(cfg_raw.get("context_chars_each_side", 1800))
+    except Exception:
+        context_chars_each_side = 1800
+    context_chars_each_side = max(300, min(context_chars_each_side, 20000))
+
+    try:
+        context_paragraphs_each_side = int(cfg_raw.get("context_paragraphs_each_side", 2))
+    except Exception:
+        context_paragraphs_each_side = 2
+    context_paragraphs_each_side = max(0, min(context_paragraphs_each_side, 8))
+
+    try:
+        context_window_max_chars = int(cfg_raw.get("context_window_max_chars", 5200))
+    except Exception:
+        context_window_max_chars = 5200
+    context_window_max_chars = max(900, min(context_window_max_chars, 50000))
+
+    request_path = str(cfg_raw.get("request_path", "/chat/completions")).strip() or "/chat/completions"
+    api_key_header = str(cfg_raw.get("api_key_header", "Authorization")).strip() or "Authorization"
+    api_key_prefix = str(cfg_raw.get("api_key_prefix", "Bearer ")).strip()
+    if api_key_prefix and not api_key_prefix.endswith(" "):
+        api_key_prefix += " "
+
+    extra_headers = _as_string_map(cfg_raw.get("extra_headers", cfg_raw.get("headers", {})))
+    extra_body = _as_object_map(cfg_raw.get("extra_body", cfg_raw.get("body", cfg_raw.get("params", {}))))
+
+    cfg = RewriteLLMConfig(
+        endpoint_url=endpoint_url,
+        model=model,
+        api_key=api_key,
+        api_key_header=api_key_header,
+        api_key_prefix=api_key_prefix,
+        request_path=request_path,
+        timeout_s=timeout_s,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        context_chars_each_side=context_chars_each_side,
+        context_paragraphs_each_side=context_paragraphs_each_side,
+        context_window_max_chars=context_window_max_chars,
+        extra_headers=extra_headers,
+        extra_body=extra_body,
+    )
+    return cfg, None
+
+
+def _post_json_request(
+    url: str,
+    payload: Dict[str, Any],
+    headers: Dict[str, str],
+    timeout_s: float,
+) -> Dict[str, Any]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url=url, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=max(1.0, float(timeout_s))) as resp:
+        body = resp.read()
+        text = body.decode("utf-8", errors="replace")
+        parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM response was not a JSON object.")
+    return parsed
+
+
+def _generate_rewrites_via_openai_compatible(
+    llm_cfg: RewriteLLMConfig,
+    system_prompt: str,
+    user_prompt: str,
+    option_count: int,
+) -> List[str]:
+    n_opts = max(1, int(option_count))
+    url = _build_chat_completions_url(llm_cfg.endpoint_url, llm_cfg.request_path)
+    if not url:
+        raise ValueError("LLM endpoint URL is empty.")
+
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    for k, v in llm_cfg.extra_headers.items():
+        headers[str(k)] = str(v)
+    if llm_cfg.api_key:
+        headers[llm_cfg.api_key_header] = f"{llm_cfg.api_key_prefix}{llm_cfg.api_key}"
+
+    rewrites: List[str] = []
+    seen: Set[str] = set()
+    temperatures = [llm_cfg.temperature, min(1.25, llm_cfg.temperature + 0.20)]
+
+    for temp in temperatures:
+        if len(rewrites) >= n_opts:
+            break
+        want = max(1, n_opts - len(rewrites))
+        payload: Dict[str, Any] = dict(llm_cfg.extra_body)
+        payload.setdefault("model", llm_cfg.model)
+        payload["messages"] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        payload.setdefault("temperature", float(temp))
+        payload.setdefault("top_p", float(llm_cfg.top_p))
+        payload.setdefault("max_tokens", int(llm_cfg.max_tokens))
+        payload.setdefault("n", int(want))
+        payload.setdefault("stream", False)
+
+        response = _post_json_request(url, payload, headers, llm_cfg.timeout_s)
+        choices = response.get("choices")
+        if not isinstance(choices, list):
+            continue
+        for ch in choices:
+            txt = _extract_completion_text({"choices": [ch]})
+            cand = _normalize_generated_rewrite(txt)
+            if not cand:
+                continue
+            key = _semantic_text_key(cand)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            rewrites.append(cand)
+            if len(rewrites) >= n_opts:
+                break
+
+    if not rewrites:
+        raise ValueError("No rewrite candidates returned by external LLM.")
+    while len(rewrites) < n_opts:
+        rewrites.append(rewrites[-1])
+    return rewrites[:n_opts]
 
 
 def load_master_config_detailed(path: str) -> Tuple[str, Dict[str, Dict[str, Any]]]:
@@ -1496,6 +1741,520 @@ def analyze_text_document(
                 temp_dir_ctx.cleanup()
 
 
+def _extract_completion_text(response: Any) -> str:
+    if not isinstance(response, dict):
+        return ""
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+    msg = first.get("message")
+    if isinstance(msg, dict):
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            return content
+    text = first.get("text", "")
+    if isinstance(text, str):
+        return text
+    return ""
+
+
+def _normalize_generated_rewrite(text: str) -> str:
+    s = str(text or "").strip()
+    if not s:
+        return ""
+
+    if s.startswith("```"):
+        lines = s.splitlines()
+        if len(lines) >= 3 and lines[-1].strip() == "```":
+            body = lines[1:-1]
+            if body:
+                s = "\n".join(body).strip()
+
+    s = re.sub(r"^\s*(?:option\s*)?\d+\s*[\)\].:-]\s*", "", s, flags=re.IGNORECASE)
+    if len(s) >= 2 and ((s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'"))):
+        s = s[1:-1].strip()
+    return s
+
+
+def _semantic_text_key(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _score_observer_logppl_batch(
+    cfg_path: str,
+    texts: List[str],
+    text_max_tokens_override: Optional[int] = None,
+) -> List[Dict[str, float]]:
+    if not texts:
+        return []
+
+    cfg, tcfg, _ccfg = load_config(cfg_path)
+    if text_max_tokens_override is not None:
+        if int(text_max_tokens_override) < 0:
+            raise ValueError(f"text_max_tokens_override={text_max_tokens_override} must be >= 0.")
+        tcfg.max_tokens = int(text_max_tokens_override)
+
+    observer_section = cfg["observer"]
+    obs_path = observer_section.get("model_path")
+    if not obs_path:
+        raise ValueError("observer.model_path is required.")
+
+    tokens_per_text: List[List[int]] = []
+    for text in texts:
+        tok_full = tokenize_with_vocab_only(obs_path, text.encode("utf-8", errors="replace"), tcfg)
+        tok = maybe_truncate_tokens(tok_full, tcfg.max_tokens)
+        if len(tok) < 2:
+            raise ValueError("Local rewrite scoring text is too short after tokenization.")
+        tokens_per_text.append(tok)
+
+    needed_ctx = max(len(toks) for toks in tokens_per_text)
+    n_ctx_obs = infer_n_ctx(observer_section, needed_ctx)
+
+    obs_cfg = dict(observer_section)
+    obs_cfg["model_path"] = obs_path
+    obs_cfg["n_ctx"] = n_ctx_obs
+    obs_cfg["logits_all"] = True
+    obs_cfg.setdefault("verbose", False)
+    obs_cfg = filter_llama_kwargs(obs_cfg)
+
+    obs = None
+    out: List[Dict[str, float]] = []
+    try:
+        obs = build_llama_instance(obs_cfg)
+        n_vocab_obs = obs.n_vocab()
+        for toks in tokens_per_text:
+            obs.reset()
+            obs.eval(toks)
+            scores = obs.scores[: len(toks), :n_vocab_obs]
+            logppl, _ppl = compute_logppl_from_scores(scores, toks)
+            out.append(
+                {
+                    "logPPL": float(logppl),
+                    "transitions": int(len(toks) - 1),
+                }
+            )
+        return out
+    finally:
+        close_llama(obs)
+        try:
+            del obs
+        except Exception:
+            pass
+        gc.collect()
+
+
+def _choose_rewrite_window_bounds(
+    text: str,
+    span_start: int,
+    span_end: int,
+    neighbor_paragraphs: int = 1,
+    pad_chars: int = 120,
+    max_window_chars: int = 2600,
+) -> Tuple[int, int]:
+    n = len(text)
+    start = max(0, min(n, int(span_start)))
+    end = max(start, min(n, int(span_end)))
+    if n <= 0:
+        return (0, 0)
+
+    spans = split_markdown_paragraph_spans(text)
+    hit_idx: Optional[int] = None
+    for i, (s, e) in enumerate(spans):
+        if end > s and start < e:
+            hit_idx = i
+            break
+
+    if hit_idx is None or not spans:
+        w_start = max(0, start - 900)
+        w_end = min(n, end + 900)
+    else:
+        left_idx = max(0, hit_idx - max(0, int(neighbor_paragraphs)))
+        right_idx = min(len(spans) - 1, hit_idx + max(0, int(neighbor_paragraphs)))
+        w_start = spans[left_idx][0]
+        w_end = spans[right_idx][1]
+
+    w_start = max(0, w_start - max(0, int(pad_chars)))
+    w_end = min(n, w_end + max(0, int(pad_chars)))
+
+    max_chars = max(300, int(max_window_chars))
+    if (w_end - w_start) > max_chars:
+        center = (start + end) // 2
+        half = max_chars // 2
+        w_start = max(0, center - half)
+        w_end = min(n, w_start + max_chars)
+        w_start = max(0, w_end - max_chars)
+
+    return (w_start, w_end)
+
+
+def _clip_text_middle(text: str, max_chars: int) -> str:
+    s = str(text or "")
+    cap = max(80, int(max_chars))
+    if len(s) <= cap:
+        return s
+    head = max(24, (cap - 9) // 2)
+    tail = max(24, cap - head - 9)
+    return s[:head] + "\n[...]\n" + s[-tail:]
+
+
+def _paragraph_index_for_span(
+    spans: List[Tuple[int, int]],
+    start: int,
+    end: int,
+) -> Optional[int]:
+    for i, (s, e) in enumerate(spans):
+        if end > s and start < e:
+            return i
+    return None
+
+
+def _build_rewrite_prompts(
+    full_text: str,
+    span_start: int,
+    span_end: int,
+    llm_cfg: Optional[RewriteLLMConfig],
+) -> Tuple[str, str, str]:
+    start = max(0, min(len(full_text), int(span_start)))
+    end = max(start, min(len(full_text), int(span_end)))
+    target = full_text[start:end].strip()
+    if not target:
+        raise ValueError("Selected low-perplexity span is empty.")
+
+    if llm_cfg is None:
+        context_chars_each_side = 1800
+        context_paragraphs_each_side = 2
+        context_window_max_chars = 5200
+    else:
+        context_chars_each_side = int(llm_cfg.context_chars_each_side)
+        context_paragraphs_each_side = int(llm_cfg.context_paragraphs_each_side)
+        context_window_max_chars = int(llm_cfg.context_window_max_chars)
+
+    spans = split_markdown_paragraph_spans(full_text)
+    para_idx = _paragraph_index_for_span(spans, start, end)
+    prev_para = ""
+    next_para = ""
+    if para_idx is not None and spans:
+        if para_idx > 0:
+            ps, pe = spans[para_idx - 1]
+            prev_para = full_text[ps:pe].strip()
+        if para_idx + 1 < len(spans):
+            ns, ne = spans[para_idx + 1]
+            next_para = full_text[ns:ne].strip()
+
+    win_start, win_end = _choose_rewrite_window_bounds(
+        full_text,
+        start,
+        end,
+        neighbor_paragraphs=context_paragraphs_each_side,
+        pad_chars=220,
+        max_window_chars=context_window_max_chars,
+    )
+
+    left_start = max(win_start, start - context_chars_each_side)
+    right_end = min(win_end, end + context_chars_each_side)
+    left = full_text[left_start:start]
+    right = full_text[end:right_end]
+
+    window_marked = (
+        full_text[win_start:start]
+        + "\n[[TARGET SPAN START]]\n"
+        + full_text[start:end]
+        + "\n[[TARGET SPAN END]]\n"
+        + full_text[end:win_end]
+    )
+
+    left = _clip_text_middle(left.strip(), min(context_chars_each_side, 3600))
+    right = _clip_text_middle(right.strip(), min(context_chars_each_side, 3600))
+    prev_para = _clip_text_middle(prev_para, 1200)
+    next_para = _clip_text_middle(next_para, 1200)
+    window_marked = _clip_text_middle(window_marked.strip(), context_window_max_chars)
+
+    system_prompt = (
+        "You rewrite exactly one markdown span from a document. Preserve meaning, facts, timeline, and voice. "
+        "Do not add explanations or labels. Output only the rewritten span text."
+    )
+
+    user_prompt = (
+        "Rewrite the TARGET span so it sounds naturally authored while staying semantically equivalent.\n\n"
+        "GLOBAL CONSTRAINTS:\n"
+        "- Preserve named entities, claims, and implied facts.\n"
+        "- Preserve tense, perspective, and speaker intent.\n"
+        "- Preserve dialogue structure and punctuation style when present.\n"
+        "- Keep similar length (roughly +/-30%).\n"
+        "- No preface, no bullets, no numbering; return only rewritten TARGET span text.\n\n"
+        "PREVIOUS PARAGRAPH:\n"
+        f"{prev_para}\n\n"
+        "CONTEXT BEFORE TARGET:\n"
+        f"{left}\n\n"
+        "TARGET SPAN:\n"
+        f"{target}\n\n"
+        "CONTEXT AFTER TARGET:\n"
+        f"{right}\n\n"
+        "NEXT PARAGRAPH:\n"
+        f"{next_para}\n\n"
+        "WINDOW WITH TARGET MARKERS (for local coherence):\n"
+        f"{window_marked}"
+    )
+
+    return system_prompt, user_prompt, target
+
+
+def _generate_rewrites_via_internal_performer(
+    cfg_path: str,
+    system_prompt: str,
+    user_prompt: str,
+    target_text: str,
+    option_count: int,
+    status_callback: Optional[Callable[[str], None]] = None,
+) -> List[str]:
+    n_opts = max(1, int(option_count))
+    cfg, _tcfg, _ccfg = load_config(cfg_path)
+    performer_section = cfg["performer"]
+    perf_path = performer_section.get("model_path")
+    if not perf_path:
+        raise ValueError("performer.model_path is required.")
+
+    perf_cfg = dict(performer_section)
+    perf_cfg["model_path"] = perf_path
+    configured_n_ctx = int(perf_cfg.get("n_ctx", 0) or 0)
+    perf_cfg["logits_all"] = False
+    perf_cfg.setdefault("verbose", False)
+    try:
+        target_tokens_preview = tokenize_with_vocab_only(
+            perf_path,
+            target_text.encode("utf-8", errors="replace"),
+            TextConfig(add_bos=False, special_tokens=False, max_tokens=0),
+        )
+        target_tok_len = len(target_tokens_preview)
+    except Exception:
+        target_tok_len = max(12, len(target_text) // 4)
+    max_out_tokens = min(220, max(48, int(target_tok_len * 1.35) + 20))
+
+    prompt_chars = len(system_prompt) + len(user_prompt) + len(target_text) + 240
+    prompt_tok_est = max(256, prompt_chars // 3)
+    n_ctx_needed = min(4096, max(1536, prompt_tok_est + max_out_tokens + 192))
+    if configured_n_ctx <= 0:
+        perf_cfg["n_ctx"] = n_ctx_needed
+    else:
+        perf_cfg["n_ctx"] = max(int(configured_n_ctx), n_ctx_needed)
+    perf_cfg = filter_llama_kwargs(perf_cfg)
+
+    perf = None
+    try:
+        if status_callback is not None:
+            status_callback(f"Loading internal performer model (n_ctx={perf_cfg.get('n_ctx')})...")
+        perf = build_llama_instance(perf_cfg)
+
+        temperatures = [0.66, 0.82, 0.98, 0.74, 0.90]
+        rewrites: List[str] = []
+        seen: Set[str] = set()
+
+        for idx, temp in enumerate(temperatures, start=1):
+            if len(rewrites) >= n_opts:
+                break
+            if status_callback is not None:
+                status_callback(f"Generating option candidates (pass {idx}/{len(temperatures)})...")
+            raw_text = ""
+            try:
+                if hasattr(perf, "create_chat_completion"):
+                    resp = perf.create_chat_completion(
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        temperature=float(temp),
+                        top_p=0.95,
+                        max_tokens=max_out_tokens,
+                        repeat_penalty=1.08,
+                    )
+                    raw_text = _extract_completion_text(resp)
+                else:
+                    resp = perf.create_completion(
+                        prompt=f"{system_prompt}\n\n{user_prompt}\n\nRewrite:\n",
+                        temperature=float(temp),
+                        top_p=0.95,
+                        max_tokens=max_out_tokens,
+                        repeat_penalty=1.08,
+                    )
+                    raw_text = _extract_completion_text(resp)
+            except Exception:
+                continue
+
+            candidate = _normalize_generated_rewrite(raw_text)
+            if not candidate:
+                continue
+            key = _semantic_text_key(candidate)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            rewrites.append(candidate)
+
+        if not rewrites:
+            raise ValueError("Could not generate rewrite options with internal performer model.")
+
+        while len(rewrites) < n_opts:
+            rewrites.append(rewrites[-1])
+        return rewrites[:n_opts]
+    finally:
+        close_llama(perf)
+        try:
+            del perf
+        except Exception:
+            pass
+        gc.collect()
+
+
+def generate_rewrite_candidates_for_span(
+    cfg_path: str,
+    full_text: str,
+    span_start: int,
+    span_end: int,
+    option_count: int = 3,
+    status_callback: Optional[Callable[[str], None]] = None,
+) -> Tuple[List[str], str, Optional[str]]:
+    n_opts = max(1, int(option_count))
+    start = max(0, min(len(full_text), int(span_start)))
+    end = max(start, min(len(full_text), int(span_end)))
+
+    llm_cfg, llm_cfg_issue = load_optional_rewrite_llm_config()
+    system_prompt, user_prompt, target = _build_rewrite_prompts(
+        full_text=full_text,
+        span_start=start,
+        span_end=end,
+        llm_cfg=llm_cfg,
+    )
+    if llm_cfg is not None:
+        try:
+            if status_callback is not None:
+                status_callback("Trying external rewrite LLM...")
+            rewrites = _generate_rewrites_via_openai_compatible(
+                llm_cfg=llm_cfg,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                option_count=n_opts,
+            )
+            return rewrites, "external-llm", None
+        except (urllib.error.URLError, urllib.error.HTTPError, socket.timeout, TimeoutError, OSError, ValueError) as exc:
+            if status_callback is not None:
+                status_callback("External LLM unavailable; falling back to internal model...")
+            fallback_reason = f"external LLM failed ({type(exc).__name__}: {exc})"
+        except Exception as exc:
+            if status_callback is not None:
+                status_callback("External LLM failed; falling back to internal model...")
+            fallback_reason = f"external LLM failed ({type(exc).__name__}: {exc})"
+        rewrites = _generate_rewrites_via_internal_performer(
+            cfg_path=cfg_path,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            target_text=target,
+            option_count=n_opts,
+            status_callback=status_callback,
+        )
+        return rewrites, "internal-fallback", fallback_reason
+
+    if llm_cfg_issue and status_callback is not None:
+        status_callback("LLM config invalid; using internal model.")
+
+    rewrites = _generate_rewrites_via_internal_performer(
+        cfg_path=cfg_path,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        target_text=target,
+        option_count=n_opts,
+        status_callback=status_callback,
+    )
+    return rewrites, "internal", llm_cfg_issue
+
+
+def estimate_rewrite_b_impact_options(
+    cfg_path: str,
+    full_text: str,
+    span_start: int,
+    span_end: int,
+    rewrites: List[str],
+    base_doc_b: float,
+    base_doc_observer_logppl: float,
+    base_doc_cross_logxppl: float,
+    base_doc_transitions: int,
+    text_max_tokens_override: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    if not rewrites:
+        return []
+
+    start = max(0, min(len(full_text), int(span_start)))
+    end = max(start, min(len(full_text), int(span_end)))
+    win_start, win_end = _choose_rewrite_window_bounds(full_text, start, end)
+    base_local = full_text[win_start:win_end]
+    rel_start = max(0, min(len(base_local), start - win_start))
+    rel_end = max(rel_start, min(len(base_local), end - win_start))
+
+    local_texts: List[str] = [base_local]
+    for rw in rewrites:
+        local_texts.append(base_local[:rel_start] + rw + base_local[rel_end:])
+
+    local_scores = _score_observer_logppl_batch(
+        cfg_path=cfg_path,
+        texts=local_texts,
+        text_max_tokens_override=text_max_tokens_override,
+    )
+    if len(local_scores) != len(local_texts):
+        raise ValueError("Internal error: local rewrite scoring did not produce expected score count.")
+
+    base_local_logppl = float(local_scores[0]["logPPL"])
+    base_local_transitions = int(local_scores[0]["transitions"])
+    doc_transitions = max(1, int(base_doc_transitions))
+    base_local_total = base_local_logppl * float(base_local_transitions)
+
+    out: List[Dict[str, Any]] = []
+    for rw, sc in zip(rewrites, local_scores[1:]):
+        cand_local_logppl = float(sc["logPPL"])
+        cand_local_transitions = int(sc["transitions"])
+        cand_local_total = cand_local_logppl * float(cand_local_transitions)
+        delta_doc_observer = (cand_local_total - base_local_total) / float(doc_transitions)
+        approx_observer = float(base_doc_observer_logppl + delta_doc_observer)
+        if np.isfinite(base_doc_cross_logxppl) and base_doc_cross_logxppl != 0.0:
+            approx_b = float(approx_observer / base_doc_cross_logxppl)
+        else:
+            approx_b = float("inf")
+        if np.isfinite(approx_b) and np.isfinite(base_doc_b):
+            delta_b = float(approx_b - base_doc_b)
+        else:
+            delta_b = float("nan")
+        out.append(
+            {
+                "text": rw,
+                "approx_B": approx_b,
+                "delta_B": delta_b,
+                "approx_observer_logPPL": approx_observer,
+                "local_logPPL": cand_local_logppl,
+                "local_transitions": cand_local_transitions,
+            }
+        )
+    def _rank_key(opt: Dict[str, Any]) -> Tuple[int, float, int, float]:
+        raw_delta = opt.get("delta_B", float("nan"))
+        raw_b = opt.get("approx_B", float("nan"))
+        try:
+            delta_b = float(raw_delta)
+        except Exception:
+            delta_b = float("nan")
+        try:
+            approx_b = float(raw_b)
+        except Exception:
+            approx_b = float("nan")
+
+        has_delta = 1 if np.isfinite(delta_b) else 0
+        has_b = 1 if np.isfinite(approx_b) else 0
+        delta_key = delta_b if has_delta else float("-inf")
+        b_key = approx_b if has_b else float("-inf")
+        return (has_delta, delta_key, has_b, b_key)
+
+    out.sort(key=_rank_key, reverse=True)
+    return out
+
+
 def launch_gui(
     cfg_path: str,
     gui_input_path: str,
@@ -1680,9 +2439,14 @@ def launch_gui(
         "prev_text": initial_text,
         "segment_tags": [],
         "segment_labels": {},
+        "segment_infos": {},
         "prior_bg_tags": [],
         "prior_counter": 0,
         "last_b_score": None,
+        "has_analysis": False,
+        "b_score_stale": False,
+        "last_analysis_status_core": "",
+        "last_analysis_metrics": None,
         "spell_version": 0,
         "last_spell_spans": None,
         "tooltip": None,
@@ -1705,6 +2469,9 @@ def launch_gui(
         "internal_update": False,
         "analyzing": False,
         "progress_popup": None,
+        "rewrite_popup": None,
+        "rewrite_request_id": 0,
+        "rewrite_busy": False,
         "debug_enabled": bool(os.environ.get("BINOCULARS_GUI_DEBUG")),
         "preview_view_offset_lines": int(os.environ.get("BINOCULARS_PREVIEW_VIEW_OFFSET_LINES", "-3")),
     }
@@ -1713,6 +2480,22 @@ def launch_gui(
 
     def current_text() -> str:
         return text_widget.get("1.0", "end-1c")
+
+    def analysis_stale_suffix() -> str:
+        if state.get("has_analysis") and state.get("b_score_stale"):
+            return " | B score is stale for current edits/rewrites. Run Analyze for exact B."
+        return ""
+
+    def refresh_analysis_status_line() -> None:
+        core = str(state.get("last_analysis_status_core", "")).strip()
+        if core:
+            status_var.set(core + analysis_stale_suffix())
+
+    def mark_analysis_stale() -> None:
+        if not state.get("has_analysis"):
+            return
+        state["b_score_stale"] = True
+        refresh_analysis_status_line()
 
     def refresh_line_numbers_now() -> None:
         state["pending_line_numbers_job"] = None
@@ -2458,6 +3241,441 @@ def launch_gui(
         if tip is not None:
             tip.geometry(f"+{event.x_root + 14}+{event.y_root + 12}")
 
+    def char_offset_for_index(index: str) -> int:
+        try:
+            raw = text_widget.count("1.0", index, "chars")
+            if isinstance(raw, tuple) and raw:
+                return int(raw[0])
+        except Exception:
+            pass
+        return 0
+
+    def tag_range_containing_index(tag: str, index: str) -> Optional[Tuple[str, str]]:
+        ranges = text_widget.tag_ranges(tag)
+        for i in range(0, len(ranges), 2):
+            s = str(ranges[i])
+            e = str(ranges[i + 1])
+            try:
+                if text_widget.compare(index, ">=", s) and text_widget.compare(index, "<", e):
+                    return (s, e)
+            except Exception:
+                continue
+        if len(ranges) >= 2:
+            return (str(ranges[0]), str(ranges[1]))
+        return None
+
+    def close_rewrite_popup() -> None:
+        popup = state.get("rewrite_popup")
+        if popup is None:
+            state["rewrite_popup"] = None
+            state["rewrite_busy"] = False
+            return
+        try:
+            popup.grab_release()
+        except Exception:
+            pass
+        try:
+            popup.destroy()
+        except Exception:
+            pass
+        state["rewrite_popup"] = None
+        state["rewrite_busy"] = False
+
+    def on_low_segment_right_click(event: Any, tag: str) -> str:
+        if state.get("analyzing") or state.get("rewrite_busy"):
+            return "break"
+        if not state.get("has_analysis"):
+            status_var.set("Rewrite menu is available after Analyze has been run at least once.")
+            return "break"
+
+        metrics_obj = state.get("last_analysis_metrics")
+        metrics = metrics_obj if isinstance(metrics_obj, dict) else None
+        if metrics is None:
+            status_var.set("Rewrite menu is unavailable until Analyze completes successfully.")
+            return "break"
+
+        click_idx = text_widget.index(f"@{event.x},{event.y}")
+        range_pair = tag_range_containing_index(tag, click_idx)
+        if range_pair is None:
+            return "break"
+        start_idx, end_idx = range_pair
+        if not text_widget.compare(end_idx, ">", start_idx):
+            return "break"
+
+        text_snapshot = current_text()
+        start_char = char_offset_for_index(start_idx)
+        end_char = char_offset_for_index(end_idx)
+        if end_char <= start_char:
+            return "break"
+
+        selected = text_snapshot[start_char:end_char]
+        if not selected.strip():
+            return "break"
+
+        close_rewrite_popup()
+        hide_tooltip()
+
+        popup = None
+        try:
+            popup = tk.Toplevel(root)
+            popup.title("Rewrite Options")
+            popup.transient(root)
+            popup.resizable(True, True)
+            popup.configure(bg="#111111")
+            # Apply a reliable initial size immediately so window does not start tiny.
+            popup.geometry("860x560")
+            popup.minsize(760, 520)
+            try:
+                root.update_idletasks()
+                root_w = max(900, int(root.winfo_width()))
+                root_h = max(700, int(root.winfo_height()))
+                popup_w = max(860, min(1120, int(root_w * 0.64)))
+                popup_h = max(560, min(760, int(root_h * 0.64)))
+                x = root.winfo_rootx() + max(0, (root_w - popup_w) // 2)
+                y = root.winfo_rooty() + max(0, (root_h - popup_h) // 2)
+                popup.geometry(f"{popup_w}x{popup_h}+{x}+{y}")
+            except Exception:
+                pass
+        except Exception as exc:
+            status_var.set(f"Failed to open rewrite popup: {exc}{analysis_stale_suffix()}")
+            return "break"
+        state["rewrite_popup"] = popup
+        state["rewrite_busy"] = True
+        request_id = int(state.get("rewrite_request_id", 0)) + 1
+        state["rewrite_request_id"] = request_id
+
+        try:
+            title_label = tk.Label(
+                popup,
+                text="Generating 3 rewrites for selected LOW section. Please wait...",
+                anchor="w",
+                justify="left",
+                bg="#111111",
+                fg="#f0f0f0",
+                padx=10,
+                pady=8,
+                font=("TkDefaultFont", 11, "bold"),
+            )
+            title_label.pack(side="top", fill="x")
+
+            sub_label = tk.Label(
+                popup,
+                text=(
+                    "Expected B impact is approximate. Full Analyze is required for exact B. "
+                    "First run may take longer while models warm up."
+                ),
+                anchor="w",
+                justify="left",
+                bg="#111111",
+                fg="#c4c4c4",
+                padx=10,
+                pady=0,
+            )
+            sub_label.pack(side="top", fill="x", pady=(0, 8))
+
+            status_label_var = tk.StringVar(value="Working...")
+            popup_status = tk.Label(
+                popup,
+                textvariable=status_label_var,
+                anchor="w",
+                justify="left",
+                bg="#111111",
+                fg="#d6d6d6",
+                padx=10,
+                pady=0,
+            )
+            popup_status.pack(side="top", fill="x", pady=(0, 8))
+
+            wait_label_var = tk.StringVar(
+                value="Please wait while options are generated and scored. This may take 30-120s."
+            )
+            wait_label = tk.Label(
+                popup,
+                textvariable=wait_label_var,
+                anchor="w",
+                justify="left",
+                bg="#111111",
+                fg="#9cc7ff",
+                padx=10,
+                pady=0,
+            )
+            wait_label.pack(side="top", fill="x", pady=(0, 10))
+
+            options_text = tk.Text(
+                popup,
+                wrap="word",
+                height=14,
+                width=96,
+                bg="#151515",
+                fg="#f0f0f0",
+                relief="flat",
+                borderwidth=0,
+                highlightthickness=1,
+                highlightbackground="#2a2a2a",
+                insertbackground="#f0f0f0",
+                font=("TkFixedFont", 11),
+                padx=10,
+                pady=8,
+            )
+            options_text.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 8))
+            options_text.insert(
+                "1.0",
+                "Preparing rewrite generation...\n\n"
+                "Stages:\n"
+                "1. Select rewrite model (external LLM if configured, else internal performer)\n"
+                "2. Generate 3 rewrite candidates\n"
+                "3. Score approximate B impact\n",
+            )
+            options_text.bind("<Key>", lambda _e: "break")
+
+            button_frame = tk.Frame(popup, bg="#111111")
+            button_frame.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
+            option_buttons: List[Any] = []
+
+            popup_state: Dict[str, Any] = {
+                "request_id": request_id,
+                "start_idx": start_idx,
+                "end_idx": end_idx,
+                "options": [],
+            }
+        except Exception as exc:
+            status_var.set(f"Rewrite popup render failed: {exc}{analysis_stale_suffix()}")
+            close_rewrite_popup()
+            return "break"
+
+        def activate_popup_modal() -> None:
+            if not popup_active():
+                return
+            try:
+                popup.deiconify()
+            except Exception:
+                pass
+            try:
+                popup.lift()
+            except Exception:
+                pass
+            try:
+                popup.focus_force()
+            except Exception:
+                pass
+            try:
+                popup.grab_set()
+            except Exception:
+                pass
+
+        wait_anim_job: Optional[Any] = None
+        wait_anim_phase = {"n": 0}
+
+        def queue_wait_anim() -> None:
+            nonlocal wait_anim_job
+            if not popup_active():
+                return
+            phase = int(wait_anim_phase["n"]) % 4
+            dots = "." * phase
+            wait_label_var.set(
+                "Please wait while options are generated and scored"
+                f"{dots} This may take 30-120s, and GPU can stay low during model load."
+            )
+            wait_anim_phase["n"] = phase + 1
+            wait_anim_job = root.after(500, queue_wait_anim)
+
+        def stop_wait_anim() -> None:
+            nonlocal wait_anim_job
+            if wait_anim_job is not None:
+                try:
+                    root.after_cancel(wait_anim_job)
+                except Exception:
+                    pass
+            wait_anim_job = None
+
+        def popup_active() -> bool:
+            return (
+                state.get("rewrite_popup") is popup
+                and int(state.get("rewrite_request_id", 0)) == int(popup_state["request_id"])
+            )
+
+        def on_popup_quit(_event: Any = None) -> str:
+            if popup_active():
+                stop_wait_anim()
+                close_rewrite_popup()
+                status_var.set(f"Rewrite selection canceled.{analysis_stale_suffix()}")
+            return "break"
+
+        def apply_rewrite_choice(choice_idx: int, _event: Any = None) -> str:
+            if not popup_active():
+                return "break"
+            options_obj = popup_state.get("options")
+            options = options_obj if isinstance(options_obj, list) else []
+            if choice_idx < 0 or choice_idx >= len(options):
+                return "break"
+            opt = options[choice_idx]
+            rewrite_text = str(opt.get("text", "")).strip()
+            if not rewrite_text:
+                return "break"
+
+            ins_start = str(popup_state["start_idx"])
+            ins_end = str(popup_state["end_idx"])
+            stop_wait_anim()
+            close_rewrite_popup()
+
+            text_widget.focus_set()
+            text_widget.mark_set("insert", ins_start)
+            text_widget.delete(ins_start, ins_end)
+            text_widget.insert(ins_start, rewrite_text)
+            new_end = text_widget.index(f"{ins_start}+{len(rewrite_text)}c")
+            text_widget.tag_add("edited", ins_start, new_end)
+            add_prior_background_from_ranges((ins_start, new_end), "#5a1f1f")
+            text_widget.tag_raise("edited")
+            text_widget.tag_raise("misspelled")
+            queue_line_numbers_refresh(delay_ms=0)
+            queue_line_bars_refresh(delay_ms=0)
+            state["spell_version"] = int(state.get("spell_version", 0)) + 1
+            queue_spellcheck(delay_ms=0)
+            queue_preview_render(delay_ms=0)
+            queue_preview_focus_sync(delay_ms=0)
+            mark_analysis_stale()
+
+            approx_b = float(opt.get("approx_B", float("nan")))
+            delta_b = float(opt.get("delta_B", float("nan")))
+            if np.isfinite(approx_b) and np.isfinite(delta_b):
+                status_var.set(
+                    f"Applied rewrite {choice_idx + 1}. Approx B: {approx_b:.6f} ({delta_b:+.6f}). "
+                    "Full Analyze required for exact B."
+                )
+            else:
+                status_var.set("Applied rewrite option. Full Analyze required for exact B.")
+            return "break"
+
+        for idx in range(3):
+            btn = tk.Button(
+                button_frame,
+                text=str(idx + 1),
+                width=8,
+                state="disabled",
+                command=lambda i=idx: apply_rewrite_choice(i),
+            )
+            btn.pack(side="left", padx=(0, 8))
+            option_buttons.append(btn)
+        quit_btn_popup = tk.Button(button_frame, text="Quit", width=12, command=on_popup_quit)
+        quit_btn_popup.pack(side="right")
+
+        popup.bind("<KeyPress-1>", lambda e: apply_rewrite_choice(0, e))
+        popup.bind("<KeyPress-2>", lambda e: apply_rewrite_choice(1, e))
+        popup.bind("<KeyPress-3>", lambda e: apply_rewrite_choice(2, e))
+        popup.bind("<KeyPress-q>", on_popup_quit)
+        popup.bind("<KeyPress-Q>", on_popup_quit)
+        popup.bind("<Escape>", on_popup_quit)
+        popup.protocol("WM_DELETE_WINDOW", on_popup_quit)
+        root.after_idle(activate_popup_modal)
+        try:
+            popup.update_idletasks()
+        except Exception:
+            pass
+
+        status_var.set("Generating rewrite options. Please wait...")
+        status_label_var.set("Preparing rewrite pipeline...")
+        queue_wait_anim()
+
+        def post_popup_status(message: str) -> None:
+            def apply() -> None:
+                if not popup_active():
+                    return
+                status_label_var.set(message)
+            root.after(0, apply)
+
+        def post_popup_log(message: str) -> None:
+            def apply() -> None:
+                if not popup_active():
+                    return
+                options_text.insert("end", f"- {message}\n")
+                options_text.see("end")
+            root.after(0, apply)
+
+        def worker() -> None:
+            try:
+                post_popup_status("Selecting rewrite model...")
+                post_popup_log("Selecting rewrite model...")
+
+                def rewrite_progress(message: str) -> None:
+                    post_popup_status(message)
+                    post_popup_log(message)
+
+                rewrites, rewrite_source, rewrite_note = generate_rewrite_candidates_for_span(
+                    cfg_path=cfg_path,
+                    full_text=text_snapshot,
+                    span_start=start_char,
+                    span_end=end_char,
+                    option_count=3,
+                    status_callback=rewrite_progress,
+                )
+                if rewrite_source == "external-llm":
+                    post_popup_log("Using external LLM for rewrite generation.")
+                elif rewrite_source == "internal-fallback":
+                    post_popup_log("External LLM unavailable; used internal performer model.")
+                else:
+                    post_popup_log("Using internal performer model for rewrite generation.")
+                if rewrite_note:
+                    post_popup_log(rewrite_note)
+                post_popup_status("Scoring expected impact for each rewrite option...")
+                post_popup_log("Scoring approximate B impact...")
+                options = estimate_rewrite_b_impact_options(
+                    cfg_path=cfg_path,
+                    full_text=text_snapshot,
+                    span_start=start_char,
+                    span_end=end_char,
+                    rewrites=rewrites,
+                    base_doc_b=float(metrics.get("binoculars_score", float("nan"))),
+                    base_doc_observer_logppl=float(metrics.get("observer_logPPL", float("nan"))),
+                    base_doc_cross_logxppl=float(metrics.get("cross_logXPPL", float("nan"))),
+                    base_doc_transitions=int(metrics.get("transitions", 0)),
+                    text_max_tokens_override=text_max_tokens_override,
+                )
+                post_popup_log("Sorted options by expected increase in B (more human-like first).")
+            except Exception as exc:
+                def on_error(msg: str = str(exc)) -> None:
+                    if not popup_active():
+                        return
+                    stop_wait_anim()
+                    status_var.set(f"Rewrite generation failed: {msg}{analysis_stale_suffix()}")
+                    close_rewrite_popup()
+
+                root.after(0, on_error)
+                return
+
+            def on_ready() -> None:
+                if not popup_active():
+                    return
+                stop_wait_anim()
+                state["rewrite_busy"] = False
+                popup_state["options"] = list(options)
+
+                options_text.delete("1.0", "end")
+                for i, opt in enumerate(options, start=1):
+                    approx_b = float(opt.get("approx_B", float("nan")))
+                    delta_b = float(opt.get("delta_B", float("nan")))
+                    if np.isfinite(approx_b) and np.isfinite(delta_b):
+                        score_line = f"approx B: {approx_b:.6f} ({delta_b:+.6f})"
+                    else:
+                        score_line = "approx B: n/a"
+                    options_text.insert("end", f"[{i}] {score_line}\n")
+                    options_text.insert("end", f"{opt.get('text', '')}\n\n")
+
+                for idx, btn in enumerate(option_buttons):
+                    btn.configure(state="normal" if idx < len(options) else "disabled")
+                src_label = (
+                    "external LLM"
+                    if rewrite_source == "external-llm"
+                    else ("internal fallback" if rewrite_source == "internal-fallback" else "internal model")
+                )
+                status_label_var.set(f"Select rewrite 1, 2, or 3. Press Quit to cancel. Source: {src_label}.")
+                wait_label_var.set("Generation complete.")
+                refresh_analysis_status_line()
+
+            root.after(0, on_ready)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return "break"
+
     def clear_current_segment_tags() -> None:
         hide_tooltip()
         for tag in state["segment_tags"]:
@@ -2468,6 +3686,7 @@ def launch_gui(
                 pass
         state["segment_tags"] = []
         state["segment_labels"] = {}
+        state["segment_infos"] = {}
         state["line_contrib_map"] = {}
         state["line_contrib_max_abs"] = 0.0
         state["line_contrib_last_line"] = 0
@@ -2591,6 +3810,7 @@ def launch_gui(
         if not text_widget.edit_modified():
             return
         text_widget.edit_modified(False)
+        mark_analysis_stale()
         pending = state.get("pending_edit_job")
         if pending is not None:
             try:
@@ -2650,8 +3870,11 @@ def launch_gui(
                 text_widget.tag_bind(tag, "<Enter>", lambda e, info=dict(ann): show_tooltip(e, info))
                 text_widget.tag_bind(tag, "<Motion>", move_tooltip)
                 text_widget.tag_bind(tag, "<Leave>", lambda _e: hide_tooltip())
+                if ann["label"] == "LOW":
+                    text_widget.tag_bind(tag, "<Button-3>", lambda e, t=tag: on_low_segment_right_click(e, t))
                 state["segment_tags"].append(tag)
                 state["segment_labels"][tag] = ann["label"]
+                state["segment_infos"][tag] = dict(ann)
 
         last_line = line_number_for_char_end(doc_text, analyzed_char_end)
         total_lines = max(1, int(text_widget.index("end-1c").split(".")[0]))
@@ -2740,7 +3963,7 @@ def launch_gui(
                     analyzed_char_end = len(analyzed_text)
         analyzed_char_end = max(0, min(len(analyzed_text), analyzed_char_end))
         last_line = line_number_for_char_end(analyzed_text, analyzed_char_end)
-        status_var.set(
+        status_core = (
             "Binocular score B (high is more human-like): "
             f"{result['binoculars']['score']:.6f} [prior: {prior_b_text}] | "
             f"Last Line: {last_line} | "
@@ -2748,6 +3971,18 @@ def launch_gui(
             f"Performer logPPL: {result['performer']['logPPL']:.6f} | "
             f"Cross logXPPL: {result['cross']['logXPPL']:.6f}"
         )
+        state["last_analysis_status_core"] = status_core
+        state["last_analysis_metrics"] = {
+            "binoculars_score": float(result["binoculars"]["score"]),
+            "observer_logPPL": float(result["observer"]["logPPL"]),
+            "performer_logPPL": float(result["performer"]["logPPL"]),
+            "cross_logXPPL": float(result["cross"]["logXPPL"]),
+            "transitions": int(result["input"]["transitions"]),
+            "last_line": int(last_line),
+        }
+        state["has_analysis"] = True
+        state["b_score_stale"] = False
+        status_var.set(status_core)
         state["last_b_score"] = float(result["binoculars"]["score"])
         state["analyzing"] = False
         set_controls(True)
@@ -2831,11 +4066,11 @@ def launch_gui(
             out_path = os.path.join(src_dir, f"{stem}_edited_{stamp}_{idx}.md")
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(content)
-        status_var.set(f"Saved edited file: {out_path}")
+        status_var.set(f"Saved edited file: {out_path}{analysis_stale_suffix()}")
 
     def on_clear_priors() -> None:
         clear_prior_backgrounds()
-        status_var.set("Cleared prior background highlights.")
+        status_var.set(f"Cleared prior background highlights.{analysis_stale_suffix()}")
 
     def on_quit() -> None:
         if state.get("pending_edit_job") is not None:
@@ -2869,6 +4104,7 @@ def launch_gui(
             except Exception:
                 pass
         hide_tooltip()
+        close_rewrite_popup()
         close_progress_popup()
         root.destroy()
 
