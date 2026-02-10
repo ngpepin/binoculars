@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import bisect
 from datetime import datetime
+import difflib
 import gc
 import json
 import os
@@ -1919,8 +1920,8 @@ def _build_rewrite_prompts(
 ) -> Tuple[str, str, str]:
     start = max(0, min(len(full_text), int(span_start)))
     end = max(start, min(len(full_text), int(span_end)))
-    target = full_text[start:end].strip()
-    if not target:
+    target = full_text[start:end]
+    if not target.strip():
         raise ValueError("Selected low-perplexity span is empty.")
 
     if llm_cfg is None:
@@ -1974,7 +1975,8 @@ def _build_rewrite_prompts(
 
     system_prompt = (
         "You rewrite exactly one markdown span from a document. Preserve meaning, facts, timeline, and voice. "
-        "Do not add explanations or labels. Output only the rewritten span text."
+        "Do not add explanations or labels. Output only the rewritten span text. "
+        "Return the complete rewritten span, including any lines left unchanged."
     )
 
     user_prompt = (
@@ -1983,6 +1985,8 @@ def _build_rewrite_prompts(
         "- Preserve named entities, claims, and implied facts.\n"
         "- Preserve tense, perspective, and speaker intent.\n"
         "- Preserve dialogue structure and punctuation style when present.\n"
+        "- Preserve paragraph and line-break structure.\n"
+        "- Do not omit lines; if a line is not rewritten, include it unchanged.\n"
         "- Keep similar length (roughly +/-30%).\n"
         "- No preface, no bullets, no numbering; return only rewritten TARGET span text.\n\n"
         "PREVIOUS PARAGRAPH:\n"
@@ -2427,6 +2431,9 @@ def launch_gui(
     preview_text.tag_configure("md_link", foreground="#9fc3ff", underline=1)
     preview_text.tag_configure("preview_heat_low", background="#3a2323")
     preview_text.tag_configure("preview_heat_high", background="#223a2a")
+    preview_text.tag_configure("preview_sel_low", background="#4a3434")
+    preview_text.tag_configure("preview_sel_high", background="#31483a")
+    preview_text.tag_configure("preview_sel_neutral", background="#606060")
     preview_text.tag_configure("preview_active_line", background="#3d3d3d")
 
     text_widget.tag_configure("edited", foreground="#ffd54f")
@@ -2447,6 +2454,7 @@ def launch_gui(
         "b_score_stale": False,
         "last_analysis_status_core": "",
         "last_analysis_metrics": None,
+        "analyzed_char_end": len(initial_text),
         "spell_version": 0,
         "last_spell_spans": None,
         "tooltip": None,
@@ -2961,6 +2969,9 @@ def launch_gui(
             pass
 
     def set_preview_active_line_for_src_line(src_line: int) -> None:
+        if selected_source_line_range() is not None:
+            preview_text.tag_remove("preview_active_line", "1.0", "end")
+            return
         preview_line = source_line_to_preview_line(src_line)
         try:
             preview_total = max(1, int(preview_text.index("end-1c").split(".")[0]))
@@ -2982,17 +2993,51 @@ def launch_gui(
         )
         preview_text.tag_raise("preview_heat_low")
         preview_text.tag_raise("preview_heat_high")
+        preview_text.tag_raise("preview_sel_low")
+        preview_text.tag_raise("preview_sel_high")
+        preview_text.tag_raise("preview_sel_neutral")
         preview_text.tag_raise("preview_active_line")
 
     def clear_preview_segment_backgrounds() -> None:
         preview_text.tag_remove("preview_heat_low", "1.0", "end")
         preview_text.tag_remove("preview_heat_high", "1.0", "end")
+        preview_text.tag_remove("preview_sel_low", "1.0", "end")
+        preview_text.tag_remove("preview_sel_high", "1.0", "end")
+        preview_text.tag_remove("preview_sel_neutral", "1.0", "end")
 
     def apply_preview_segment_backgrounds() -> None:
         clear_preview_segment_backgrounds()
         map_obj = state.get("preview_line_map")
         preview_line_map = map_obj if isinstance(map_obj, dict) else {}
         if not preview_line_map:
+            return
+
+        sel_range = selected_source_line_range()
+        if sel_range is not None:
+            sel_start_line, sel_end_line = sel_range
+            for src_line in range(sel_start_line, sel_end_line + 1):
+                mapped = preview_line_map.get(src_line)
+                if mapped is None:
+                    mapped = source_line_to_preview_line(src_line)
+                try:
+                    preview_line = int(mapped)
+                except Exception:
+                    continue
+                label = line_heat_label(src_line)
+                if label == "LOW":
+                    preview_tag = "preview_sel_low"
+                elif label == "HIGH":
+                    preview_tag = "preview_sel_high"
+                else:
+                    preview_tag = "preview_sel_neutral"
+                preview_text.tag_add(
+                    preview_tag,
+                    f"{preview_line}.0",
+                    f"{preview_line}.0 lineend+1c",
+                )
+            preview_text.tag_lower("preview_sel_low")
+            preview_text.tag_lower("preview_sel_high")
+            preview_text.tag_lower("preview_sel_neutral")
             return
 
         for tag in state.get("segment_tags", []):
@@ -3055,8 +3100,33 @@ def launch_gui(
                     saw_high = True
         return "HIGH" if saw_high else None
 
+    def selected_source_line_range() -> Optional[Tuple[int, int]]:
+        ranges = text_widget.tag_ranges("sel")
+        if len(ranges) < 2:
+            return None
+        start_idx = str(ranges[0])
+        end_idx = str(ranges[1])
+        try:
+            if not text_widget.compare(end_idx, ">", start_idx):
+                return None
+        except Exception:
+            return None
+        try:
+            start_line = int(start_idx.split(".")[0])
+        except Exception:
+            start_line = 1
+        try:
+            end_minus_idx = text_widget.index(f"{end_idx}-1c")
+            end_line = int(str(end_minus_idx).split(".")[0])
+        except Exception:
+            end_line = start_line
+        if end_line < start_line:
+            end_line = start_line
+        return (start_line, end_line)
+
     def sync_preview_focus_now() -> None:
         state["pending_focus_job"] = None
+        apply_preview_segment_backgrounds()
 
         try:
             src_line = int(text_widget.index("insert").split(".")[0])
@@ -3281,37 +3351,205 @@ def launch_gui(
         state["rewrite_popup"] = None
         state["rewrite_busy"] = False
 
-    def on_low_segment_right_click(event: Any, tag: str) -> str:
-        if state.get("analyzing") or state.get("rewrite_busy"):
-            return "break"
-        if not state.get("has_analysis"):
-            status_var.set("Rewrite menu is available after Analyze has been run at least once.")
-            return "break"
+    def scored_char_limit_for_text(text_snapshot: str) -> int:
+        text_len = len(text_snapshot)
+        try:
+            analyzed_end = int(state.get("analyzed_char_end", text_len))
+        except Exception:
+            analyzed_end = text_len
+        return max(0, min(text_len, analyzed_end))
 
-        metrics_obj = state.get("last_analysis_metrics")
-        metrics = metrics_obj if isinstance(metrics_obj, dict) else None
-        if metrics is None:
-            status_var.set("Rewrite menu is unavailable until Analyze completes successfully.")
-            return "break"
+    def selection_index_pair() -> Optional[Tuple[str, str]]:
+        ranges = text_widget.tag_ranges("sel")
+        if len(ranges) < 2:
+            return None
+        start_idx = str(ranges[0])
+        end_idx = str(ranges[1])
+        try:
+            if text_widget.compare(end_idx, ">", start_idx):
+                return (start_idx, end_idx)
+        except Exception:
+            return None
+        return None
 
-        click_idx = text_widget.index(f"@{event.x},{event.y}")
-        range_pair = tag_range_containing_index(tag, click_idx)
-        if range_pair is None:
-            return "break"
-        start_idx, end_idx = range_pair
-        if not text_widget.compare(end_idx, ">", start_idx):
-            return "break"
+    def clamp_span_to_scored_range(
+        start_char: int, end_char: int, text_snapshot: str
+    ) -> Optional[Tuple[int, int, bool]]:
+        text_len = len(text_snapshot)
+        start = max(0, min(text_len, int(start_char)))
+        end = max(start, min(text_len, int(end_char)))
+        scored_end = scored_char_limit_for_text(text_snapshot)
+        clamped_start = max(0, min(scored_end, start))
+        clamped_end = max(clamped_start, min(scored_end, end))
+        if clamped_end <= clamped_start:
+            return None
+        was_clamped = (clamped_start != start) or (clamped_end != end)
+        return (clamped_start, clamped_end, was_clamped)
 
-        text_snapshot = current_text()
-        start_char = char_offset_for_index(start_idx)
-        end_char = char_offset_for_index(end_idx)
-        if end_char <= start_char:
-            return "break"
+    def expand_span_to_full_lines(
+        start_char: int, end_char: int, text_snapshot: str
+    ) -> Optional[Tuple[int, int]]:
+        text_len = len(text_snapshot)
+        start = max(0, min(text_len, int(start_char)))
+        end = max(start, min(text_len, int(end_char)))
+        if end <= start:
+            return None
+        # Extend to whole line boundaries. Include trailing newline for the last selected line when present.
+        line_start = text_snapshot.rfind("\n", 0, start) + 1
+        last_char = max(start, end - 1)
+        nl_after = text_snapshot.find("\n", last_char)
+        if nl_after < 0:
+            line_end = text_len
+        else:
+            line_end = min(text_len, nl_after + 1)
+        if line_end <= line_start:
+            return None
+        return (line_start, line_end)
 
-        selected = text_snapshot[start_char:end_char]
-        if not selected.strip():
-            return "break"
+    def collect_line_heat_labels_for_index_range(start_idx: str, end_idx: str) -> List[Optional[str]]:
+        try:
+            if not text_widget.compare(end_idx, ">", start_idx):
+                return []
+        except Exception:
+            return []
+        try:
+            start_line = int(str(text_widget.index(start_idx)).split(".")[0])
+        except Exception:
+            start_line = 1
+        try:
+            end_minus_idx = text_widget.index(f"{end_idx}-1c")
+            end_line = int(str(end_minus_idx).split(".")[0])
+        except Exception:
+            end_line = start_line
+        if end_line < start_line:
+            end_line = start_line
+        out: List[Optional[str]] = []
+        for ln in range(start_line, end_line + 1):
+            out.append(line_heat_label(ln))
+        return out
 
+    def add_prior_background_from_line_labels(
+        start_idx: str, end_idx: str, prior_line_labels: List[Optional[str]]
+    ) -> None:
+        if not prior_line_labels:
+            return
+        try:
+            if not text_widget.compare(end_idx, ">", start_idx):
+                return
+        except Exception:
+            return
+        try:
+            start_line = int(str(text_widget.index(start_idx)).split(".")[0])
+        except Exception:
+            start_line = 1
+        try:
+            end_minus_idx = text_widget.index(f"{end_idx}-1c")
+            end_line = int(str(end_minus_idx).split(".")[0])
+        except Exception:
+            end_line = start_line
+        if end_line < start_line:
+            end_line = start_line
+
+        new_line_count = max(1, end_line - start_line + 1)
+        old_line_count = max(1, len(prior_line_labels))
+        low_ranges: List[str] = []
+        high_ranges: List[str] = []
+
+        for i in range(new_line_count):
+            src_i = min(old_line_count - 1, int((i * old_line_count) / new_line_count))
+            label = prior_line_labels[src_i]
+            line_no = start_line + i
+            seg_start = start_idx if i == 0 else f"{line_no}.0"
+            seg_end = end_idx if i == (new_line_count - 1) else f"{line_no + 1}.0"
+            if label == "LOW":
+                low_ranges.extend([seg_start, seg_end])
+            elif label == "HIGH":
+                high_ranges.extend([seg_start, seg_end])
+
+        if low_ranges:
+            add_prior_background_from_ranges(tuple(low_ranges), "#5a1f1f")
+        if high_ranges:
+            add_prior_background_from_ranges(tuple(high_ranges), "#203026")
+
+    def reinject_missing_original_lines(original_text: str, rewrite_text: str) -> Tuple[str, int]:
+        original = str(original_text or "")
+        rewrite = str(rewrite_text or "")
+        if not original:
+            return rewrite, 0
+        if not rewrite:
+            return original, len(original.splitlines())
+
+        original_lines = original.split("\n")
+        rewrite_lines = rewrite.split("\n")
+        if not original_lines:
+            return rewrite, 0
+        if not rewrite_lines:
+            return original, len(original_lines)
+
+        def is_accidental_short_replace(orig_line: str, rw_line: str) -> bool:
+            o = str(orig_line or "").strip()
+            r = str(rw_line or "").strip()
+            if not o:
+                return False
+            if not r:
+                return True
+            o_words = len(re.findall(r"[A-Za-z0-9]+", o))
+            r_words = len(re.findall(r"[A-Za-z0-9]+", r))
+            if len(o) >= 60 and len(r) <= 14:
+                return True
+            if o_words >= 8 and r_words <= 2:
+                return True
+            if o.lower().startswith(r.lower()) and len(r) <= max(10, int(len(o) * 0.22)):
+                return True
+            return False
+
+        matcher = difflib.SequenceMatcher(a=original_lines, b=rewrite_lines, autojunk=False)
+        merged_lines: List[str] = []
+        reinserted = 0
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "delete":
+                segment = original_lines[i1:i2]
+                merged_lines.extend(segment)
+                reinserted += len(segment)
+            elif tag == "replace":
+                orig_seg = original_lines[i1:i2]
+                rw_seg = rewrite_lines[j1:j2]
+                pair_n = min(len(orig_seg), len(rw_seg))
+                for k in range(pair_n):
+                    o_line = orig_seg[k]
+                    r_line = rw_seg[k]
+                    if is_accidental_short_replace(o_line, r_line):
+                        merged_lines.append(o_line)
+                        reinserted += 1
+                    else:
+                        merged_lines.append(r_line)
+                # If replacement collapses multiple original lines, preserve unmapped original tail unchanged.
+                if len(orig_seg) > pair_n:
+                    tail = orig_seg[pair_n:]
+                    merged_lines.extend(tail)
+                    reinserted += len(tail)
+                elif len(rw_seg) > pair_n:
+                    merged_lines.extend(rw_seg[pair_n:])
+            else:
+                merged_lines.extend(rewrite_lines[j1:j2])
+
+        merged = "\n".join(merged_lines)
+        trailing_newlines = len(original) - len(original.rstrip("\n"))
+        if trailing_newlines > 0:
+            merged = merged.rstrip("\n") + ("\n" * trailing_newlines)
+        return merged, reinserted
+
+    def launch_rewrite_popup_for_span(
+        start_idx: str,
+        end_idx: str,
+        start_char: int,
+        end_char: int,
+        text_snapshot: str,
+        metrics: Dict[str, Any],
+        span_label: str,
+        range_note: Optional[str] = None,
+        selection_mode: bool = False,
+    ) -> str:
         close_rewrite_popup()
         hide_tooltip()
 
@@ -3322,15 +3560,23 @@ def launch_gui(
             popup.transient(root)
             popup.resizable(True, True)
             popup.configure(bg="#111111")
+            width_scale = 1.25
+            height_scale = 1.25 if selection_mode else 1.0
             # Apply a reliable initial size immediately so window does not start tiny.
-            popup.geometry("860x560")
-            popup.minsize(760, 520)
+            base_w = int(round(900 * width_scale))
+            base_h = int(round(620 * height_scale))
+            min_w = int(round(780 * width_scale))
+            min_h = int(round(540 * height_scale))
+            popup.geometry(f"{base_w}x{base_h}")
+            popup.minsize(min_w, min_h)
             try:
                 root.update_idletasks()
                 root_w = max(900, int(root.winfo_width()))
                 root_h = max(700, int(root.winfo_height()))
-                popup_w = max(860, min(1120, int(root_w * 0.64)))
-                popup_h = max(560, min(760, int(root_h * 0.64)))
+                popup_w = max(base_w, min(int(round(1180 * width_scale)), int(round(root_w * 0.85))))
+                base_dyn_h = 600 if not selection_mode else 750
+                max_dyn_h = 820 if not selection_mode else 1025
+                popup_h = max(int(round(base_dyn_h)), min(int(round(max_dyn_h)), int(round(root_h * 0.88))))
                 x = root.winfo_rootx() + max(0, (root_w - popup_w) // 2)
                 y = root.winfo_rooty() + max(0, (root_h - popup_h) // 2)
                 popup.geometry(f"{popup_w}x{popup_h}+{x}+{y}")
@@ -3347,7 +3593,7 @@ def launch_gui(
         try:
             title_label = tk.Label(
                 popup,
-                text="Generating 3 rewrites for selected LOW section. Please wait...",
+                text=f"Generating 3 rewrites for {span_label}. Please wait...",
                 anchor="w",
                 justify="left",
                 bg="#111111",
@@ -3371,7 +3617,20 @@ def launch_gui(
                 padx=10,
                 pady=0,
             )
-            sub_label.pack(side="top", fill="x", pady=(0, 8))
+            sub_label.pack(side="top", fill="x", pady=(0, 4))
+
+            if range_note:
+                range_note_label = tk.Label(
+                    popup,
+                    text=range_note,
+                    anchor="w",
+                    justify="left",
+                    bg="#111111",
+                    fg="#9cc7ff",
+                    padx=10,
+                    pady=0,
+                )
+                range_note_label.pack(side="top", fill="x", pady=(0, 6))
 
             status_label_var = tk.StringVar(value="Working...")
             popup_status = tk.Label(
@@ -3401,11 +3660,16 @@ def launch_gui(
             )
             wait_label.pack(side="top", fill="x", pady=(0, 10))
 
+            options_frame = tk.Frame(popup, bg="#111111")
+            options_frame.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 8))
+            options_scroll = tk.Scrollbar(options_frame, orient="vertical")
+            options_scroll.pack(side="right", fill="y")
             options_text = tk.Text(
-                popup,
+                options_frame,
                 wrap="word",
-                height=14,
-                width=96,
+                height=16,
+                width=100,
+                yscrollcommand=options_scroll.set,
                 bg="#151515",
                 fg="#f0f0f0",
                 relief="flat",
@@ -3417,7 +3681,8 @@ def launch_gui(
                 padx=10,
                 pady=8,
             )
-            options_text.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 8))
+            options_text.pack(side="left", fill="both", expand=True)
+            options_scroll.configure(command=options_text.yview)
             options_text.insert(
                 "1.0",
                 "Preparing rewrite generation...\n\n"
@@ -3509,12 +3774,16 @@ def launch_gui(
             if choice_idx < 0 or choice_idx >= len(options):
                 return "break"
             opt = options[choice_idx]
-            rewrite_text = str(opt.get("text", "")).strip()
-            if not rewrite_text:
+            rewrite_text_raw = str(opt.get("text", ""))
+            if not rewrite_text_raw.strip():
                 return "break"
+            rewrite_text = rewrite_text_raw
 
             ins_start = str(popup_state["start_idx"])
             ins_end = str(popup_state["end_idx"])
+            prior_line_labels: List[Optional[str]] = []
+            if selection_mode:
+                prior_line_labels = collect_line_heat_labels_for_index_range(ins_start, ins_end)
             stop_wait_anim()
             close_rewrite_popup()
 
@@ -3524,7 +3793,10 @@ def launch_gui(
             text_widget.insert(ins_start, rewrite_text)
             new_end = text_widget.index(f"{ins_start}+{len(rewrite_text)}c")
             text_widget.tag_add("edited", ins_start, new_end)
-            add_prior_background_from_ranges((ins_start, new_end), "#5a1f1f")
+            if selection_mode:
+                add_prior_background_from_line_labels(ins_start, new_end, prior_line_labels)
+            else:
+                add_prior_background_from_ranges((ins_start, new_end), "#5a1f1f")
             text_widget.tag_raise("edited")
             text_widget.tag_raise("misspelled")
             queue_line_numbers_refresh(delay_ms=0)
@@ -3581,6 +3853,7 @@ def launch_gui(
                 if not popup_active():
                     return
                 status_label_var.set(message)
+
             root.after(0, apply)
 
         def post_popup_log(message: str) -> None:
@@ -3589,12 +3862,15 @@ def launch_gui(
                     return
                 options_text.insert("end", f"- {message}\n")
                 options_text.see("end")
+
             root.after(0, apply)
 
         def worker() -> None:
             try:
                 post_popup_status("Selecting rewrite model...")
                 post_popup_log("Selecting rewrite model...")
+                if range_note:
+                    post_popup_log(range_note)
 
                 def rewrite_progress(message: str) -> None:
                     post_popup_status(message)
@@ -3608,6 +3884,30 @@ def launch_gui(
                     option_count=3,
                     status_callback=rewrite_progress,
                 )
+                if selection_mode:
+                    original_span = text_snapshot[start_char:end_char]
+                    repaired: List[str] = []
+                    repaired_lines = 0
+                    for cand in rewrites:
+                        fixed, count = reinject_missing_original_lines(original_span, cand)
+                        repaired.append(fixed)
+                        repaired_lines += max(0, int(count))
+                    deduped: List[str] = []
+                    seen_keys: Set[str] = set()
+                    for cand in repaired:
+                        key = _semantic_text_key(cand)
+                        if key and key not in seen_keys:
+                            seen_keys.add(key)
+                            deduped.append(cand)
+                    if deduped:
+                        rewrites = deduped
+                    while len(rewrites) < 3:
+                        rewrites.append(rewrites[-1] if rewrites else original_span)
+                    rewrites = rewrites[:3]
+                    if repaired_lines > 0:
+                        post_popup_log(
+                            f"Preserved {repaired_lines} unchanged source line(s) omitted by model output."
+                        )
                 if rewrite_source == "external-llm":
                     post_popup_log("Using external LLM for rewrite generation.")
                 elif rewrite_source == "internal-fallback":
@@ -3675,6 +3975,130 @@ def launch_gui(
 
         threading.Thread(target=worker, daemon=True).start()
         return "break"
+
+    def maybe_start_selection_rewrite(_event: Optional[Any] = None) -> bool:
+        sel_pair = selection_index_pair()
+        if sel_pair is None:
+            return False
+        if state.get("analyzing") or state.get("rewrite_busy"):
+            return True
+        if not state.get("has_analysis"):
+            status_var.set("Rewrite menu is available after Analyze has been run at least once.")
+            return True
+
+        metrics_obj = state.get("last_analysis_metrics")
+        metrics = metrics_obj if isinstance(metrics_obj, dict) else None
+        if metrics is None:
+            status_var.set("Rewrite menu is unavailable until Analyze completes successfully.")
+            return True
+
+        text_snapshot = current_text()
+        raw_start_idx, raw_end_idx = sel_pair
+        raw_start_char = char_offset_for_index(raw_start_idx)
+        raw_end_char = char_offset_for_index(raw_end_idx)
+        if raw_end_char <= raw_start_char:
+            return True
+
+        expanded = expand_span_to_full_lines(raw_start_char, raw_end_char, text_snapshot)
+        if expanded is None:
+            status_var.set("Selected text could not be expanded to full lines.")
+            return True
+        expanded_start_char, expanded_end_char = expanded
+
+        clamped = clamp_span_to_scored_range(expanded_start_char, expanded_end_char, text_snapshot)
+        if clamped is None:
+            status_var.set(
+                "Selected text is outside analyzed/scored range. Adjust selection or run Analyze again."
+            )
+            return True
+        start_char, end_char, was_clamped = clamped
+        selected = text_snapshot[start_char:end_char]
+        if not selected.strip():
+            status_var.set("Selected text is empty after clamping to scored range.")
+            return True
+
+        start_idx = text_widget.index(f"1.0+{start_char}c")
+        end_idx = text_widget.index(f"1.0+{end_char}c")
+        range_note = (
+            "Selection was rounded to whole lines, then clamped to scored text only where needed."
+            if was_clamped
+            else "Selection was rounded to whole lines for rewrite generation."
+        )
+        launch_rewrite_popup_for_span(
+            start_idx=start_idx,
+            end_idx=end_idx,
+            start_char=start_char,
+            end_char=end_char,
+            text_snapshot=text_snapshot,
+            metrics=metrics,
+            span_label="selected highlighted section",
+            range_note=range_note,
+            selection_mode=True,
+        )
+        return True
+
+    def on_editor_right_click(event: Any) -> Optional[str]:
+        if maybe_start_selection_rewrite(event):
+            return "break"
+        return None
+
+    def on_low_segment_right_click(event: Any, tag: str) -> str:
+        # Selection-based rewrite mode takes precedence if a span is highlighted.
+        if maybe_start_selection_rewrite(event):
+            return "break"
+        if state.get("analyzing") or state.get("rewrite_busy"):
+            return "break"
+        if not state.get("has_analysis"):
+            status_var.set("Rewrite menu is available after Analyze has been run at least once.")
+            return "break"
+
+        metrics_obj = state.get("last_analysis_metrics")
+        metrics = metrics_obj if isinstance(metrics_obj, dict) else None
+        if metrics is None:
+            status_var.set("Rewrite menu is unavailable until Analyze completes successfully.")
+            return "break"
+
+        click_idx = text_widget.index(f"@{event.x},{event.y}")
+        range_pair = tag_range_containing_index(tag, click_idx)
+        if range_pair is None:
+            return "break"
+        start_idx, end_idx = range_pair
+        if not text_widget.compare(end_idx, ">", start_idx):
+            return "break"
+
+        text_snapshot = current_text()
+        raw_start_char = char_offset_for_index(start_idx)
+        raw_end_char = char_offset_for_index(end_idx)
+        clamped = clamp_span_to_scored_range(raw_start_char, raw_end_char, text_snapshot)
+        if clamped is None:
+            status_var.set("Selected LOW section is outside analyzed/scored text.")
+            return "break"
+        start_char, end_char, was_clamped = clamped
+        if end_char <= start_char:
+            return "break"
+
+        selected = text_snapshot[start_char:end_char]
+        if not selected.strip():
+            return "break"
+
+        clamped_start_idx = text_widget.index(f"1.0+{start_char}c")
+        clamped_end_idx = text_widget.index(f"1.0+{end_char}c")
+        range_note = (
+            "LOW section overlapped unscored text. Rewrite options are limited to scored/analyzed text only."
+            if was_clamped
+            else None
+        )
+        return launch_rewrite_popup_for_span(
+            start_idx=clamped_start_idx,
+            end_idx=clamped_end_idx,
+            start_char=start_char,
+            end_char=end_char,
+            text_snapshot=text_snapshot,
+            metrics=metrics,
+            span_label="selected LOW section",
+            range_note=range_note,
+            selection_mode=False,
+        )
 
     def clear_current_segment_tags() -> None:
         hide_tooltip()
@@ -3838,6 +4262,7 @@ def launch_gui(
         else:
             analyzed_char_end = doc_len
         analyzed_char_end = max(0, min(doc_len, analyzed_char_end))
+        state["analyzed_char_end"] = int(analyzed_char_end)
 
         annotations: Dict[int, Dict[str, Any]] = {}
         if rows:
@@ -3962,6 +4387,7 @@ def launch_gui(
                 except Exception:
                     analyzed_char_end = len(analyzed_text)
         analyzed_char_end = max(0, min(len(analyzed_text), analyzed_char_end))
+        state["analyzed_char_end"] = int(analyzed_char_end)
         last_line = line_number_for_char_end(analyzed_text, analyzed_char_end)
         status_core = (
             "Binocular score B (high is more human-like): "
@@ -4154,6 +4580,8 @@ def launch_gui(
     preview_text.bind("<Button-4>", on_preview_button4, add="+")
     preview_text.bind("<Button-5>", on_preview_button5, add="+")
     text_widget.bind("<<Modified>>", on_modified)
+    text_widget.bind("<Button-3>", on_editor_right_click, add="+")
+    text_widget.bind("<<Selection>>", lambda _e: queue_preview_focus_sync(delay_ms=0), add="+")
     text_widget.bind("<KeyRelease>", lambda _e: queue_preview_focus_sync(delay_ms=0), add="+")
     text_widget.bind("<ButtonRelease-1>", lambda _e: queue_preview_focus_sync(delay_ms=0), add="+")
     root.bind("<F9>", toggle_debug_overlay, add="+")

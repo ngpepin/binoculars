@@ -79,8 +79,10 @@ Important: this is a scoring signal, not proof of authorship.
 - `binoculars.sh`: wrapper that activates venv, auto-cleans old instances, forwards Ctrl-C
 - `binocular.sh`: alias wrapper (`exec binoculars.sh`)
 - `config.binoculars.json`: master profile selector (`default` + `profiles`)
+- `config.binoculars.llm.json`: optional OpenAI-compatible rewrite backend config for GUI rewrite suggestions
 - `config.llama31.cuda12gb.fast.json`: fast profile (currently `text.max_tokens=4096`)
 - `config.llama31.cuda12gb.long.json`: long profile (currently `text.max_tokens=12288`)
+- `USERGUIDE-GUI.md`: detailed GUI user guide and iterative workflow guidance
 - `background/2401.12070v3.pdf`: background paper
 - `samples/`: sample markdown inputs
 - `tests/test_regression_v1_1_x.py`: regression suite
@@ -156,6 +158,50 @@ Notes:
 - `n_ctx: 0` means auto (`n_ctx = analyzed token count`)
 - `text.max_tokens > 0` truncates input token window
 - `cache.dtype` may be `float16` or `float32`
+
+### 3) Optional rewrite LLM config (GUI)
+
+If `config.binoculars.llm.json` is present and enabled, GUI rewrite suggestions can use an external OpenAI-compatible endpoint.
+If missing or disabled, internal performer-model generation is used.
+If present but unreachable/invalid at runtime, GUI rewrites automatically fall back to internal generation.
+
+Supported fields include:
+
+- `llm.enabled`
+- `llm.endpoint_url`
+- `llm.request_path` (default `/chat/completions`)
+- `llm.model`
+- `llm.api_key` or `llm.api_key_env` (also supports `OPENAI_API_KEY` when enabled)
+- `llm.api_key_header` / `llm.api_key_prefix`
+- `llm.timeout_s`
+- `llm.max_tokens`
+- `llm.temperature`
+- `llm.top_p`
+- `llm.context_chars_each_side`
+- `llm.context_paragraphs_each_side`
+- `llm.context_window_max_chars`
+- `llm.extra_headers`
+- `llm.extra_body`
+
+Example:
+
+```json
+{
+  "llm": {
+    "enabled": true,
+    "endpoint_url": "http://localhost:4141/v1",
+    "model": "gpt-4.1",
+    "request_path": "/chat/completions",
+    "api_key_env": "OPENAI_API_KEY",
+    "max_tokens": 220,
+    "temperature": 0.78,
+    "top_p": 0.95,
+    "context_chars_each_side": 1800,
+    "context_paragraphs_each_side": 2,
+    "context_window_max_chars": 5200
+  }
+}
+```
 
 ## Execution Model
 
@@ -297,6 +343,10 @@ Launches an editor/analyzer with:
   - `Binocular score B (high is more human-like): ...`
   - includes prior score and `Last Line`
 
+For a detailed workflow-oriented guide, see:
+
+- `USERGUIDE-GUI.md`
+
 ### GUI behavior
 
 - `Analyze`:
@@ -313,6 +363,19 @@ Launches an editor/analyzer with:
   - same directory as source
 - Always-on English spell checking:
   - misspellings marked with red underline
+- Rewrite suggestions:
+  - right-click a red (`LOW`) paragraph segment to open 3 rewrite options
+  - or highlight a block (multi-line allowed) and right-click to request block rewrites
+  - highlighted-block rewrites round selection to full lines
+  - if selection extends into unscored text, only scored overlap is rewritten
+  - popup shows approximate B impact per option (exact B requires `Analyze`)
+  - options are sorted by expected B increase (more human-like first)
+  - choose option with mouse or keyboard `1`/`2`/`3`, or `Quit`
+  - chosen rewrite is inserted as an edit (yellow), with prior backgrounds preserved by prior line status
+  - B score is intentionally not auto-recomputed; status marks it stale until next `Analyze`
+- Preview selection mirroring:
+  - when a block is selected in the left pane, right preview mirrors the same line range
+  - selected preview lines show LOW/HIGH/neutral background styles
 
 ### Preview sync + debug controls
 
@@ -407,6 +470,23 @@ Run regression suite:
 - No claim of definitive authorship attribution
 - Markdown is analyzed as text; no semantic markdown parsing
 - Long documents may require truncation due full-logit cost
+
+## Planned Next Major Feature
+
+The next major planned feature is chunk-aware GUI analysis for very large files that cannot be analyzed in one pass.
+
+Planned behavior (not yet implemented):
+
+- First `Analyze` computes the first analyzable chunk (bounded by current token/memory limits).
+- After the first successful chunk analysis, an `Analyze Next` button appears when unscored text remains.
+- `Analyze Next` analyzes the next chunk and updates the last covered line.
+- `Analyze Next` remains visible until all chunks are analyzed.
+- Status-bar `B` should reflect the active chunk, selected by this priority:
+  - chunk containing the current selected line,
+  - chunk containing the current selected text block,
+  - otherwise chunk containing most lines in the visible window.
+- Pressing `Analyze` should analyze the active chunk (not always chunk 1).
+- Rewrite suggestions for a red line or highlighted block should compute approximate B-impact for that requested block in the active chunk context.
 
 ## Safety / Responsible Use
 
