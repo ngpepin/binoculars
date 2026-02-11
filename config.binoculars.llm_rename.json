@@ -1,7 +1,7 @@
 {
   "llm": {
     "enabled": true,
-    "endpoint_url": "",
+    "endpoint_url": "...",
     "request_path": "/chat/completions",
     "model": "gpt-4.1",
     "api_key": "",
@@ -12,6 +12,9 @@
     "max_tokens": 180,
     "temperature": 0.78,
     "top_p": 0.95,
+    "context_chars_each_side": 1800,
+    "context_paragraphs_each_side": 2,
+    "context_window_max_chars": 5200,
     "extra_headers": {},
     "extra_body": {
       "frequency_penalty": 0.0,
