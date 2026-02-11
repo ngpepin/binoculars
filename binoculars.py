@@ -4342,12 +4342,12 @@ def launch_gui(
             popup.resizable(True, True)
             popup.configure(bg="#111111")
             width_scale = 1.25
-            height_scale = 1.25 if selection_mode else 1.0
             # Apply a reliable initial size immediately so window does not start tiny.
             base_w = int(round(900 * width_scale))
-            base_h = int(round(620 * height_scale))
+            base_h = 760 if selection_mode else 660
             min_w = int(round(780 * width_scale))
-            min_h = int(round(540 * height_scale))
+            # Keep enough vertical space so option buttons stay visible without manual resize.
+            min_h = 760 if selection_mode else 620
             popup.geometry(f"{base_w}x{base_h}")
             popup.minsize(min_w, min_h)
             try:
@@ -4441,6 +4441,12 @@ def launch_gui(
             )
             wait_label.pack(side="top", fill="x", pady=(0, 10))
 
+            button_frame = tk.Frame(popup, bg="#111111")
+            button_frame.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
+            button_frame.configure(height=44)
+            button_frame.pack_propagate(False)
+            option_buttons: List[Any] = []
+
             options_frame = tk.Frame(popup, bg="#111111")
             options_frame.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 8))
             options_scroll = tk.Scrollbar(options_frame, orient="vertical")
@@ -4448,7 +4454,7 @@ def launch_gui(
             options_text = tk.Text(
                 options_frame,
                 wrap="word",
-                height=16,
+                height=10,
                 width=100,
                 yscrollcommand=options_scroll.set,
                 bg="#151515",
@@ -4473,10 +4479,6 @@ def launch_gui(
                 "3. Score approximate B impact\n",
             )
             options_text.bind("<Key>", lambda _e: "break")
-
-            button_frame = tk.Frame(popup, bg="#111111")
-            button_frame.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
-            option_buttons: List[Any] = []
 
             popup_state: Dict[str, Any] = {
                 "request_id": request_id,
