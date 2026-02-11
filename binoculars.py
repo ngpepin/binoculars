@@ -2553,6 +2553,7 @@ def launch_gui(
         "analyzing": False,
         "progress_popup": None,
         "save_popup": None,
+        "pending_status_restore_job": None,
         "rewrite_popup": None,
         "rewrite_request_id": 0,
         "rewrite_busy": False,
@@ -2574,6 +2575,34 @@ def launch_gui(
         core = str(state.get("last_analysis_status_core", "")).strip()
         if core:
             status_var.set(core + analysis_stale_suffix())
+
+    def cancel_pending_status_restore() -> None:
+        pending_restore = state.get("pending_status_restore_job")
+        if pending_restore is None:
+            return
+        try:
+            root.after_cancel(pending_restore)
+        except Exception:
+            pass
+        state["pending_status_restore_job"] = None
+
+    def show_transient_status_then_restore_stats(message: str, duration_ms: int = 8000) -> None:
+        cancel_pending_status_restore()
+        status_var.set(message)
+        core = str(state.get("last_analysis_status_core", "")).strip()
+        if not core:
+            return
+
+        expected = message
+
+        def restore() -> None:
+            state["pending_status_restore_job"] = None
+            # Do not clobber newer status updates.
+            if status_var.get() != expected:
+                return
+            refresh_analysis_status_line()
+
+        state["pending_status_restore_job"] = root.after(max(100, int(duration_ms)), restore)
 
     def mark_analysis_stale() -> None:
         if not state.get("has_analysis"):
@@ -4471,6 +4500,7 @@ def launch_gui(
         state["save_popup"] = None
 
     def finish_analysis_error(message: str) -> None:
+        cancel_pending_status_restore()
         close_progress_popup()
         state["analyzing"] = False
         set_controls(True)
@@ -4482,6 +4512,7 @@ def launch_gui(
         result: Dict[str, Any],
         profile: Optional[Dict[str, Any]],
     ) -> None:
+        cancel_pending_status_restore()
         close_progress_popup()
         state["internal_update"] = True
         try:
@@ -4550,6 +4581,7 @@ def launch_gui(
     def on_analyze() -> None:
         if state["analyzing"]:
             return
+        cancel_pending_status_restore()
 
         pending = state.get("pending_edit_job")
         if pending is not None:
@@ -4618,11 +4650,17 @@ def launch_gui(
             messagebox.showerror("Save Error", str(exc))
             return
         close_save_popup()
-        status_var.set(f"Saved edited file: {out_path}{analysis_stale_suffix()}")
+        show_transient_status_then_restore_stats(
+            f"Saved edited file: {out_path}{analysis_stale_suffix()}",
+            duration_ms=8000,
+        )
 
     def on_clear_priors() -> None:
         clear_prior_backgrounds()
-        status_var.set(f"Cleared prior background highlights.{analysis_stale_suffix()}")
+        show_transient_status_then_restore_stats(
+            f"Cleared prior background highlights.{analysis_stale_suffix()}",
+            duration_ms=8000,
+        )
 
     def on_quit() -> None:
         if state.get("pending_edit_job") is not None:
@@ -4655,6 +4693,7 @@ def launch_gui(
                 root.after_cancel(state["pending_focus_job"])
             except Exception:
                 pass
+        cancel_pending_status_restore()
         hide_tooltip()
         close_rewrite_popup()
         close_progress_popup()
@@ -4891,6 +4930,11 @@ def main() -> int:
     )
     args = ap.parse_args()
 
+    if args.gui is not None:
+        print("Launching GUI...", file=sys.stderr)
+    else:
+        print("One moment please, starting...", file=sys.stderr)
+
     try:
         _, cfg_path, text_max_tokens_override = resolve_profile_config(args.master_config, args.config)
 
@@ -4938,5 +4982,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    print("One moment please, starting...", file=sys.stderr)
     raise SystemExit(main())
