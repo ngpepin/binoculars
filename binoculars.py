@@ -2955,7 +2955,7 @@ def launch_gui(
             clear_one_level_undo()
             show_transient_status_then_restore_stats(
                 f"Undo applied: {label}.{analysis_stale_suffix()}",
-                duration_ms=8000,
+                duration_ms=1800,
             )
         except Exception as exc:
             clear_one_level_undo()
