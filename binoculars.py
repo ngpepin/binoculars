@@ -2998,6 +2998,14 @@ def launch_gui(
         saved_snapshot = str(state.get("last_saved_text", ""))
         return current_text() != saved_snapshot
 
+    def sync_save_button_state(enabled_base: bool = True) -> None:
+        # Save is enabled only when edits are allowed and content differs from last saved/opened snapshot.
+        save_enabled = bool(enabled_base) and has_unsaved_changes()
+        try:
+            save_btn.configure(state="normal" if save_enabled else "disabled")
+        except Exception:
+            pass
+
     def sync_undo_button_state(enabled_base: bool = True) -> None:
         # Undo is single-level and only available when a tracked operation exists.
         undo_enabled = bool(state.get("undo_action")) and bool(enabled_base)
@@ -5088,6 +5096,7 @@ def launch_gui(
         if not text_widget.edit_modified():
             return
         text_widget.edit_modified(False)
+        sync_save_button_state(enabled_base=(not bool(state.get("analyzing"))))
         cancel_pending_synonym_lookup()
         state["synonym_request_id"] = int(state.get("synonym_request_id", 0)) + 1
         mark_analysis_stale()
@@ -5171,7 +5180,7 @@ def launch_gui(
         btn_state = "normal" if enabled else "disabled"
         analyze_btn.configure(state=btn_state)
         open_btn.configure(state=btn_state)
-        save_btn.configure(state=btn_state)
+        sync_save_button_state(enabled_base=enabled)
         clear_priors_btn.configure(state=btn_state)
         quit_btn.configure(state=btn_state)
         sync_undo_button_state(enabled_base=enabled)
@@ -5405,6 +5414,7 @@ def launch_gui(
             return False
         close_save_popup()
         state["last_saved_text"] = content
+        sync_save_button_state(enabled_base=(not bool(state.get("analyzing"))))
         if show_status:
             show_transient_status_then_restore_stats(
                 f"Saved edited file: {out_path}{analysis_stale_suffix()}",
@@ -5481,6 +5491,7 @@ def launch_gui(
         state["line_count"] = 0
         state["spell_version"] = int(state.get("spell_version", 0)) + 1
         set_clear_priors_visible(False)
+        sync_save_button_state(enabled_base=(not bool(state.get("analyzing"))))
 
         text_widget.mark_set("insert", "1.0")
         text_widget.see("1.0")
@@ -5629,6 +5640,7 @@ def launch_gui(
         synonym_buttons.append(btn)
     clear_synonym_panel()
     sync_undo_button_state(enabled_base=True)
+    sync_save_button_state(enabled_base=True)
 
     state["internal_update"] = True
     text_widget.insert("1.0", initial_text)
