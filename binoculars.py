@@ -2541,7 +2541,7 @@ def launch_gui(
     try:
         import tkinter as tk
         import tkinter.font as tkfont
-        from tkinter import messagebox
+        from tkinter import filedialog, messagebox
     except Exception as exc:
         raise ValueError("Tkinter is required for --gui mode but could not be imported.") from exc
 
@@ -2889,6 +2889,7 @@ def launch_gui(
     state: Dict[str, Any] = {
         "baseline_text": initial_text,
         "prev_text": initial_text,
+        "last_saved_text": initial_text,
         "segment_tags": [],
         "segment_labels": {},
         "segment_infos": {},
@@ -2992,6 +2993,10 @@ def launch_gui(
             return
         state["b_score_stale"] = True
         refresh_analysis_status_line()
+
+    def has_unsaved_changes() -> bool:
+        saved_snapshot = str(state.get("last_saved_text", ""))
+        return current_text() != saved_snapshot
 
     def sync_undo_button_state(enabled_base: bool = True) -> None:
         # Undo is single-level and only available when a tracked operation exists.
@@ -5165,6 +5170,7 @@ def launch_gui(
     def set_controls(enabled: bool) -> None:
         btn_state = "normal" if enabled else "disabled"
         analyze_btn.configure(state=btn_state)
+        open_btn.configure(state=btn_state)
         save_btn.configure(state=btn_state)
         clear_priors_btn.configure(state=btn_state)
         quit_btn.configure(state=btn_state)
@@ -5378,7 +5384,7 @@ def launch_gui(
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def on_save() -> None:
+    def save_current_document(show_status: bool = True) -> bool:
         content = current_text()
         src_dir = os.path.dirname(src_path) or "."
         stem, _ext = os.path.splitext(os.path.basename(src_path))
@@ -5396,12 +5402,126 @@ def launch_gui(
             close_save_popup()
             status_var.set(f"Save failed: {exc}{analysis_stale_suffix()}")
             messagebox.showerror("Save Error", str(exc))
-            return
+            return False
         close_save_popup()
-        show_transient_status_then_restore_stats(
-            f"Saved edited file: {out_path}{analysis_stale_suffix()}",
-            duration_ms=8000,
+        state["last_saved_text"] = content
+        if show_status:
+            show_transient_status_then_restore_stats(
+                f"Saved edited file: {out_path}{analysis_stale_suffix()}",
+                duration_ms=8000,
+            )
+        return True
+
+    def load_document_into_editor(new_src_path: str) -> bool:
+        nonlocal src_path
+        if state.get("analyzing") or state.get("rewrite_busy"):
+            return False
+
+        try:
+            with open(new_src_path, "r", encoding="utf-8") as f:
+                loaded_text = _normalize_markdown_hardbreaks(f.read())
+        except Exception as exc:
+            messagebox.showerror("Open Error", str(exc))
+            status_var.set(f"Open failed: {exc}")
+            return False
+
+        pending_keys = (
+            "pending_edit_job",
+            "pending_spell_job",
+            "pending_line_numbers_job",
+            "pending_line_bars_job",
+            "pending_preview_job",
+            "pending_focus_job",
         )
+        for key in pending_keys:
+            pending = state.get(key)
+            if pending is None:
+                continue
+            try:
+                root.after_cancel(pending)
+            except Exception:
+                pass
+            state[key] = None
+
+        cancel_pending_synonym_lookup()
+        state["synonym_request_id"] = int(state.get("synonym_request_id", 0)) + 1
+        cancel_pending_status_restore()
+        hide_tooltip()
+        close_rewrite_popup()
+        close_progress_popup()
+        close_save_popup()
+
+        clear_current_segment_tags()
+        clear_prior_backgrounds()
+        text_widget.tag_remove("edited", "1.0", "end")
+        text_widget.tag_remove("misspelled", "1.0", "end")
+        text_widget.tag_remove("unscored", "1.0", "end")
+        clear_synonym_panel()
+        clear_one_level_undo()
+
+        state["internal_update"] = True
+        try:
+            text_widget.delete("1.0", "end")
+            text_widget.insert("1.0", loaded_text)
+            text_widget.edit_modified(False)
+        finally:
+            state["internal_update"] = False
+
+        src_path = os.path.abspath(new_src_path)
+        root.title(f"Binoculars - {os.path.basename(src_path)}")
+        state["baseline_text"] = loaded_text
+        state["prev_text"] = loaded_text
+        state["last_saved_text"] = loaded_text
+        state["last_b_score"] = None
+        state["has_analysis"] = False
+        state["b_score_stale"] = False
+        state["last_analysis_status_core"] = ""
+        state["last_analysis_metrics"] = None
+        state["analyzed_char_end"] = len(loaded_text)
+        state["line_count"] = 0
+        state["spell_version"] = int(state.get("spell_version", 0)) + 1
+        set_clear_priors_visible(False)
+
+        text_widget.mark_set("insert", "1.0")
+        text_widget.see("1.0")
+        refresh_line_numbers_now()
+        refresh_line_bars_now()
+        queue_spellcheck(delay_ms=0)
+        queue_preview_render(delay_ms=0)
+        queue_preview_focus_sync(delay_ms=0)
+        status_var.set(f"Opened: {src_path}. Press Analyze to score and highlight this document.")
+        return True
+
+    def on_open() -> None:
+        if state.get("analyzing") or state.get("rewrite_busy"):
+            return
+
+        if has_unsaved_changes():
+            ask = messagebox.askyesnocancel(
+                "Unsaved Changes",
+                "This document has unsaved changes.\n\nSave before opening a new file?",
+            )
+            if ask is None:
+                return
+            if ask:
+                if not save_current_document(show_status=False):
+                    return
+
+        initial_dir = os.path.dirname(src_path) or "."
+        chosen = filedialog.askopenfilename(
+            title="Open Markdown/Text File",
+            initialdir=initial_dir,
+            filetypes=(
+                ("Markdown/Text files", "*.md *.markdown *.txt"),
+                ("All files", "*.*"),
+            ),
+        )
+        if not chosen:
+            return
+        load_document_into_editor(chosen)
+
+    def on_save() -> None:
+        save_current_document(show_status=True)
 
     def on_clear_priors() -> None:
         clear_prior_backgrounds()
@@ -5476,6 +5596,7 @@ def launch_gui(
         queue_line_numbers_refresh(delay_ms=0)
 
     analyze_btn = tk.Button(toolbar, text="Analyze", command=on_analyze, width=12)
+    open_btn = tk.Button(toolbar, text="Open", command=on_open, width=12)
     save_btn = tk.Button(toolbar, text="Save", command=on_save, width=12)
     undo_btn = tk.Button(toolbar, text="Undo", command=on_undo, width=12)
     clear_priors_btn = tk.Button(toolbar, text="Clear Priors", command=on_clear_priors, width=12)
@@ -5491,6 +5612,7 @@ def launch_gui(
         state["clear_priors_visible"] = bool(visible)
 
     analyze_btn.pack(side="left", padx=(0, 8))
+    open_btn.pack(side="left", padx=(0, 8))
     save_btn.pack(side="left", padx=(0, 8))
     undo_btn.pack(side="left", padx=(0, 8))
     quit_btn.pack(side="left")

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Binoculars
+Comment=Launch Binoculars in GUI mode
+Path=/my/directory/path/binoculars
+Exec=/my/directory/path/binoculars/binoculars.sh --gui /my/directory/path/binoculars/USERGUIDE-GUI.md
+StartupWMClass=Binoculars
+StartupNotify=true
+Terminal=false
+Categories=Utility;TextEditor;
