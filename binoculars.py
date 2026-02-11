@@ -2553,9 +2553,25 @@ def launch_gui(
         initial_text = _normalize_markdown_hardbreaks(f.read())
 
     try:
-        root = tk.Tk()
-    except Exception as exc:
-        raise ValueError("Unable to start GUI window. Check your display environment.") from exc
+        # className influences WM_CLASS on Linux/X11 docks/taskbars.
+        root = tk.Tk(className="Binoculars")
+    except Exception:
+        try:
+            root = tk.Tk()
+        except Exception as exc:
+            raise ValueError("Unable to start GUI window. Check your display environment.") from exc
+    try:
+        root.wm_class("Binoculars")
+    except Exception:
+        pass
+    try:
+        root.tk.call("tk", "appname", "Binoculars")
+    except Exception:
+        pass
+    try:
+        root.iconname("Binoculars")
+    except Exception:
+        pass
 
     def maximize_root_window() -> None:
         # Ubuntu and different WMs expose maximize via different APIs.
@@ -2586,7 +2602,102 @@ def launch_gui(
                 return family
         return "TkDefaultFont"
 
-    root.title(f"Binoculars Editor - {os.path.basename(src_path)}")
+    def create_owl_icon_image() -> Optional[Any]:
+        """
+        Build a small built-in owl icon (big eyes) so GUI launches with a recognizable app icon
+        without requiring external image assets.
+        """
+        try:
+            size = 64
+            icon = tk.PhotoImage(width=size, height=size)
+
+            def rect(x1: int, y1: int, x2: int, y2: int, color: str) -> None:
+                # Tk's PhotoImage rectangle upper bounds are exclusive.
+                icon.put(color, to=(x1, y1, x2 + 1, y2 + 1))
+
+            def circle(cx: int, cy: int, radius: int, color: str) -> None:
+                r2 = radius * radius
+                for y in range(cy - radius, cy + radius + 1):
+                    if y < 0 or y >= size:
+                        continue
+                    for x in range(cx - radius, cx + radius + 1):
+                        if x < 0 or x >= size:
+                            continue
+                        dx = x - cx
+                        dy = y - cy
+                        if (dx * dx) + (dy * dy) <= r2:
+                            icon.put(color, to=(x, y))
+
+            outline = "#1c1c1c"
+            feather_outer = "#7c7c7c"
+            feather_inner = "#9b9b9b"
+            face = "#c8c8c8"
+            eye_white = "#f0f0f0"
+            pupil = "#151515"
+            beak = "#b1b1b1"
+            wing = "#676767"
+            badge_outer = "#d0d0d0"
+            badge_inner = "#bdbdbd"
+
+            # Circular badge background so icon reads well at small sizes.
+            circle(32, 32, 30, badge_outer)
+            circle(32, 32, 27, badge_inner)
+
+            # Owl body and head.
+            circle(32, 36, 20, outline)
+            circle(32, 36, 18, feather_outer)
+            circle(32, 29, 16, feather_inner)
+
+            # Ears.
+            rect(18, 12, 24, 20, outline)
+            rect(40, 12, 46, 20, outline)
+            rect(19, 13, 23, 19, feather_outer)
+            rect(41, 13, 45, 19, feather_outer)
+
+            # Face mask.
+            circle(32, 31, 12, face)
+
+            # Big eyes.
+            circle(24, 30, 9, outline)
+            circle(40, 30, 9, outline)
+            circle(24, 30, 7, eye_white)
+            circle(40, 30, 7, eye_white)
+            circle(24, 31, 4, pupil)
+            circle(40, 31, 4, pupil)
+            circle(22, 28, 2, "#d7d7d7")
+            circle(38, 28, 2, "#d7d7d7")
+
+            # Beak.
+            rect(30, 35, 34, 39, outline)
+            rect(31, 36, 33, 38, beak)
+
+            # Wings.
+            rect(14, 34, 21, 49, wing)
+            rect(43, 34, 50, 49, wing)
+            rect(14, 34, 15, 49, outline)
+            rect(20, 34, 21, 49, outline)
+            rect(43, 34, 44, 49, outline)
+            rect(49, 34, 50, 49, outline)
+
+            # Belly and feet.
+            rect(26, 42, 38, 53, "#a7a7a7")
+            rect(27, 43, 37, 52, "#b8b8b8")
+            rect(24, 54, 29, 58, outline)
+            rect(35, 54, 40, 58, outline)
+
+            return icon
+        except Exception:
+            return None
+
+    root.title(f"Binoculars - {os.path.basename(src_path)}")
+    app_icon = create_owl_icon_image()
+    if app_icon is not None:
+        try:
+            root.iconphoto(True, app_icon)
+            # Keep a strong reference; Tk can drop icons if image is GC'd.
+            root._binoculars_app_icon = app_icon  # type: ignore[attr-defined]
+        except Exception:
+            pass
     root.geometry("1200x800")
     root.configure(bg="#000000")
     maximize_root_window()
@@ -2770,6 +2881,11 @@ def launch_gui(
     text_widget.tag_configure("unscored", foreground="#b2bac4")
     english_words = load_english_words()
 
+    # Central GUI state store. Grouped logically:
+    # - analysis metrics/status
+    # - scheduled UI jobs
+    # - synonym/rewrite transient state
+    # - rendering caches (line map/contributions/priors)
     state: Dict[str, Any] = {
         "baseline_text": initial_text,
         "prev_text": initial_text,
@@ -2849,6 +2965,10 @@ def launch_gui(
         state["pending_status_restore_job"] = None
 
     def show_transient_status_then_restore_stats(message: str, duration_ms: int = 8000) -> None:
+        """
+        Show a temporary status message, then restore the current analysis metrics line.
+        This is used for non-blocking workflow events (save, clear priors, delete, undo).
+        """
         cancel_pending_status_restore()
         status_var.set(message)
         core = str(state.get("last_analysis_status_core", "")).strip()
@@ -2873,6 +2993,7 @@ def launch_gui(
         refresh_analysis_status_line()
 
     def sync_undo_button_state(enabled_base: bool = True) -> None:
+        # Undo is single-level and only available when a tracked operation exists.
         undo_enabled = bool(state.get("undo_action")) and bool(enabled_base)
         try:
             undo_btn.configure(state="normal" if undo_enabled else "disabled")
@@ -2889,6 +3010,10 @@ def launch_gui(
         old_text: str,
         new_text: str,
     ) -> None:
+        """
+        Capture one reversible text mutation.
+        We intentionally keep one level only to keep behavior predictable and fast.
+        """
         state["undo_action"] = {
             "label": str(operation_label),
             "start_idx": str(start_idx),
@@ -2899,6 +3024,10 @@ def launch_gui(
         sync_undo_button_state(enabled_base=(not bool(state.get("analyzing"))))
 
     def on_undo() -> None:
+        """
+        Restore the most recent tracked mutation if the document has not changed since.
+        Guarding on full-text equality prevents applying stale coordinates to a changed doc.
+        """
         action_obj = state.get("undo_action")
         action = action_obj if isinstance(action_obj, dict) else None
         if not action:
@@ -3068,6 +3197,7 @@ def launch_gui(
             btn.configure(state="normal" if i < len(cased) else "disabled")
 
     def queue_synonym_lookup_for_click(index_clicked: str) -> None:
+        # Debounce avoids accidental lookups while drag-selection is still in motion.
         cancel_pending_synonym_lookup()
         req_id = int(state.get("synonym_request_id", 0)) + 1
         state["synonym_request_id"] = req_id
@@ -4711,6 +4841,10 @@ def launch_gui(
         queue_synonym_lookup_for_click(click_idx)
 
     def on_delete_key(event: Any) -> Optional[str]:
+        """
+        Delete selected text as a tracked operation so Undo can restore it.
+        If no selection exists, return None to preserve normal single-char delete behavior.
+        """
         del event
         if state.get("internal_update"):
             return None
@@ -4750,7 +4884,8 @@ def launch_gui(
         return "break"
 
     def on_backspace_key(event: Any) -> Optional[str]:
-        # Match Delete behavior for selected blocks so one-level Undo is available.
+        # Match Delete behavior for selected blocks so one-level Undo is available
+        # for both Del and Backspace-based deletions.
         return on_delete_key(event)
 
     def on_low_segment_right_click(event: Any, tag: str) -> str:

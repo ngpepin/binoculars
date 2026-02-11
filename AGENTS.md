@@ -20,9 +20,10 @@ Status:
 - Functional CLI + GUI prototype with regression coverage for the `v1.1.x` line.
 - Core scoring is stable; calibration/classification is not implemented.
 - GUI supports iterative rewrite workflows with approximate impact scoring and explicit full re-analysis.
+- GUI also supports fast synonym-assisted edits, one-level undo for tracked mutations, and transient status messaging that restores metrics automatically.
 
 Latest known commit at time of this guide update:
-- `77e40ec`
+- `225b75e`
 
 ## 3) Repository Map
 
@@ -103,6 +104,16 @@ Baseline dependencies:
 venv/bin/pip install numpy llama-cpp-python
 ```
 
+Optional dependency for richer synonym lookup:
+```bash
+venv/bin/pip install nltk
+venv/bin/python - <<'PY'
+import nltk
+nltk.download('wordnet', quiet=True)
+nltk.download('omw-1.4', quiet=True)
+PY
+```
+
 Example scoring run:
 ```bash
 venv/bin/python binoculars.py --config fast your_doc.md --json
@@ -129,6 +140,7 @@ Important:
   - `Analyze` computes exact document metrics and refreshes heatmap.
   - rewrites show approximate impact; exact B requires Analyze.
   - status explicitly marks B stale after edits/rewrites.
+  - non-analysis status messages are transient and then restore metrics (Undo success is intentionally brief).
 
 GUI rewrite behavior:
 - Right-click on red (`LOW`) scored segments to request 3 rewrites.
@@ -139,6 +151,25 @@ GUI rewrite behavior:
   - preserve unchanged source lines when model output accidentally omits/collapses them
 - Popup supports scrolling and keyboard selection (`1`/`2`/`3`, `Q`/`Esc` to cancel).
 - Options are sorted by expected B increase (more human-like first).
+
+GUI synonym behavior:
+- Left-click a word in the left pane to trigger synonym lookup after a short debounce.
+- Synonym panel (bottom of right pane) shows up to 9 options in 3 columns with buttons `1..9`.
+- Source order: local fallback -> WordNet (if installed) -> Datamuse API fallback.
+- Applying a synonym is tracked as one undoable mutation.
+
+GUI undo behavior (single level):
+- Toolbar has `Undo` button.
+- Supported tracked operations:
+  - selected-block delete (`Delete` or `Backspace`),
+  - synonym replacement,
+  - red-segment rewrite replacement,
+  - highlighted-block rewrite replacement.
+- Undo is invalidated if document text changes after the tracked operation.
+
+GUI identity details:
+- Window/app name is set to `Binoculars` (including Linux WM class/appname hints).
+- GUI icon is drawn in code (owl with large eyes) via Tk `PhotoImage`.
 
 ## 8) Lessons Learned / Gotchas
 

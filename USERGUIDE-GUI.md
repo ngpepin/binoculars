@@ -25,7 +25,8 @@ Main areas:
 - Left pane: editable source text.
 - Left gutter: line numbers and per-line contribution bars.
 - Right pane: markdown preview with score-based backgrounds.
-- Toolbar: `Analyze`, `Save`, `Clear Priors`, `Quit`.
+- Right-pane footer: synonym panel for clicked words.
+- Toolbar: `Analyze`, `Save`, `Undo`, `Clear Priors`, `Quit`.
 - Status bar: current score/metrics and workflow state.
 
 Color conventions (after Analyze):
@@ -63,8 +64,9 @@ Use this loop for practical throughput:
 4. Apply one or more rewrite options (no auto-analyze).
 5. Continue editing while watching stale indicator.
 6. Re-run `Analyze` when you need exact score confirmation.
-7. Press `Clear Priors` when overlays become visually noisy.
-8. Repeat.
+7. Use `Undo` when you want to revert the last tracked mutation.
+8. Press `Clear Priors` when overlays become visually noisy.
+9. Repeat.
 
 Suggested cadence:
 - Run `Analyze` every few applied rewrites (for example every 3-8), or after a major section change.
@@ -108,7 +110,30 @@ Popup details:
 Option ordering:
 - Sorted by expected increase in B (more human-like first).
 
-## 7) Exact vs Approximate Metrics
+## 7) Synonym Finder and One-Level Undo
+
+Synonym finder:
+- Left-click a word in the left pane.
+- After a short debounce, the synonym panel shows up to 9 options in 3 columns.
+- Select by clicking button `1..9` in the panel.
+- Replacement is inserted in the left pane and marked yellow as an edit.
+
+Synonym source order:
+- local fallback list,
+- WordNet (if available in environment),
+- Datamuse API fallback.
+
+One-level Undo:
+- `Undo` reverts exactly one tracked operation.
+- Supported tracked operations:
+  - selected-block delete (`Delete` or `Backspace`),
+  - synonym replacement,
+  - single red-segment rewrite replacement,
+  - highlighted-block rewrite replacement.
+- Undo is intentionally one level only.
+- If text changed after the tracked operation, Undo is invalidated for safety.
+
+## 8) Exact vs Approximate Metrics
 
 Approximate values in popup:
 - Designed for ranking options quickly.
@@ -118,7 +143,7 @@ Exact values in status bar:
 - Updated only by `Analyze`.
 - Include exact `B`, `Observer logPPL`, `Performer logPPL`, `Cross logXPPL`, and scored `Last Line`.
 
-## 8) Prior Overlays and `Clear Priors`
+## 9) Prior Overlays and `Clear Priors`
 
 What priors are:
 - Faint background traces of previous analyses and edits.
@@ -133,7 +158,7 @@ What `Clear Priors` does:
 - Does not alter current text.
 - Does not run Analyze.
 
-## 9) Preview Pane Selection Mirroring
+## 10) Preview Pane Selection Mirroring
 
 When you highlight a block on the left:
 - Right preview mirrors the same selected block.
@@ -144,7 +169,7 @@ When you highlight a block on the left:
 
 This makes it easier to inspect local context before requesting rewrites.
 
-## 10) Saving and Output Files
+## 11) Saving and Output Files
 
 `Save` writes timestamped files next to the source:
 
@@ -153,8 +178,9 @@ This makes it easier to inspect local context before requesting rewrites.
 
 Tip:
 - Save snapshots at meaningful milestones (for example after each Analyze-confirmed improvement).
+- Save shows a modal popup with destination filename while write is in progress.
 
-## 11) Optional External Rewrite Backend (`config.binoculars.llm.json`)
+## 12) Optional External Rewrite Backend (`config.binoculars.llm.json`)
 
 If configured and reachable, rewrite generation can use any OpenAI-compatible endpoint.
 If config is absent/disabled/unreachable, GUI automatically falls back to internal performer model.
@@ -169,7 +195,7 @@ Typical fields:
 - context controls (`context_chars_each_side`, `context_paragraphs_each_side`, `context_window_max_chars`)
 - `llm.extra_headers`, `llm.extra_body`
 
-## 12) Troubleshooting
+## 13) Troubleshooting
 
 Rewrite menu does not open:
 - Run `Analyze` at least once first.
@@ -180,9 +206,17 @@ Rewrite generation seems slow:
 - External endpoint latency can dominate.
 - Reduce context fields in `config.binoculars.llm.json` if needed.
 
+Undo button is disabled or Undo fails:
+- Undo only supports one tracked operation at a time.
+- Undo is invalidated if the document changed after that operation.
+
 B score seems inconsistent with popup deltas:
 - Popup deltas are approximate.
 - Run full `Analyze` for authoritative values.
+
+Status-bar messages disappear:
+- Non-analysis workflow messages are transient and metrics are restored automatically.
+- `Analyzing...` remains until analysis completes.
 
 Visual clutter is high:
 - Use `Clear Priors`, then continue iteration.
@@ -190,7 +224,8 @@ Visual clutter is high:
 ---
 
 Practical summary:
-- Use rewrites + edits for fast local iteration,
+- Use rewrites + synonym swaps + direct edits for fast local iteration,
 - trust popup numbers for relative ranking,
 - use `Analyze` as the exact checkpoint,
+- use one-level `Undo` to quickly back out the last tracked mutation,
 - use `Clear Priors` as periodic visual reset.

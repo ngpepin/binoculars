@@ -104,12 +104,24 @@ Important: this is a scoring signal, not proof of authorship.
 - Python 3.10+
 - `numpy`
 - `llama-cpp-python`
+- optional: `nltk` (for local WordNet synonym expansion in GUI)
 - GGUF models on local disk
 
 Install into repo venv:
 
 ```bash
 venv/bin/pip install numpy llama-cpp-python
+```
+
+Optional WordNet setup for richer synonym suggestions:
+
+```bash
+venv/bin/pip install nltk
+venv/bin/python - <<'PY'
+import nltk
+nltk.download("wordnet", quiet=True)
+nltk.download("omw-1.4", quiet=True)
+PY
 ```
 
 ## Model Files
@@ -339,14 +351,17 @@ Heatmap semantics:
 
 Launches an editor/analyzer with:
 
+- Window/app name: `Binoculars`
 - Left pane: editable source text
 - Left gutter:
   - logical line numbers
   - red/green contribution bars per line
 - Right pane: live markdown preview
+- Right-pane footer: real-time synonym panel for clicked words
 - Controls:
   - `Analyze`
   - `Save`
+  - `Undo` (one level)
   - `Clear Priors`
   - `Quit`
 - Status bar:
@@ -363,16 +378,24 @@ For a detailed workflow-oriented guide, see:
   - scores full current document
   - preserves cursor and top-view position
   - updates red/green foreground highlights
-  - updates hover tooltips
+  - updates hover tooltips (`% contribution`, `logPPL`, `delta_if_removed`, `delta_vs_doc`, ranges)
   - updates status metrics
+  - keeps `Performing analysis on current text...` visible until analysis finishes
 - Edits since last analysis show in yellow
 - On next `Analyze`, previous highlights/edits become faint prior backgrounds
 - `Clear Priors` removes faint prior backgrounds only
 - `Save` writes:
   - `<stem>_edited_YYYYMMDDHHMM.md`
   - same directory as source
+  - shows a modal `Saving...` popup with the destination filename while writing
 - Always-on English spell checking:
   - misspellings marked with red underline
+- Synonym suggestions:
+  - left-click any word in the left pane to request synonyms
+  - lookup is debounced to avoid firing during drag-selection
+  - panel shows up to 9 options in 3 columns with buttons `1..9`
+  - selecting an option replaces the clicked word and marks the replacement as an edit (yellow)
+  - lookup order is: local fallback list -> WordNet (if installed) -> Datamuse API fallback
 - Rewrite suggestions:
   - right-click a red (`LOW`) paragraph segment to open 3 rewrite options
   - or highlight a block (multi-line allowed) and right-click to request block rewrites
@@ -383,9 +406,17 @@ For a detailed workflow-oriented guide, see:
   - choose option with mouse or keyboard `1`/`2`/`3`, or `Quit`
   - chosen rewrite is inserted as an edit (yellow), with prior backgrounds preserved by prior line status
   - B score is intentionally not auto-recomputed; status marks it stale until next `Analyze`
+- Delete + undo behavior:
+  - deleting a selected block with `Delete` or `Backspace` is tracked as one undoable action
+  - `Undo` supports one level for: selected-block delete, synonym replacement, red-segment rewrite, and block rewrite
+  - successful undo status is shown briefly, then metrics return
 - Preview selection mirroring:
   - when a block is selected in the left pane, right preview mirrors the same line range
   - selected preview lines show LOW/HIGH/neutral background styles
+- Status-bar transient messages:
+  - non-analysis events (for example Save/Clear Priors/Delete/Undo) temporarily replace metrics
+  - most transient messages restore metrics after ~8 seconds
+  - successful `Undo applied...` restores metrics quickly (about 1.8 seconds)
 
 ### Preview sync + debug controls
 
