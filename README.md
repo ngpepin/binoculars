@@ -1,26 +1,21 @@
 # Binoculars
 
-`Binoculars` is a local AI-text forensics and humanization workflow tool. It uses two related `llama.cpp` models (observer + performer) to compute faithful Binoculars-style scores from full logits, then helps you iteratively rewrite high-risk spans toward more human-like text in the GUI.
+`Binoculars` is a local workflow tool for AI text forensics and humanization. It uses two related `llama.cpp` models - observer and performer - to compute Binoculars-style scores from full logits, then guides you through iterative rewrites of high-risk text spans in the GUI.
 
-If you need to evaluate or revise long-form text without handing documents to a hosted detector, this repo gives you a practical workflow:
+If you need to evaluate or revise long-form text without sending documents to a remote detector, this repository provides a practical solution.
 
-- Keep data and models local by default.
-- Compute inspectable signals (`logPPL`, `logXPPL`, `B`) instead of opaque labels.
-- See exactly where score pressure comes from with paragraph-level heatmaps.
-- Generate 3 rewrite options for a flagged line or selected block and rank them by approximate B impact for fast humanization passes.
-- Re-run full Analyze only when needed for exact checkpoint scores.
-- Optionally use an OpenAI-compatible rewrite backend, with automatic fallback to internal local generation.
+- Data and models remain local by default.
+- The system computes inspectable signals (`logPPL`, `logXPPL`, `B`) rather than opaque labels.
+- Paragraph-level heatmaps show exactly where score pressure originates.
+- For any flagged line or selected block, you can generate three rewrite options and rank them by estimated B impact for quick humanization passes.
+- Full analysis can be re-run only when you need exact checkpoint scores.
+- Optionally, you may use an OpenAI-compatible rewrite backend, with automatic fallback to internal local generation if needed.
 
 Reference paper (also in `background/`): https://arxiv.org/abs/2401.12070
 
-Acknowledgment:
-Special thanks to the Binoculars paper authors for the foundational method this project builds on: Abhimanyu Hans, Avi Schwarzschild, Valeriia Cherepanova, Hamid Kazemi, Aniruddha Saha, Micah Goldblum, Jonas Geiping, and Tom Goldstein.
+Acknowledgment: The Binoculars paper authors - Abhimanyu Hans, Avi Schwarzschild, Valeriia Cherepanova, Hamid Kazemi, Aniruddha Saha, Micah Goldblum, Jonas Geiping, and Tom Goldstein - provided the foundational method for this project.
 
-<p align="center">
-  <img src="media/screenshot.png" width="900">
-  <br/>
-  <em>Screenshot of the GUI</em>
-</p>
+<p align="center"> <img src="media/screenshot.png" width="900"> <br/> <em>Screenshot of the GUI</em> </p>
 
 ## What This Does
 
@@ -37,10 +32,10 @@ It can also generate paragraph-level diagnostics and heatmaps.
 The Binoculars-style cross-entropy term depends on full next-token distributions. In practice, this means:
 
 - `logits_all=True` is required
-- top-k API logprobs are not sufficient for faithful reconstruction
-- observer/performer tokenizer alignment must be exact
+- Top-k API logprobs are not sufficient for faithful reconstruction
+- Observer and performer tokenizer alignment must be exact
 
-Reference paper is included at:
+The reference paper is included at:
 
 - `background/2401.12070v3.pdf`
 
@@ -52,62 +47,48 @@ Additional local design notes:
 
 Let a tokenized document be:
 
-$$
-x_1,\, x_2,\, \dots,\, x_T
-$$
+$$ x_1,\, x_2,\, \dots,\, x_T $$
 
 with observer model $M_o$ and performer model $M_p$.
 
 **Observer log-perplexity:**
 
-$$
-\log \mathrm{PPL}_{M_o}(x) = -\frac{1}{T-1} \sum_{t=1}^{T-1} \log p_{M_o}(x_{t+1} \mid x_{\leq t})
-$$
+$$ \log \mathrm{PPL}_{M_o}(x) = -\frac{1}{T-1} \sum_{t=1}^{T-1} \log p_{M_o}(x_{t+1} \mid x_{\leq t}) $$
 
 **Cross log-perplexity:**
 
-$$
-\log \mathrm{XPPL}_{M_o, M_p}(x) = -\frac{1}{T-1} \sum_{t=1}^{T-1} \sum_{v \in V} p_{M_o}(v \mid x_{\leq t}) \log p_{M_p}(v \mid x_{\leq t})
-$$
+$$ \log \mathrm{XPPL}_{M_o, M_p}(x) = -\frac{1}{T-1} \sum_{t=1}^{T-1} \sum_{v \in V} p_{M_o}(v \mid x_{\leq t}) \log p_{M_p}(v \mid x_{\leq t}) $$
 
 **Binoculars score:**
 
-$$
-B(x) = \frac{\log \mathrm{PPL}_{M_o}(x)}{\log \mathrm{XPPL}_{M_o, M_p}(x)}
-$$
+$$ B(x) = \frac{\log \mathrm{PPL}_{M_o}(x)}{\log \mathrm{XPPL}_{M_o, M_p}(x)} $$
 
-Current UI/CLI interpretation used by this repo:
+The current UI/CLI interpretation used by this repository:
 
 - Higher `B` is treated as more human-like
-- Lower paragraph `logPPL` is treated as more AI-like for heatmap coloring
+- Lower paragraph `logPPL` is treated as more AI-like for heatmap colouring
 
-Important: this is a scoring signal, not proof of authorship.
+Important: This is a scoring signal, not proof of authorship.
 
 ## Repository Layout
 
-- `binoculars.py`: main CLI + GUI application
-- `binoculars.sh`: wrapper that activates venv, auto-cleans old instances, forwards Ctrl-C
-- `binocular.sh`: alias wrapper (`exec binoculars.sh`)
-- `config.binoculars.json`: master profile selector (`default` + `profiles`)
-- `config.binoculars.llm.json`: optional OpenAI-compatible rewrite backend config for GUI rewrite suggestions
-- `config.llama31.cuda12gb.fast.json`: fast profile (currently `text.max_tokens=4096`)
-- `config.llama31.cuda12gb.long.json`: long profile (currently `text.max_tokens=12288`)
-- `USERGUIDE-GUI.md`: detailed GUI user guide and iterative workflow guidance
-- `background/2401.12070v3.pdf`: background paper
-- `samples/`: sample markdown inputs
-- `tests/test_regression_v1_1_x.py`: regression suite
-- `tests/fixtures/`: fixture docs used by regression tests
+- `binoculars.py`: main CLI and GUI application; `binoculars.sh`: wrapper that activates venv, cleans old instances, and forwards Ctrl-C
+- `binocular.sh`: alias wrapper (`exec binoculars.sh`); `config.binoculars.json`: master profile selector (`default` and `profiles`)
+- `config.binoculars.llm.json`: optional OpenAI-compatible rewrite backend config for GUI rewrite suggestions; `config.llama31.cuda12gb.fast.json`: fast profile (currently `text.max_tokens=4096`)
+- `config.llama31.cuda12gb.long.json`: long profile (currently `text.max_tokens=12288`); `USERGUIDE-GUI.md`: detailed GUI user guide and iterative workflow guidance
+- `background/2401.12070v3.pdf`: background paper; `samples/`: sample markdown inputs
+- `tests/test_regression_v1_1_x.py`: regression suite; `tests/fixtures/`: fixture docs used by regression tests
 
 ## Requirements
 
 - Linux or macOS shell
-- Python 3.10+
+- Python 3.10 or newer
 - `numpy`
 - `llama-cpp-python`
-- optional: `nltk` (for local WordNet synonym expansion in GUI)
+- Optional: `nltk` (for local WordNet synonym expansion in GUI)
 - GGUF models on local disk
 
-Install into repo venv:
+Install into the repository venv:
 
 ```bash
 venv/bin/pip install numpy llama-cpp-python
@@ -126,16 +107,16 @@ PY
 
 ## Model Files
 
-Configs in this repo point to local model paths under `models/`, for example:
+Configs in this repository point to local model paths under `models/`, for example:
 
 - Base observer: Llama 3.1 8B Q5_K_M
 - Instruct performer: Llama 3.1 8B Instruct Q5_K_M
 
-You can use different models if tokenizer/vocab alignment is preserved.
+You may use different models if tokenizer and vocabulary alignment are preserved.
 
 ## Configuration
 
-### 1) Master profile config
+### 1) Master Profile Config
 
 `config.binoculars.json` selects profile by label:
 
@@ -151,8 +132,8 @@ You can use different models if tokenizer/vocab alignment is preserved.
 
 `profiles` entries can be either:
 
-- string path (current repo default), or
-- object form:
+- String path (current repository default), or
+- Object form:
 
 ```json
 {
@@ -163,7 +144,7 @@ You can use different models if tokenizer/vocab alignment is preserved.
 
 `max_tokens` in object form (if present) overrides `text.max_tokens` in the concrete profile.
 
-### 2) Concrete observer/performer profile
+### 2) Concrete Observer/Performer Profile
 
 Each profile must define:
 
@@ -181,28 +162,19 @@ Notes:
 - `text.max_tokens > 0` truncates input token window
 - `cache.dtype` may be `float16` or `float32`
 
-### 3) Optional rewrite LLM config (GUI)
+### 3) Optional Rewrite LLM Config (GUI)
 
-If `config.binoculars.llm.json` is present and enabled, GUI rewrite suggestions can use an external OpenAI-compatible endpoint.
-If missing or disabled, internal performer-model generation is used.
-If present but unreachable/invalid at runtime, GUI rewrites automatically fall back to internal generation.
+If `config.binoculars.llm.json` is present and enabled, GUI rewrite suggestions can use an external OpenAI-compatible endpoint. If missing or disabled, internal performer-model generation is used. If present but unreachable or invalid at runtime, GUI rewrites automatically fall back to internal generation.
 
 Supported fields include:
 
-- `llm.enabled`
-- `llm.endpoint_url`
-- `llm.request_path` (default `/chat/completions`)
-- `llm.model`
-- `llm.api_key` or `llm.api_key_env` (also supports `OPENAI_API_KEY` when enabled)
-- `llm.api_key_header` / `llm.api_key_prefix`
-- `llm.timeout_s`
-- `llm.max_tokens`
-- `llm.temperature`
-- `llm.top_p`
-- `llm.context_chars_each_side`
-- `llm.context_paragraphs_each_side`
-- `llm.context_window_max_chars`
-- `llm.extra_headers`
+- `llm.enabled`; `llm.endpoint_url`
+- `llm.request_path` (default `/chat/completions`); `llm.model`
+- `llm.api_key` or `llm.api_key_env` (also supports `OPENAI_API_KEY` when enabled); `llm.api_key_header` / `llm.api_key_prefix`
+- `llm.timeout_s`; `llm.max_tokens`
+- `llm.temperature`; `llm.top_p`
+- `llm.context_chars_each_side`; `llm.context_paragraphs_each_side`
+- `llm.context_window_max_chars`; `llm.extra_headers`
 - `llm.extra_body`
 
 Example:
@@ -229,15 +201,15 @@ Example:
 
 `binoculars.py` loads models sequentially:
 
-1. Tokenize with observer/performer in `vocab_only=True`
+1. Tokenize with observer and performer in `vocab_only=True`
 2. Hard-fail if tokenization differs
 3. Run observer with full logits
 4. Persist observer logits to memmap
 5. Unload observer, load performer
-6. Compute cross-entropy term from observer distribution vs performer logits
-7. Emit metrics, optional diagnostics/heatmap
+6. Compute cross-entropy term from observer distribution versus performer logits
+7. Emit metrics and optional diagnostics or heatmap
 
-This keeps VRAM lower than concurrent dual-model loading.
+This approach keeps VRAM usage lower than concurrent dual-model loading.
 
 ## CLI Usage
 
@@ -247,19 +219,19 @@ Show help:
 ./binoculars.sh --help
 ```
 
-Basic:
+Basic usage:
 
 ```bash
 ./binoculars.sh samples/Athens.md
 ```
 
-JSON:
+JSON output:
 
 ```bash
 ./binoculars.sh --config long samples/Athens.md --json
 ```
 
-Heatmap:
+Heatmap mode:
 
 ```bash
 ./binoculars.sh --config fast --input samples/Athens.md --heatmap --diagnose-top-k 10
@@ -285,77 +257,67 @@ Alias wrapper:
 /home/npepin/Projects/binoculars/binocular.sh --config fast /tmp/doc.md
 ```
 
-### Input rules
+### Input Rules
 
-- Provide input either as:
-  - positional `INPUT`, or
+- Provide input as either:
+  - Positional `INPUT`, or
   - `--input INPUT`
-- If both are provided, command errors
-- If multiple positional paths are provided, only the first is used (warning emitted)
+- If both are provided, the command errors
+- If multiple positional paths are given, only the first is used (a warning is emitted)
 - If no input is given, stdin (`-`) is used
 
-### CLI options
+### CLI Options
 
-- `--master-config FILE`: master profile mapping file
-- `--config PROFILE`: profile label (`fast`, `long`, etc.)
-- `--input FILE|-`: explicit input
-- `--output FILE`: write text output
-- `--json`: emit JSON result object
-- `--diagnose-paragraphs`: rank low-perplexity hotspot paragraphs
-- `--diagnose-top-k N`: hotspot count (also used by heatmap selection)
-- `--diagnose-print-text`: print full hotspot text segments
-- `--heatmap`: emit console + markdown heatmap output
-- `--gui FILE`: launch interactive GUI editor/analyzer
+- `--master-config FILE`: master profile mapping file; `--config PROFILE`: profile label (`fast`, `long`, etc.)
+- `--input FILE|-`: explicit input; `--output FILE`: write text output
+- `--json`: emit JSON result object; `--diagnose-paragraphs`: rank low-perplexity hotspot paragraphs
+- `--diagnose-top-k N`: hotspot count (also used by heatmap selection); `--diagnose-print-text`: print full hotspot text segments
+- `--heatmap`: emit console and markdown heatmap output; `--gui FILE`: launch interactive GUI editor/analyzer
 
 `--heatmap` cannot be combined with `--json`.
 
 `--gui` is mutually exclusive with:
 
 - `--input`
-- positional `INPUT`
+- Positional `INPUT`
 - `--output`
 - `--json`
 - `--heatmap`
 
-## Heatmap Mode (`--heatmap`)
+## Heatmap Mode (`--Heatmap`)
 
 When enabled:
 
-- console output shows:
-  - red/green highlights (ANSI)
-  - simple note markers like `[1]`
-  - line-drawing notes table
-  - wrapped layout (about 85% terminal width)
-- file output writes markdown to:
-  - `<input_stem>_heatmap.md` in the same directory as source input
-- existing heatmap file is backed up first:
-  - `<name>.YYYYMMDD_HHMMSS.bak` (timestamp format may vary by implementation helper)
+- Console output shows:
+  - Red and green highlights (ANSI)
+  - Simple note markers like `[1]`
+  - Line-drawing notes table
+  - Wrapped layout (about 85% terminal width)
+- File output writes markdown to:
+  - `[[HTML_BLOCK_6]]_heatmap.md` in the same directory as the source input
+  - Existing heatmap file is backed up first:
+    - `[[HTML_BLOCK_7]].YYYYMMDD_HHMMSS.bak` (timestamp format may vary by implementation helper)
 
 Heatmap semantics:
 
 - Red sections: lowest paragraph `logPPL`
 - Green sections: highest paragraph `logPPL`
 - Note table columns:
-  - `Index`
-  - `Label`
-  - `% contribution`
-  - `Paragraph`
-  - `logPPL`
-  - `delta_vs_doc`
-  - `delta_if_removed`
-  - `Transitions`
-  - `Chars`
-  - `Tokens`
+  - `Index`; `Label`
+  - `% contribution`; `Paragraph`
+  - `logPPL`; `delta_vs_doc`
+  - `delta_if_removed`; `Transitions`
+  - `Chars`; `Tokens`
 
-## GUI Mode (`--gui <file>`)
+## GUI Mode (`--Gui [[HTML_BLOCK_8]]`)
 
 Launches an editor/analyzer with:
 
 - Window/app name: `Binoculars`
 - Left pane: editable source text
 - Left gutter:
-  - logical line numbers
-  - red/green contribution bars per line
+  - Logical line numbers
+  - Red and green contribution bars per line
 - Right pane: live markdown preview
 - Right-pane footer: real-time synonym panel for clicked words
 - Controls:
@@ -366,80 +328,77 @@ Launches an editor/analyzer with:
   - `Quit`
 - Status bar:
   - `Binocular score B (high is more human-like): ...`
-  - includes prior score and `Last Line`
+  - Includes prior score and `Last Line`
 
 For a detailed workflow-oriented guide, see:
 
 - `USERGUIDE-GUI.md`
 
-### GUI behavior
+### GUI Behaviour
 
 - `Analyze`:
-  - scores full current document
-  - preserves cursor and top-view position
-  - updates red/green foreground highlights
-  - updates hover tooltips (`% contribution`, `logPPL`, `delta_if_removed`, `delta_vs_doc`, ranges)
-  - updates status metrics
-  - keeps `Performing analysis on current text...` visible until analysis finishes
-- Edits since last analysis show in yellow
-- On next `Analyze`, previous highlights/edits become faint prior backgrounds
-- `Clear Priors` removes faint prior backgrounds only
-- `Save` writes:
-  - `<stem>_edited_YYYYMMDDHHMM.md`
-  - same directory as source
-  - shows a modal `Saving...` popup with the destination filename while writing
-- Always-on English spell checking:
-  - misspellings marked with red underline
-- Synonym suggestions:
-  - left-click any word in the left pane to request synonyms
-  - lookup is debounced to avoid firing during drag-selection
-  - panel shows up to 9 options in 3 columns with buttons `1..9`
-  - selecting an option replaces the clicked word and marks the replacement as an edit (yellow)
-  - lookup order is: local fallback list -> WordNet (if installed) -> Datamuse API fallback
-- Rewrite suggestions:
-  - right-click a red (`LOW`) paragraph segment to open 3 rewrite options
-  - or highlight a block (multi-line allowed) and right-click to request block rewrites
-  - highlighted-block rewrites round selection to full lines
-  - if selection extends into unscored text, only scored overlap is rewritten
-  - popup shows approximate B impact per option (exact B requires `Analyze`)
-  - options are sorted by expected B increase (more human-like first)
-  - choose option with mouse or keyboard `1`/`2`/`3`, or `Quit`
-  - chosen rewrite is inserted as an edit (yellow), with prior backgrounds preserved by prior line status
-  - B score is intentionally not auto-recomputed; status marks it stale until next `Analyze`
-- Delete + undo behavior:
-  - deleting a selected block with `Delete` or `Backspace` is tracked as one undoable action
-  - `Undo` supports one level for: selected-block delete, synonym replacement, red-segment rewrite, and block rewrite
-  - successful undo status is shown briefly, then metrics return
-- Preview selection mirroring:
-  - when a block is selected in the left pane, right preview mirrors the same line range
-  - selected preview lines show LOW/HIGH/neutral background styles
-- Status-bar transient messages:
-  - non-analysis events (for example Save/Clear Priors/Delete/Undo) temporarily replace metrics
-  - most transient messages restore metrics after ~8 seconds
-  - successful `Undo applied...` restores metrics quickly (about 1.8 seconds)
+  - Scores the full current document
+  - Preserves cursor and top-view position
+  - Updates red and green foreground highlights
+  - Updates hover tooltips (`% contribution`, `logPPL`, `delta_if_removed`, `delta_vs_doc`, ranges)
+  - Updates status metrics
+  - Keeps `Performing analysis on current text...` visible until analysis finishes
+  - Edits since last analysis show in yellow
 
-### Preview sync + debug controls
+- On advancing to the next `Analyze`, previous highlights or edits are reduced to faint backgrounds, indicating prior states.
+- Executing `Clear Priors` clears only these faint backgrounds, leaving other markings intact.
+- The `Save` command initiates a write operation:
+- `[[HTML_BLOCK_9]]_edited_YYYYMMDDHHMM.md`
+- Output is directed to the same directory as the source file.
+- During the write process, a modal `Saving...` popup displays the destination filename.
+
+Always-on English spell checking is active:
+- Misspelled words are underlined in red.
+
+Synonym suggestions are available:
+- Left-click any word in the left pane to request synonyms.
+- Lookup actions are debounced to prevent triggering during drag-selection.
+- The synonym panel displays up to nine options in three columns, each with a `1..9` button.
+- Selecting a synonym replaces the chosen word and marks the change as an edit (yellow).
+- The lookup sequence is: local fallback list, then WordNet (if installed), then Datamuse API as a fallback.
+
+Rewrite suggestions can be accessed as follows:
+- Right-click a red (`LOW`) paragraph segment to open three rewrite options.; Alternatively, highlight a block (multi-line selection allowed) and right-click to request block rewrites.
+- Highlighted-block rewrites round the selection to full lines.; If the selection includes unscored text, only the scored portion is rewritten.
+- The popup displays the approximate B impact for each option (exact B requires `Analyze`).; Options are sorted by expected B increase, with more human-like choices first.
+- Select an option using the mouse or keyboard (`1`/`2`/`3`), or `Quit`.; The selected rewrite is inserted as an edit (yellow), and prior backgrounds are preserved according to previous line status.
+- The B score is not automatically recalculated; the status marks it as stale until the next `Analyze`.
+
+Delete and undo operations are tracked:
+- Deleting a selected block with `Delete` or `Backspace` is recorded as a single undoable action.
+- `Undo` supports one level of undo for selected-block delete, synonym replacement, red-segment rewrite, and block rewrite.
+- Successful undo status is shown briefly, after which metrics return.
+
+Preview selection mirroring is supported:
+- Selecting a block in the left pane causes the right preview to mirror the same line range.
+- Selected preview lines display LOW, HIGH, or neutral background styles.
+
+Status-bar transient messages:
+- Non-analysis events (such as Save, Clear Priors, Delete, or Undo) temporarily replace metrics.
+- Most transient messages restore metrics after approximately eight seconds.
+- A successful `Undo applied...` restores metrics quickly, in about 1.8 seconds.
+
+### Preview Sync and Debug Controls
 
 Environment variables:
+- `BINOCULARS_GUI_DEBUG=1`: Starts with the debug overlay enabled; can be toggled in-app with `F9`.
+- `BINOCULARS_PREVIEW_VIEW_OFFSET_LINES=-3`: Adjusts vertical view calibration for the right pane, affecting only the preview viewport position (not line mapping).
 
-- `BINOCULARS_GUI_DEBUG=1`
-  - starts with debug overlay enabled
-  - toggle in-app with `F9`
-- `BINOCULARS_PREVIEW_VIEW_OFFSET_LINES=-3`
-  - vertical view calibration for right pane
-  - changes preview viewport position only (not line mapping)
+## Wrapper Behaviour (`Binoculars.Sh`)
 
-## Wrapper behavior (`binoculars.sh`)
+`binoculars.sh` performs the following:
+- Activates the repository virtual environment.
+- Runs `binoculars.py`.
+- Deactivates the virtual environment on exit.
+- Forwards Ctrl-C to the child process.
+- Terminates prior running instances by default to free GPU or VRAM resources.
 
-`binoculars.sh`:
-
-- activates repo venv
-- runs `binoculars.py`
-- deactivates venv on exit
-- forwards Ctrl-C to child process
-- terminates prior running instances by default to free GPU/VRAM
-
-Disable auto-kill if needed:
+To disable automatic termination if necessary:
 
 ```bash
 BINOCULARS_DISABLE_AUTO_KILL=1 ./binoculars.sh ...
@@ -447,8 +406,7 @@ BINOCULARS_DISABLE_AUTO_KILL=1 ./binoculars.sh ...
 
 ## Output Contract (JSON)
 
-Top-level keys:
-
+Top-level keys include:
 - `input`
 - `observer`
 - `performer`
@@ -457,54 +415,47 @@ Top-level keys:
 - `cache`
 
 Optional:
-
-- `diagnostics.low_perplexity_spans` (when `--diagnose-paragraphs` enabled)
+- `diagnostics.low_perplexity_spans` (when `--diagnose-paragraphs` is enabled)
 
 ## Performance and Tuning Notes
 
-- Main memory pressure comes from full logits (`tokens x vocab`)
-- Long contexts are expensive even if VRAM appears available
-- `text.max_tokens` is the primary cap for runtime/memory safety
-- `n_ctx: 0` is usually best (auto-size to analyzed tokens)
-- Observer/performer are loaded sequentially by design
+- Main memory usage is driven by full logits (`tokens x vocab`).
+- Long contexts are resource-intensive, even if VRAM appears available.
+- `text.max_tokens` is the primary limit for runtime and memory safety.
+- `n_ctx: 0` is typically optimal (auto-sizes to analyzed tokens).
+- Observer and performer components are loaded sequentially.
 
 Current shipped profile token limits:
-
 - `fast`: 4096
 - `long`: 12288
 
-Adjust these in profile JSONs based on your machine.
+Adjust these values in profile JSON files as needed for your hardware.
 
 ## Troubleshooting
 
 Tokenizer mismatch error:
-
-- Use same-family model pair (base + instruct sibling)
-- Ensure both configs reference compatible tokenizer/vocab models
+- Use a model pair from the same family (base and instruct sibling).
+- Ensure both configurations reference compatible tokenizer and vocabulary models.
 
 Missing file errors:
-
-- Validate `config.binoculars.json` profile paths
-- Validate model paths in concrete config JSONs
+- Verify `config.binoculars.json` profile paths.
+- Check model paths in the configuration JSON files.
 
 GUI unavailable:
-
-- Ensure Tkinter is installed for your Python environment
+- Confirm that Tkinter is installed in your Python environment.
 
 Unexpected GPU memory contention:
-
-- Close other LLM processes, or rely on wrapper auto-kill
-- reduce `text.max_tokens`
-- reduce `n_batch` if needed
+- Close other LLM processes, or rely on the wrapper's auto-kill feature.
+- Reduce `text.max_tokens`.
+- Lower `n_batch` if necessary.
 
 llama.cpp context warnings:
-
-- Low-signal llama.cpp runtime logs (`INFO`/`WARN`/`DEBUG`, including `llama_context` initialization chatter) are suppressed by default for cleaner output.
-- To disable suppression for debugging, set `BINOCULARS_SUPPRESS_LLAMA_CONTEXT_WARNINGS=0`.
+- Low-signal llama.cpp runtime logs (`INFO`, `WARN`, `DEBUG`, including `llama_context` initialization messages) are suppressed by default for cleaner output.
+- To disable log suppression for debugging, set `BINOCULARS_SUPPRESS_LLAMA_CONTEXT_WARNINGS=0`.
 
 ## Tests
 
-Run regression suite:
+To run the regression suite:
 
 ```bash
 ./venv/bin/python -m unittest -v tests/test_regression_v1_1_x.py
@@ -512,102 +463,100 @@ Run regression suite:
 
 ## License
 
-PolyForm Noncommercial License 1.0.0.
-This project implementation is licensed under the **PolyForm Noncommercial License 1.0.0** (see `LICENSE.md`).
+PolyForm Noncommercial License 1.0.0. This project is licensed under the **PolyForm Noncommercial License 1.0.0** (see `LICENSE.md`).
 
 Important scope clarification:
-
-- This license covers the code, configuration, scripts, and documentation in this repository.
-- It does **not** claim ownership of, or restrict use of, the Binoculars approach described in the paper itself.
+- The licence applies to the code, configuration, scripts, and documentation in this repository.
+- It does not claim ownership of, or restrict use of, the Binoculars approach described in the associated paper.
 
 Key points:
+- Noncommercial use only: use, modification, and redistribution are permitted for noncommercial purposes.
 
-- Noncommercial only: use, modification, and redistribution are permitted for noncommercial purposes.
-- Commercial use requires permission: any commercial use (including paid products or services incorporating this code) requires explicit permission from the author.
-- Attribution required: redistribution or use of substantial portions of this project must include clear credit and preserve the license/notice requirements described in `LICENSE.md`.
+- Commercial use requires explicit authorization. Any paid product or service that incorporates this code must have the author's permission.
 
-For commercial use, contact the author to discuss potential participation and/or licensing.
+- Attribution is mandatory. Redistribution or use of substantial portions of this project must include clear credit and preserve the licence and notice requirements described in `LICENSE.md`.
+
+For commercial applications, contact the author to discuss participation or licensing.
 
 ## Limitations
 
-- No built-in calibrated classifier thresholds yet
-- No claim of definitive authorship attribution
-- Markdown is analyzed as text; no semantic markdown parsing
-- Long documents may require truncation due full-logit cost
+- No calibrated classifier thresholds are implemented yet.
+- There is no claim of definitive authorship attribution.
+- Markdown is processed as plain text; semantic markdown parsing is not performed.
+- Long documents may need to be truncated due to full-logit computational cost.
 
 ## Planned Next Major Feature
 
-The next major planned feature is chunk-aware GUI analysis for very large files that cannot be analyzed in one pass.
+The next significant feature will be chunk-aware GUI analysis for large files that cannot be processed in a single pass.
 
-Planned behavior (not yet implemented):
+Planned behaviour (pending implementation):
 
-- First `Analyze` computes the first analyzable chunk (bounded by current token/memory limits).
-- After the first successful chunk analysis, an `Analyze Next` button appears when unscored text remains.
+- `Analyze` computes the first analyzable chunk, limited by current token and memory constraints.
+- After the first chunk is analyzed, an `Analyze Next` button appears if unscored text remains.
 - `Analyze Next` analyzes the next chunk and updates the last covered line.
-- `Analyze Next` remains visible until all chunks are analyzed.
-- Status-bar `B` should reflect the active chunk, selected by this priority:
-  - chunk containing the current selected line,
-  - chunk containing the current selected text block,
-  - otherwise chunk containing most lines in the visible window.
-- Pressing `Analyze` should analyze the active chunk (not always chunk 1).
-- Rewrite suggestions for a red line or highlighted block should compute approximate B-impact for that requested block in the active chunk context.
+- `Analyze Next` remains visible until all chunks are processed.
+- The status bar `B` should indicate the active chunk, selected by this priority:
+  - The chunk containing the currently selected line.
+  - The chunk containing the currently selected text block.
+  - Otherwise, the chunk with the most lines in the visible window.
+- Pressing `Analyze` analyzes the active chunk (not always the first chunk).
+- Rewrite suggestions for a red line or highlighted block should compute approximate B-impact for that block within the active chunk context.
 
 ## Safety / Responsible Use
 
-Use outputs as probabilistic signals in a broader review workflow.  
-Do not use this tool as a sole basis for punitive or high-stakes decisions.
+Treat outputs as probabilistic signals within a broader review process. Do not use this tool as the sole basis for punitive or high-stakes actions.
 
-## Appendix: GPTZero vs Binoculars (What Is Publicly Known)
+## Appendix: GPTZero vs Binoculars (Public Information)
 
-This appendix summarizes publicly available information about GPTZero and compares it to the Binoculars method implemented in this repo.
+This appendix summarizes public details about GPTZero and compares them to the Binoculars method implemented here.
 
-### 1) What is known about how GPTZero works
+### 1) What Is Known About Gptzero
 
-Public GPTZero materials describe an evolving detector stack:
+Public GPTZero materials describe a layered detection system.
 
-- GPTZero’s initial release (January 2023) emphasized `perplexity` and `burstiness` as core signals.
-- Current GPTZero docs describe a probabilistic, sentence-level and document-level deep-learning detector that does not rely only on perplexity/burstiness.
-- GPTZero publicly states its production system combines multiple components and outputs trinary sentence labels (`human`, `mixed`, `AI`) with confidence/uncertainty handling.
+- The initial release (January 2023) focused on `perplexity` and `burstiness` as core indicators.
+- Current documentation describes a probabilistic, sentence-level and document-level deep-learning detector that does not rely solely on perplexity or burstiness.
+- GPTZero states its production system combines multiple components and outputs trinary sentence labels (`human`, `mixed`, `AI`) with confidence and uncertainty handling.
 
-What is not public in full detail:
+Details not publicly disclosed:
 
-- exact model architecture(s),
-- exact training data composition,
-- post-processing and thresholding internals,
-- adversarial hardening implementation details.
+- Exact model architectures.
+- Training data composition.
+- Post-processing and thresholding methods.
+- Adversarial hardening techniques.
 
-So, GPTZero is partially documented publicly, but the complete detector internals are proprietary.
+Therefore, GPTZero is partially documented, but the full internal mechanisms remain proprietary.
 
-### 2) How Binoculars differs
+### 2) How Binoculars Differs
 
-Binoculars is much more mechanistically explicit:
+Binoculars is more explicit in its mechanism.
 
 - It is defined by transparent equations over two related language models:
-  - observer `logPPL`,
-  - observer-vs-performer `logXPPL`,
-  - ratio `B = logPPL / logXPPL`.
-- It is a zero-shot detection approach (no target-model-specific training required for the detector itself).
-- The paper reports strong low-FPR performance, including detection of over 90% generated samples at 0.01% FPR across studied settings.
-- The paper also reports head-to-head comparisons where Binoculars outperformed GPTZero in their 2023-timeframe evaluation setup.
+  - observer `logPPL`
+  - observer-vs-performer `logXPPL`
+  - ratio `B = logPPL / logXPPL`
+- It uses a zero-shot detection approach, requiring no target-model-specific training for the detector.
+- The paper reports strong low-FPR performance, detecting over 90% of generated samples at 0.01% FPR in tested scenarios.
+- Head-to-head comparisons in the paper show Binoculars outperforming GPTZero in their 2023 evaluation setup.
 
-### 3) Why Binoculars can be in the same league as GPTZero
+### 3) Why Binoculars Can Compete with Gptzero
 
-From currently available evidence, it is reasonable to say Binoculars can be in the same competitive tier, with caveats:
+Available evidence indicates Binoculars can operate in the same competitive tier, with some caveats.
 
-- The published Binoculars results show strong discrimination at very low false-positive rates, which is a key deployment criterion.
+- Published results show strong discrimination at very low false-positive rates, a key deployment factor.
 - The mechanism is model-agnostic in the zero-shot sense and can generalize to unseen generators when assumptions hold.
-- The approach is inspectable and reproducible (equations + open implementation path), which helps calibration and operational trust.
+- The approach is inspectable and reproducible (equations and open implementation), aiding calibration and operational trust.
 
-However, a careful statement is still required:
+However, caution is warranted.
 
-- “As robust as GPTZero” is context-dependent and should be validated on your own domain, document lengths, and attack/perturbation conditions.
-- The Binoculars paper itself notes important limits (for example, degraded recall in some low-resource language settings, and no guarantee against motivated adversarial evasion).
-- Independent benchmark work also indicates that many detectors can degrade under perturbation, so robustness claims should always be treated as empirical and ongoing.
+- “As robust as GPTZero” is context-dependent and should be validated on your domain, document lengths, and attack or perturbation conditions.
+- The Binoculars paper notes important limits, such as degraded recall in some low-resource language settings and no guarantee against motivated adversarial evasion.
+- Independent benchmarks indicate that many detectors degrade under perturbation, so robustness claims should be treated as empirical and subject to ongoing review.
 
-Practical conclusion:
+In practice:
 
-- Binoculars is credibly “same-league” with commercial detectors in several reported settings, especially when low-FPR behavior is prioritized.
-- You should still run periodic, domain-specific benchmark checks (including perturbed/paraphrased text) before making strong operational claims.
+- Binoculars is credibly “same-league” with commercial detectors in several reported scenarios, especially when low-FPR behaviour is required.
+- You should run periodic, domain-specific benchmark checks (including perturbed or paraphrased text) before making strong operational claims.
 
 ### 4) Sources
 
