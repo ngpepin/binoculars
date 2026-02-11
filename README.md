@@ -466,6 +466,11 @@ Unexpected GPU memory contention:
 - reduce `text.max_tokens`
 - reduce `n_batch` if needed
 
+llama.cpp context warnings:
+
+- Low-signal llama.cpp runtime logs (`INFO`/`WARN`/`DEBUG`, including `llama_context` initialization chatter) are suppressed by default for cleaner output.
+- To disable suppression for debugging, set `BINOCULARS_SUPPRESS_LLAMA_CONTEXT_WARNINGS=0`.
+
 ## Tests
 
 Run regression suite:

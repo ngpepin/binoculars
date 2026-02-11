@@ -1,10 +1,12 @@
 import importlib.util
+import io
 import json
 import os
 import sys
 import tempfile
 import types
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 
 
@@ -348,6 +350,47 @@ class TestRegressionV11X(unittest.TestCase):
         spans = self.binoculars.find_misspelled_spans("hello wrld and helo", dictionary)
         words = ["hello wrld and helo"[s:e] for s, e in spans]
         self.assertEqual(words, ["wrld", "helo"])
+
+    def test_llama_context_log_suppression_patterns_v1_1_x(self):
+        should_suppress = self.binoculars.should_suppress_llama_context_log
+
+        self.assertTrue(
+            should_suppress("llama_context: n_batch is less than GGML_KQ_MASK_PAD - increasing to 64\n")
+        )
+        self.assertTrue(
+            should_suppress(
+                "llama_context: n_ctx_per_seq (32) > n_ctx_train (0) -- possible training context overflow\n"
+            )
+        )
+        self.assertTrue(
+            should_suppress(
+                "llama_context: n_ctx_per_seq (3138) < n_ctx_train (131072) -- the full capacity of the model will not be utilized\n"
+            )
+        )
+        self.assertTrue(
+            should_suppress(
+                "llama_context: n_ctx_per_seq (3271) < n_ctx_train (131072) -- the full capacity of the model will not be utilized\n"
+            )
+        )
+        self.assertFalse(should_suppress("llama_context: model loaded\n"))
+        self.assertFalse(should_suppress("llama_model_loader: loaded metadata\n"))
+
+    def test_llama_log_callback_filters_non_errors_v1_1_x(self):
+        m = self.binoculars
+        prev_last = getattr(m, "_LLAMA_LAST_LOG_LEVEL", 1)
+        try:
+            m._LLAMA_LAST_LOG_LEVEL = 1
+            sink = io.StringIO()
+            with redirect_stderr(sink):
+                m._llama_log_callback(1, b"llama_context: constructing llama_context\n", None)
+                m._llama_log_callback(2, b"llama_context: n_ctx_per_seq (32) > n_ctx_train (0) -- possible training context overflow\n", None)
+                m._llama_log_callback(3, b"llama_context: critical failure\n", None)
+            out = sink.getvalue()
+            self.assertNotIn("constructing llama_context", out)
+            self.assertNotIn("possible training context overflow", out)
+            self.assertIn("critical failure", out)
+        finally:
+            m._LLAMA_LAST_LOG_LEVEL = prev_last
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import ctypes
 from datetime import datetime
 import difflib
 import gc
@@ -36,6 +37,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, Tuple, List, Set
 
 import numpy as np
+import llama_cpp
 from llama_cpp import Llama
 
 
@@ -51,6 +53,77 @@ _ENGLISH_WORDLIST_PATHS = [
     "/usr/dict/words",
 ]
 _ENGLISH_WORDS_CACHE: Optional[Set[str]] = None
+_LLAMA_SUPPRESSED_LOG_PATTERNS = (
+    re.compile(r"^llama_context:\s*n_batch is less than GGML_KQ_MASK_PAD - increasing to \d+$"),
+    re.compile(r"^llama_context:\s*n_ctx_per_seq \(\d+\) > n_ctx_train \(\d+\) -- possible training context overflow$"),
+    re.compile(
+        r"^llama_context:\s*n_ctx_per_seq \(\d+\) < n_ctx_train \(\d+\) -- the full capacity of the model will not be utilized$"
+    ),
+)
+_LLAMA_LOG_CALLBACK = None
+_LLAMA_LOG_CONFIGURED = False
+_LLAMA_LAST_LOG_LEVEL = 1
+# ggml log levels (from llama.cpp / llama-cpp-python):
+# 0=NONE, 1=INFO, 2=WARN, 3=ERROR, 4=DEBUG, 5=CONT(previous level)
+_LLAMA_LOG_LEVEL_ERROR = 3
+
+
+def should_suppress_llama_context_log(text: str) -> bool:
+    msg = (text or "").strip()
+    if not msg:
+        return False
+    return any(pat.match(msg) for pat in _LLAMA_SUPPRESSED_LOG_PATTERNS)
+
+
+def _emit_llama_log_text(text: str) -> None:
+    if not text:
+        return
+    if should_suppress_llama_context_log(text):
+        return
+    try:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _llama_log_callback(level: int, text: bytes, user_data: ctypes.c_void_p) -> None:
+    del user_data
+    if not text:
+        return
+    global _LLAMA_LAST_LOG_LEVEL
+    effective_level = _LLAMA_LAST_LOG_LEVEL if level == 5 else level
+    if level != 5:
+        _LLAMA_LAST_LOG_LEVEL = level
+    if effective_level < _LLAMA_LOG_LEVEL_ERROR:
+        # Keep stderr clean: drop INFO/WARN/DEBUG/CONT noise.
+        return
+    chunk = text.decode("utf-8", errors="replace")
+    if not chunk:
+        return
+    _emit_llama_log_text(chunk)
+
+
+def configure_llama_log_filtering() -> None:
+    global _LLAMA_LOG_CALLBACK, _LLAMA_LOG_CONFIGURED
+    if _LLAMA_LOG_CONFIGURED:
+        return
+    _LLAMA_LOG_CONFIGURED = True
+
+    env_raw = str(os.environ.get("BINOCULARS_SUPPRESS_LLAMA_CONTEXT_WARNINGS", "1")).strip().lower()
+    if env_raw in {"0", "false", "no", "off"}:
+        return
+
+    log_set = getattr(llama_cpp, "llama_log_set", None)
+    cb_factory = getattr(llama_cpp, "llama_log_callback", None)
+    if log_set is None or cb_factory is None:
+        return
+
+    try:
+        _LLAMA_LOG_CALLBACK = cb_factory(_llama_log_callback)
+        log_set(_LLAMA_LOG_CALLBACK, None)
+    except Exception:
+        _LLAMA_LOG_CALLBACK = None
 
 
 def load_english_words() -> Set[str]:
@@ -612,6 +685,7 @@ def load_config(path: str) -> Tuple[Dict[str, Any], TextConfig, CacheConfig]:
 
 
 def build_llama_instance(model_cfg: Dict[str, Any]) -> Llama:
+    configure_llama_log_filtering()
     return Llama(**model_cfg)
 
 
@@ -630,6 +704,7 @@ def tokenize_with_vocab_only(model_path: str, text_bytes: bytes, tcfg: TextConfi
     """
     tok = None
     try:
+        configure_llama_log_filtering()
         tok = Llama(
             model_path=model_path,
             vocab_only=True,
@@ -2477,6 +2552,7 @@ def launch_gui(
         "internal_update": False,
         "analyzing": False,
         "progress_popup": None,
+        "save_popup": None,
         "rewrite_popup": None,
         "rewrite_request_id": 0,
         "rewrite_busy": False,
@@ -3593,7 +3669,7 @@ def launch_gui(
         try:
             title_label = tk.Label(
                 popup,
-                text=f"Generating 3 rewrites for {span_label}. Please wait...",
+                text=f"Performing rewrite generation for {span_label}...",
                 anchor="w",
                 justify="left",
                 bg="#111111",
@@ -3646,7 +3722,7 @@ def launch_gui(
             popup_status.pack(side="top", fill="x", pady=(0, 8))
 
             wait_label_var = tk.StringVar(
-                value="Please wait while options are generated and scored. This may take 30-120s."
+                value="Performing rewrite generation and impact scoring (30-120s)."
             )
             wait_label = tk.Label(
                 popup,
@@ -3738,7 +3814,7 @@ def launch_gui(
             phase = int(wait_anim_phase["n"]) % 4
             dots = "." * phase
             wait_label_var.set(
-                "Please wait while options are generated and scored"
+                "Performing rewrite generation and impact scoring"
                 f"{dots} This may take 30-120s, and GPU can stay low during model load."
             )
             wait_anim_phase["n"] = phase + 1
@@ -3844,7 +3920,7 @@ def launch_gui(
         except Exception:
             pass
 
-        status_var.set("Generating rewrite options. Please wait...")
+        status_var.set("Performing rewrite generation and impact scoring...")
         status_label_var.set("Preparing rewrite pipeline...")
         queue_wait_anim()
 
@@ -4327,7 +4403,7 @@ def launch_gui(
         popup.grab_set()
         msg = tk.Label(
             popup,
-            text="The text is being analyzed by the binoculars...",
+            text="Performing analysis on current text...",
             padx=18,
             pady=14,
         )
@@ -4351,6 +4427,48 @@ def launch_gui(
         except Exception:
             pass
         state["progress_popup"] = None
+
+    def show_save_popup(out_path: str) -> None:
+        popup = tk.Toplevel(root)
+        popup.title("Saving")
+        popup.transient(root)
+        popup.resizable(False, False)
+        popup.grab_set()
+        popup.configure(bg="#111111")
+        msg = tk.Label(
+            popup,
+            text=(
+                "One moment please, performing Save...\n\n"
+                f"Saving to:\n{out_path}"
+            ),
+            justify="left",
+            anchor="w",
+            bg="#111111",
+            fg="#f0f0f0",
+            padx=18,
+            pady=14,
+            wraplength=700,
+        )
+        msg.pack(fill="both", expand=True)
+        popup.update_idletasks()
+        x = root.winfo_rootx() + (root.winfo_width() // 2) - (popup.winfo_width() // 2)
+        y = root.winfo_rooty() + (root.winfo_height() // 2) - (popup.winfo_height() // 2)
+        popup.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        state["save_popup"] = popup
+
+    def close_save_popup() -> None:
+        popup = state.get("save_popup")
+        if popup is None:
+            return
+        try:
+            popup.grab_release()
+        except Exception:
+            pass
+        try:
+            popup.destroy()
+        except Exception:
+            pass
+        state["save_popup"] = None
 
     def finish_analysis_error(message: str) -> None:
         close_progress_popup()
@@ -4458,7 +4576,7 @@ def launch_gui(
         state["analyze_cursor_idx"] = cursor_idx
         state["analyze_yview_top"] = yview_top
         state["analyzing"] = True
-        status_var.set("Analyzing current text...")
+        status_var.set("Performing analysis on current text...")
         set_controls(False)
         show_progress_popup()
 
@@ -4490,8 +4608,16 @@ def launch_gui(
         while os.path.exists(out_path):
             idx += 1
             out_path = os.path.join(src_dir, f"{stem}_edited_{stamp}_{idx}.md")
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        show_save_popup(out_path)
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception as exc:
+            close_save_popup()
+            status_var.set(f"Save failed: {exc}{analysis_stale_suffix()}")
+            messagebox.showerror("Save Error", str(exc))
+            return
+        close_save_popup()
         status_var.set(f"Saved edited file: {out_path}{analysis_stale_suffix()}")
 
     def on_clear_priors() -> None:
@@ -4532,6 +4658,7 @@ def launch_gui(
         hide_tooltip()
         close_rewrite_popup()
         close_progress_popup()
+        close_save_popup()
         root.destroy()
 
     def place_initial_sash(retries: int = 24) -> None:
@@ -4811,4 +4938,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    print("One moment please, starting...", file=sys.stderr)
     raise SystemExit(main())
