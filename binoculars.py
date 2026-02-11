@@ -2935,6 +2935,7 @@ def launch_gui(
         "rewrite_popup": None,
         "rewrite_request_id": 0,
         "rewrite_busy": False,
+        "clear_priors_visible": False,
         "debug_enabled": bool(os.environ.get("BINOCULARS_GUI_DEBUG")),
         "preview_view_offset_lines": int(os.environ.get("BINOCULARS_PREVIEW_VIEW_OFFSET_LINES", "-3")),
     }
@@ -5302,6 +5303,7 @@ def launch_gui(
             "last_line": int(last_line),
         }
         state["has_analysis"] = True
+        set_clear_priors_visible(True)
         state["b_score_stale"] = False
         status_var.set(status_core)
         state["last_b_score"] = float(result["binoculars"]["score"])
@@ -5478,11 +5480,21 @@ def launch_gui(
     undo_btn = tk.Button(toolbar, text="Undo", command=on_undo, width=12)
     clear_priors_btn = tk.Button(toolbar, text="Clear Priors", command=on_clear_priors, width=12)
     quit_btn = tk.Button(toolbar, text="Quit", command=on_quit, width=12)
+
+    def set_clear_priors_visible(visible: bool) -> None:
+        if visible == bool(state.get("clear_priors_visible")):
+            return
+        if visible:
+            clear_priors_btn.pack(side="left", padx=(0, 8), before=quit_btn)
+        else:
+            clear_priors_btn.pack_forget()
+        state["clear_priors_visible"] = bool(visible)
+
     analyze_btn.pack(side="left", padx=(0, 8))
     save_btn.pack(side="left", padx=(0, 8))
     undo_btn.pack(side="left", padx=(0, 8))
-    clear_priors_btn.pack(side="left", padx=(0, 8))
     quit_btn.pack(side="left")
+    set_clear_priors_visible(False)
     for idx in range(SYNONYM_OPTION_COUNT):
         btn = tk.Button(
             synonym_btn_frame,
