@@ -5,6 +5,7 @@ Name=Binoculars
 Comment=Launch Binoculars in GUI mode
 Path=/my/directory/path/binoculars
 Exec=/my/directory/path/binoculars/binoculars.sh --gui /my/directory/path/binoculars/USERGUIDE-GUI.md
+Icon=/my/directory/path/binoculars/media/binoculars-icon.png
 StartupWMClass=Binoculars
 StartupNotify=true
 Terminal=false
