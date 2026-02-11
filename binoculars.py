@@ -2551,6 +2551,9 @@ def launch_gui(
 
     with open(src_path, "r", encoding="utf-8") as f:
         initial_text = _normalize_markdown_hardbreaks(f.read())
+    home_dir = os.path.expanduser("~")
+    if not os.path.isdir(home_dir):
+        home_dir = os.path.dirname(src_path) or "."
 
     try:
         # className influences WM_CLASS on Linux/X11 docks/taskbars.
@@ -2937,6 +2940,8 @@ def launch_gui(
         "rewrite_request_id": 0,
         "rewrite_busy": False,
         "clear_priors_visible": False,
+        "open_dialog_dir": home_dir,
+        "open_dialog_resize_bindings_installed": False,
         "debug_enabled": bool(os.environ.get("BINOCULARS_GUI_DEBUG")),
         "preview_view_offset_lines": int(os.environ.get("BINOCULARS_PREVIEW_VIEW_OFFSET_LINES", "-3")),
     }
@@ -5395,6 +5400,7 @@ def launch_gui(
 
     def save_current_document(show_status: bool = True) -> bool:
         content = current_text()
+        # Saves follow the currently loaded document location.
         src_dir = os.path.dirname(src_path) or "."
         stem, _ext = os.path.splitext(os.path.basename(src_path))
         stamp = datetime.now().strftime("%Y%m%d%H%M")
@@ -5478,6 +5484,9 @@ def launch_gui(
             state["internal_update"] = False
 
         src_path = os.path.abspath(new_src_path)
+        opened_dir = os.path.dirname(src_path) or "."
+        if os.path.isdir(opened_dir):
+            state["open_dialog_dir"] = opened_dir
         root.title(f"Binoculars - {os.path.basename(src_path)}")
         state["baseline_text"] = loaded_text
         state["prev_text"] = loaded_text
@@ -5503,6 +5512,70 @@ def launch_gui(
         status_var.set(f"Opened: {src_path}. Press Analyze to score and highlight this document.")
         return True
 
+    def choose_open_file_with_dark_preference(initial_dir: str) -> str:
+        """
+        Best-effort dark file dialog on Linux.
+        Native toolkit support varies by distro/desktop; fallback remains functional.
+        """
+        if not bool(state.get("open_dialog_resize_bindings_installed", False)):
+            resize_script = (
+                "if {[winfo exists %W]} {"
+                "update idletasks; "
+                "set sw [winfo screenwidth %W]; "
+                "set sh [winfo screenheight %W]; "
+                "set ww [expr {int($sw * 0.56)}]; "
+                "set wh [expr {int($sh * 0.58)}]; "
+                "if {$ww < 900} {set ww 900}; "
+                "if {$wh < 560} {set wh 560}; "
+                "if {$ww > 1380} {set ww 1380}; "
+                "if {$wh > 900} {set wh 900}; "
+                "wm minsize %W 900 560; "
+                "wm geometry %W ${ww}x${wh}"
+                "}"
+            )
+            for dlg_class in ("TkFDialog", "TkMotifFDialog"):
+                try:
+                    root.tk.call("bind", dlg_class, "<Map>", resize_script)
+                except Exception:
+                    pass
+            state["open_dialog_resize_bindings_installed"] = True
+
+        dialog_dir = str(initial_dir or "")
+        if not os.path.isdir(dialog_dir):
+            dialog_dir = os.path.expanduser("~")
+        if not os.path.isdir(dialog_dir):
+            dialog_dir = "."
+
+        prior_gtk_theme = os.environ.get("GTK_THEME")
+        applied_temp_dark_theme = False
+        if sys.platform.startswith("linux") and not prior_gtk_theme:
+            os.environ["GTK_THEME"] = "Adwaita:dark"
+            applied_temp_dark_theme = True
+
+        try:
+            raw_choice = filedialog.askopenfilename(
+                parent=root,
+                title="Open Markdown/Text File",
+                initialdir=dialog_dir,
+                filetypes=(
+                    ("Markdown/Text files", "*.md *.markdown *.txt"),
+                    ("All files", "*.*"),
+                ),
+            )
+            # Some Tk/platform combinations can return an empty tuple-like value on cancel.
+            # Normalize all "cancel" shapes to "" so callers can reliably no-op.
+            if isinstance(raw_choice, (tuple, list)):
+                if not raw_choice:
+                    return ""
+                return str(raw_choice[0] or "")
+            choice = str(raw_choice or "").strip()
+            if choice in {"()", "[]", "''", '""'}:
+                return ""
+            return choice
+        finally:
+            if applied_temp_dark_theme:
+                os.environ.pop("GTK_THEME", None)
+
     def on_open() -> None:
         if state.get("analyzing") or state.get("rewrite_busy"):
             return
@@ -5518,15 +5591,9 @@ def launch_gui(
                 if not save_current_document(show_status=False):
                     return
 
-        initial_dir = os.path.dirname(src_path) or "."
-        chosen = filedialog.askopenfilename(
-            title="Open Markdown/Text File",
-            initialdir=initial_dir,
-            filetypes=(
-                ("Markdown/Text files", "*.md *.markdown *.txt"),
-                ("All files", "*.*"),
-            ),
-        )
+        initial_dir_obj = state.get("open_dialog_dir")
+        initial_dir = str(initial_dir_obj or "")
+        chosen = choose_open_file_with_dark_preference(initial_dir)
         if not chosen:
             return
         load_document_into_editor(chosen)
