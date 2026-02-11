@@ -32,6 +32,7 @@ import sys
 import tempfile
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, Tuple, List, Set
@@ -46,6 +47,9 @@ from llama_cpp import Llama
 # ----------------------------
 
 SPELL_WORD_RE = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)*(?:[-/][A-Za-z]+(?:['’][A-Za-z]+)*)*")
+SYNONYM_TOKEN_RE = re.compile(r"[A-Za-z]+(?:['’-][A-Za-z]+)*$")
+SYNONYM_OPTION_COUNT = 9
+SYNONYM_GRID_COLUMNS = 3
 _ENGLISH_WORDLIST_PATHS = [
     "/usr/share/dict/american-english",
     "/usr/share/dict/british-english",
@@ -66,6 +70,28 @@ _LLAMA_LAST_LOG_LEVEL = 1
 # ggml log levels (from llama.cpp / llama-cpp-python):
 # 0=NONE, 1=INFO, 2=WARN, 3=ERROR, 4=DEBUG, 5=CONT(previous level)
 _LLAMA_LOG_LEVEL_ERROR = 3
+_LOCAL_SYNONYM_FALLBACK: Dict[str, List[str]] = {
+    "quick": ["fast", "rapid", "swift", "speedy", "brisk", "hasty"],
+    "slow": ["gradual", "leisurely", "sluggish", "unhurried", "plodding", "delayed"],
+    "good": ["great", "solid", "decent", "worthy", "favorable", "beneficial"],
+    "bad": ["poor", "awful", "weak", "inferior", "unfavorable", "harmful"],
+    "big": ["large", "huge", "vast", "major", "sizable", "substantial"],
+    "small": ["little", "tiny", "compact", "minor", "modest", "slight"],
+    "smart": ["clever", "sharp", "bright", "astute", "savvy", "intelligent"],
+    "easy": ["simple", "straightforward", "effortless", "light", "smooth", "clear"],
+    "hard": ["difficult", "tough", "challenging", "demanding", "strenuous", "severe"],
+    "clear": ["plain", "explicit", "evident", "obvious", "distinct", "transparent"],
+    "show": ["display", "reveal", "present", "illustrate", "demonstrate", "exhibit"],
+    "use": ["apply", "utilize", "employ", "leverage", "adopt", "operate"],
+    "make": ["create", "build", "produce", "form", "craft", "generate"],
+    "change": ["alter", "modify", "revise", "adjust", "shift", "transform"],
+    "help": ["assist", "support", "aid", "enable", "facilitate", "improve"],
+    "idea": ["concept", "notion", "thought", "insight", "proposal", "theme"],
+    "important": ["key", "vital", "critical", "central", "major", "essential"],
+    "interesting": ["engaging", "intriguing", "compelling", "notable", "fascinating", "captivating"],
+}
+_WORDNET_MODULE: Optional[Any] = None
+_WORDNET_READY: Optional[bool] = None
 
 
 def should_suppress_llama_context_log(text: str) -> bool:
@@ -73,6 +99,178 @@ def should_suppress_llama_context_log(text: str) -> bool:
     if not msg:
         return False
     return any(pat.match(msg) for pat in _LLAMA_SUPPRESSED_LOG_PATTERNS)
+
+
+def _is_synonym_word_char(ch: str) -> bool:
+    return bool(ch) and (ch.isalpha() or ch in {"'", "’", "-"})
+
+
+def extract_click_word_span(text: str, char_pos: int) -> Optional[Tuple[int, int, str]]:
+    """
+    Return (start, end, word) for the word around char_pos.
+    Accepts apostrophes and hyphens inside words.
+    """
+    raw = str(text or "")
+    if not raw:
+        return None
+    n = len(raw)
+    pos = max(0, min(n - 1, int(char_pos)))
+    if not _is_synonym_word_char(raw[pos]):
+        if pos > 0 and _is_synonym_word_char(raw[pos - 1]):
+            pos -= 1
+        else:
+            return None
+
+    start = pos
+    while start > 0 and _is_synonym_word_char(raw[start - 1]):
+        start -= 1
+    end = pos + 1
+    while end < n and _is_synonym_word_char(raw[end]):
+        end += 1
+
+    while start < end and raw[start] in {"'", "’", "-"}:
+        start += 1
+    while end > start and raw[end - 1] in {"'", "’", "-"}:
+        end -= 1
+    if end <= start:
+        return None
+
+    word = raw[start:end]
+    if not SYNONYM_TOKEN_RE.match(word):
+        return None
+    return (start, end, word)
+
+
+def _normalize_synonym_candidate(word: str) -> Optional[str]:
+    w = str(word or "").strip().replace("’", "'").lower()
+    if not w:
+        return None
+    w = w.replace("_", " ")
+    w = re.sub(r"\s+", " ", w)
+    if " " in w:
+        return None
+    w = w.strip("'-.")
+    if not w:
+        return None
+    if not SYNONYM_TOKEN_RE.match(w):
+        return None
+    return w
+
+
+def dedupe_synonym_candidates(
+    base_word: str,
+    candidates: List[str],
+    max_items: int = SYNONYM_OPTION_COUNT,
+) -> List[str]:
+    base = _normalize_synonym_candidate(base_word)
+    out: List[str] = []
+    seen: Set[str] = set()
+    for cand in candidates:
+        norm = _normalize_synonym_candidate(cand)
+        if not norm:
+            continue
+        if base and norm == base:
+            continue
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+        if len(out) >= max(1, int(max_items)):
+            break
+    return out
+
+
+def apply_word_case_from_template(template: str, candidate: str) -> str:
+    src = str(template or "")
+    dst = str(candidate or "")
+    if not dst:
+        return dst
+    if src.isupper():
+        return dst.upper()
+    if len(src) > 1 and src[0].isupper() and src[1:].islower():
+        return dst.capitalize()
+    if src[:1].isupper():
+        return dst[:1].upper() + dst[1:]
+    return dst
+
+
+def _get_wordnet_module() -> Optional[Any]:
+    global _WORDNET_MODULE, _WORDNET_READY
+    if _WORDNET_READY is False:
+        return None
+    if _WORDNET_READY is None:
+        try:
+            from nltk.corpus import wordnet as wn  # type: ignore
+        except Exception:
+            _WORDNET_READY = False
+            _WORDNET_MODULE = None
+            return None
+        _WORDNET_MODULE = wn
+        _WORDNET_READY = True
+    return _WORDNET_MODULE
+
+
+def _lookup_synonyms_wordnet(word: str) -> List[str]:
+    wn = _get_wordnet_module()
+    if wn is None:
+        return []
+    out: List[str] = []
+    try:
+        for syn in wn.synsets(word):
+            lemmas = syn.lemma_names()
+            for lemma in lemmas:
+                out.append(str(lemma))
+                if len(out) >= 80:
+                    return out
+    except Exception:
+        return []
+    return out
+
+
+def _lookup_synonyms_datamuse(word: str, timeout_s: float = 1.2) -> List[str]:
+    encoded = urllib.parse.quote_plus(str(word or "").strip())
+    if not encoded:
+        return []
+    url = f"https://api.datamuse.com/words?ml={encoded}&max={max(24, SYNONYM_OPTION_COUNT * 4)}"
+    req = urllib.request.Request(
+        url=url,
+        headers={"User-Agent": "binoculars-synonyms/1.0"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=max(0.5, float(timeout_s))) as resp:
+            payload = resp.read()
+    except Exception:
+        return []
+    try:
+        parsed = json.loads(payload.decode("utf-8", errors="replace"))
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    out: List[str] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        w = item.get("word")
+        if isinstance(w, str):
+            out.append(w)
+    return out
+
+
+def lookup_synonyms_fast(word: str, max_items: int = SYNONYM_OPTION_COUNT) -> List[str]:
+    base = _normalize_synonym_candidate(word)
+    if not base:
+        return []
+    candidates: List[str] = []
+    candidates.extend(_LOCAL_SYNONYM_FALLBACK.get(base, []))
+    candidates.extend(_lookup_synonyms_wordnet(base))
+    out = dedupe_synonym_candidates(base, candidates, max_items=max_items)
+    if len(out) >= max_items:
+        return out[:max_items]
+    remote = _lookup_synonyms_datamuse(base)
+    out = dedupe_synonym_candidates(base, out + remote, max_items=max_items)
+    return out[:max_items]
 
 
 def _emit_llama_log_text(text: str) -> None:
@@ -2475,8 +2673,11 @@ def launch_gui(
     scroll_y.pack(side="right", fill="y")
     text_widget.pack(side="left", fill="both", expand=True)
 
+    preview_body = tk.Frame(preview_frame, bg="#2a2a2a")
+    preview_body.pack(side="top", fill="both", expand=True)
+
     preview_text = tk.Text(
-        preview_frame,
+        preview_body,
         wrap="word",
         state="disabled",
         takefocus=0,
@@ -2488,10 +2689,62 @@ def launch_gui(
         padx=12,
         pady=12,
     )
-    preview_scroll = tk.Scrollbar(preview_frame, orient="vertical")
+    preview_scroll = tk.Scrollbar(preview_body, orient="vertical")
     preview_text.configure(yscrollcommand=preview_scroll.set)
     preview_scroll.pack(side="right", fill="y")
     preview_text.pack(side="left", fill="both", expand=True)
+
+    synonym_panel = tk.Frame(
+        preview_frame,
+        bg="#1f4548",
+        bd=0,
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground="#2a6568",
+    )
+    synonym_panel.pack(side="bottom", fill="x", padx=8, pady=(0, 8))
+    synonym_header_var = tk.StringVar(value="Synonyms: click a word in the left pane.")
+    synonym_header = tk.Label(
+        synonym_panel,
+        textvariable=synonym_header_var,
+        anchor="w",
+        justify="left",
+        bg="#1f4548",
+        fg="#e9ffff",
+        padx=10,
+        pady=6,
+        font=("TkDefaultFont", 10, "bold"),
+    )
+    synonym_header.pack(side="top", fill="x")
+
+    synonym_grid = tk.Frame(synonym_panel, bg="#1f4548")
+    synonym_grid.pack(side="top", fill="x", padx=8, pady=(0, 4))
+    for col_idx in range(SYNONYM_GRID_COLUMNS):
+        synonym_grid.grid_columnconfigure(col_idx, weight=1)
+    synonym_item_vars: List[Any] = [tk.StringVar(value="") for _ in range(SYNONYM_OPTION_COUNT)]
+    synonym_item_labels: List[Any] = []
+    synonym_item_width = 17 if SYNONYM_GRID_COLUMNS >= 3 else 26
+    for i in range(SYNONYM_OPTION_COUNT):
+        row = i // SYNONYM_GRID_COLUMNS
+        col = i % SYNONYM_GRID_COLUMNS
+        lbl = tk.Label(
+            synonym_grid,
+            textvariable=synonym_item_vars[i],
+            anchor="w",
+            justify="left",
+            bg="#1f4548",
+            fg="#e8f6f8",
+            width=synonym_item_width,
+            padx=6,
+            pady=1,
+            font=("TkDefaultFont", 9),
+        )
+        lbl.grid(row=row, column=col, sticky="w", padx=(0, 8), pady=1)
+        synonym_item_labels.append(lbl)
+
+    synonym_btn_frame = tk.Frame(synonym_panel, bg="#1f4548")
+    synonym_btn_frame.pack(side="bottom", fill="x", padx=8, pady=(0, 8))
+    synonym_buttons: List[Any] = []
 
     preview_text.tag_configure("md_h1", font=(preview_font_family, preview_font_size + 7, "bold"), spacing3=7)
     preview_text.tag_configure("md_h2", font=(preview_font_family, preview_font_size + 4, "bold"), spacing3=6)
@@ -2510,10 +2763,11 @@ def launch_gui(
     preview_text.tag_configure("preview_sel_high", background="#31483a")
     preview_text.tag_configure("preview_sel_neutral", background="#606060")
     preview_text.tag_configure("preview_active_line", background="#3d3d3d")
+    preview_text.tag_configure("preview_unscored", foreground="#b2bac4")
 
     text_widget.tag_configure("edited", foreground="#ffd54f")
     text_widget.tag_configure("misspelled", underline=1, underlinefg="#ff4d4d")
-    text_widget.tag_configure("unscored", foreground="#dddddd")
+    text_widget.tag_configure("unscored", foreground="#b2bac4")
     english_words = load_english_words()
 
     state: Dict[str, Any] = {
@@ -2539,6 +2793,13 @@ def launch_gui(
         "pending_spell_job": None,
         "pending_preview_job": None,
         "pending_focus_job": None,
+        "pending_synonym_job": None,
+        "synonym_request_id": 0,
+        "synonym_options": [],
+        "synonym_target_word": "",
+        "synonym_target_start_idx": None,
+        "synonym_target_end_idx": None,
+        "synonym_cache": {},
         "preview_line_map": {},
         "line_contrib_map": {},
         "line_contrib_max_abs": 0.0,
@@ -2554,6 +2815,7 @@ def launch_gui(
         "progress_popup": None,
         "save_popup": None,
         "pending_status_restore_job": None,
+        "undo_action": None,
         "rewrite_popup": None,
         "rewrite_request_id": 0,
         "rewrite_busy": False,
@@ -2609,6 +2871,266 @@ def launch_gui(
             return
         state["b_score_stale"] = True
         refresh_analysis_status_line()
+
+    def sync_undo_button_state(enabled_base: bool = True) -> None:
+        undo_enabled = bool(state.get("undo_action")) and bool(enabled_base)
+        try:
+            undo_btn.configure(state="normal" if undo_enabled else "disabled")
+        except Exception:
+            pass
+
+    def clear_one_level_undo() -> None:
+        state["undo_action"] = None
+        sync_undo_button_state(enabled_base=(not bool(state.get("analyzing"))))
+
+    def remember_one_level_undo(
+        operation_label: str,
+        start_idx: str,
+        old_text: str,
+        new_text: str,
+    ) -> None:
+        state["undo_action"] = {
+            "label": str(operation_label),
+            "start_idx": str(start_idx),
+            "old_text": str(old_text),
+            "new_text": str(new_text),
+            "after_text": current_text(),
+        }
+        sync_undo_button_state(enabled_base=(not bool(state.get("analyzing"))))
+
+    def on_undo() -> None:
+        action_obj = state.get("undo_action")
+        action = action_obj if isinstance(action_obj, dict) else None
+        if not action:
+            show_transient_status_then_restore_stats(
+                f"Undo unavailable: no tracked operation.{analysis_stale_suffix()}",
+                duration_ms=8000,
+            )
+            return
+        if state.get("analyzing") or state.get("rewrite_busy"):
+            return
+
+        current = current_text()
+        expected_after = str(action.get("after_text", ""))
+        if current != expected_after:
+            clear_one_level_undo()
+            show_transient_status_then_restore_stats(
+                f"Undo unavailable: document changed since last tracked operation.{analysis_stale_suffix()}",
+                duration_ms=8000,
+            )
+            return
+
+        start_idx = str(action.get("start_idx", "1.0"))
+        old_text = str(action.get("old_text", ""))
+        new_text = str(action.get("new_text", ""))
+        label = str(action.get("label", "operation"))
+        try:
+            end_idx = text_widget.index(f"{start_idx}+{len(new_text)}c")
+            existing = text_widget.get(start_idx, end_idx)
+            if existing != new_text:
+                clear_one_level_undo()
+                show_transient_status_then_restore_stats(
+                    f"Undo unavailable: tracked range no longer matches.{analysis_stale_suffix()}",
+                    duration_ms=8000,
+                )
+                return
+
+            text_widget.focus_set()
+            text_widget.mark_set("insert", start_idx)
+            text_widget.delete(start_idx, end_idx)
+            if old_text:
+                text_widget.insert(start_idx, old_text)
+            restored_end = text_widget.index(f"{start_idx}+{len(old_text)}c")
+            if old_text:
+                text_widget.tag_add("edited", start_idx, restored_end)
+            text_widget.tag_raise("edited")
+            text_widget.tag_raise("misspelled")
+            queue_line_numbers_refresh(delay_ms=0)
+            queue_line_bars_refresh(delay_ms=0)
+            state["spell_version"] = int(state.get("spell_version", 0)) + 1
+            queue_spellcheck(delay_ms=0)
+            queue_preview_render(delay_ms=0)
+            queue_preview_focus_sync(delay_ms=0)
+            mark_analysis_stale()
+            clear_one_level_undo()
+            show_transient_status_then_restore_stats(
+                f"Undo applied: {label}.{analysis_stale_suffix()}",
+                duration_ms=8000,
+            )
+        except Exception as exc:
+            clear_one_level_undo()
+            status_var.set(f"Undo failed: {exc}{analysis_stale_suffix()}")
+
+    def cancel_pending_synonym_lookup() -> None:
+        pending_syn = state.get("pending_synonym_job")
+        if pending_syn is None:
+            return
+        try:
+            root.after_cancel(pending_syn)
+        except Exception:
+            pass
+        state["pending_synonym_job"] = None
+
+    def clear_synonym_panel(message: str = "Synonyms: click a word in the left pane.") -> None:
+        synonym_header_var.set(message)
+        for i in range(SYNONYM_OPTION_COUNT):
+            synonym_item_vars[i].set("")
+        for btn in synonym_buttons:
+            try:
+                btn.configure(state="disabled")
+            except Exception:
+                pass
+        state["synonym_options"] = []
+        state["synonym_target_word"] = ""
+        state["synonym_target_start_idx"] = None
+        state["synonym_target_end_idx"] = None
+
+    def apply_synonym_choice(choice_idx: int, _event: Optional[Any] = None) -> str:
+        options_obj = state.get("synonym_options")
+        options = options_obj if isinstance(options_obj, list) else []
+        if choice_idx < 0 or choice_idx >= len(options):
+            return "break"
+
+        start_idx = state.get("synonym_target_start_idx")
+        end_idx = state.get("synonym_target_end_idx")
+        target_word = str(state.get("synonym_target_word", "") or "")
+        if not start_idx or not end_idx or not target_word:
+            return "break"
+
+        replacement = str(options[choice_idx] or "").strip()
+        if not replacement:
+            return "break"
+
+        try:
+            current_span = text_widget.get(str(start_idx), str(end_idx))
+        except Exception:
+            status_var.set("Synonym target changed. Click the word again.")
+            return "break"
+        if _normalize_synonym_candidate(current_span) != _normalize_synonym_candidate(target_word):
+            status_var.set("Synonym target changed. Click the word again.")
+            return "break"
+
+        text_widget.focus_set()
+        text_widget.mark_set("insert", str(start_idx))
+        text_widget.delete(str(start_idx), str(end_idx))
+        text_widget.insert(str(start_idx), replacement)
+        new_end = text_widget.index(f"{start_idx}+{len(replacement)}c")
+        text_widget.tag_add("edited", str(start_idx), new_end)
+        text_widget.tag_raise("edited")
+        text_widget.tag_raise("misspelled")
+        queue_line_numbers_refresh(delay_ms=0)
+        queue_line_bars_refresh(delay_ms=0)
+        state["spell_version"] = int(state.get("spell_version", 0)) + 1
+        queue_spellcheck(delay_ms=0)
+        queue_preview_render(delay_ms=0)
+        queue_preview_focus_sync(delay_ms=0)
+        remember_one_level_undo(
+            operation_label="synonym replacement",
+            start_idx=str(start_idx),
+            old_text=current_span,
+            new_text=replacement,
+        )
+        mark_analysis_stale()
+        status_var.set(f"Applied synonym [{choice_idx + 1}] '{replacement}'.{analysis_stale_suffix()}")
+        return "break"
+
+    def update_synonym_panel_for_word(
+        request_id: int,
+        clicked_word: str,
+        start_idx: str,
+        end_idx: str,
+        synonyms: List[str],
+    ) -> None:
+        if int(state.get("synonym_request_id", 0)) != int(request_id):
+            return
+
+        cased = [apply_word_case_from_template(clicked_word, s) for s in synonyms]
+        state["synonym_options"] = list(cased[:SYNONYM_OPTION_COUNT])
+        state["synonym_target_word"] = clicked_word
+        state["synonym_target_start_idx"] = start_idx
+        state["synonym_target_end_idx"] = end_idx
+
+        if not cased:
+            synonym_header_var.set(f"No synonyms found for '{clicked_word}'.")
+            for i in range(SYNONYM_OPTION_COUNT):
+                synonym_item_vars[i].set("")
+            for btn in synonym_buttons:
+                btn.configure(state="disabled")
+            return
+
+        synonym_header_var.set(f"Synonyms for '{clicked_word}':")
+        for i in range(SYNONYM_OPTION_COUNT):
+            if i < len(cased):
+                synonym_item_vars[i].set(f"[{i + 1}] {cased[i]}")
+            else:
+                synonym_item_vars[i].set("")
+        for i, btn in enumerate(synonym_buttons):
+            btn.configure(state="normal" if i < len(cased) else "disabled")
+
+    def queue_synonym_lookup_for_click(index_clicked: str) -> None:
+        cancel_pending_synonym_lookup()
+        req_id = int(state.get("synonym_request_id", 0)) + 1
+        state["synonym_request_id"] = req_id
+
+        def launch() -> None:
+            state["pending_synonym_job"] = None
+            if state.get("internal_update"):
+                return
+            if bool(state.get("rewrite_busy")) or bool(state.get("analyzing")):
+                return
+
+            sel_pair = selection_index_pair()
+            if sel_pair is not None:
+                s_idx, e_idx = sel_pair
+                if char_offset_for_index(e_idx) > char_offset_for_index(s_idx):
+                    # User is selecting a region; skip synonym lookup to avoid jitter.
+                    return
+
+            text_snapshot = current_text()
+            if not text_snapshot:
+                clear_synonym_panel()
+                return
+            char_pos = char_offset_for_index(index_clicked)
+            span = extract_click_word_span(text_snapshot, char_pos)
+            if span is None:
+                return
+            start_char, end_char, word = span
+            if end_char <= start_char:
+                return
+
+            norm_word = _normalize_synonym_candidate(word)
+            if not norm_word:
+                return
+
+            start_idx = text_widget.index(f"1.0+{start_char}c")
+            end_idx = text_widget.index(f"1.0+{end_char}c")
+            synonym_header_var.set(f"Looking up synonyms for '{word}'...")
+            for i in range(SYNONYM_OPTION_COUNT):
+                synonym_item_vars[i].set("")
+            for btn in synonym_buttons:
+                btn.configure(state="disabled")
+
+            cache_obj = state.get("synonym_cache")
+            cache = cache_obj if isinstance(cache_obj, dict) else {}
+            cached = cache.get(norm_word)
+            if isinstance(cached, list) and cached:
+                update_synonym_panel_for_word(req_id, word, start_idx, end_idx, list(cached))
+                return
+
+            def worker() -> None:
+                found = lookup_synonyms_fast(norm_word, max_items=SYNONYM_OPTION_COUNT)
+                if isinstance(cache_obj, dict):
+                    cache_obj[norm_word] = list(found)
+
+                def on_ready() -> None:
+                    update_synonym_panel_for_word(req_id, word, start_idx, end_idx, list(found))
+
+                root.after(0, on_ready)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        # Small debounce to avoid firing while drag-selection is in progress.
+        state["pending_synonym_job"] = root.after(230, launch)
 
     def refresh_line_numbers_now() -> None:
         state["pending_line_numbers_job"] = None
@@ -3109,6 +3631,7 @@ def launch_gui(
         preview_text.tag_remove("preview_sel_low", "1.0", "end")
         preview_text.tag_remove("preview_sel_high", "1.0", "end")
         preview_text.tag_remove("preview_sel_neutral", "1.0", "end")
+        preview_text.tag_remove("preview_unscored", "1.0", "end")
 
     def apply_preview_segment_backgrounds() -> None:
         clear_preview_segment_backgrounds()
@@ -3116,6 +3639,29 @@ def launch_gui(
         preview_line_map = map_obj if isinstance(map_obj, dict) else {}
         if not preview_line_map:
             return
+
+        src_text = current_text()
+        src_total_lines = max(1, int(text_widget.index("end-1c").split(".")[0]))
+        try:
+            analyzed_end = int(state.get("analyzed_char_end", len(src_text)))
+        except Exception:
+            analyzed_end = len(src_text)
+        analyzed_end = max(0, min(len(src_text), analyzed_end))
+        analyzed_last_line = line_number_for_char_end(src_text, analyzed_end)
+        if analyzed_last_line < src_total_lines:
+            for src_line in range(analyzed_last_line + 1, src_total_lines + 1):
+                mapped = preview_line_map.get(src_line)
+                if mapped is None:
+                    mapped = source_line_to_preview_line(src_line)
+                try:
+                    preview_line = int(mapped)
+                except Exception:
+                    continue
+                preview_text.tag_add(
+                    "preview_unscored",
+                    f"{preview_line}.0",
+                    f"{preview_line}.0 lineend+1c",
+                )
 
         sel_range = selected_source_line_range()
         if sel_range is not None:
@@ -3143,6 +3689,7 @@ def launch_gui(
             preview_text.tag_lower("preview_sel_low")
             preview_text.tag_lower("preview_sel_high")
             preview_text.tag_lower("preview_sel_neutral")
+            preview_text.tag_raise("preview_unscored")
             return
 
         for tag in state.get("segment_tags", []):
@@ -3180,6 +3727,7 @@ def launch_gui(
                     )
         preview_text.tag_lower("preview_heat_low")
         preview_text.tag_lower("preview_heat_high")
+        preview_text.tag_raise("preview_unscored")
 
     def line_heat_label(src_line: int) -> Optional[str]:
         line_start = f"{src_line}.0"
@@ -3379,13 +3927,11 @@ def launch_gui(
         pct = info.get("pct_contribution", float("nan"))
         pct_str = f"{pct:+.2f}%" if np.isfinite(pct) else "n/a"
         return (
-            f"Index: {info['note_num']}\n"
-            f"Label: {info['label']}\n"
             f"% contribution: {pct_str}\n"
             f"Paragraph: {info['paragraph_id']}\n"
             f"logPPL: {info['logPPL']:.6f}\n"
-            f"delta_vs_doc: {info['delta_vs_doc_logPPL']:+.6f}\n"
             f"delta_if_removed: {info['delta_doc_logPPL_if_removed']:+.6f}\n"
+            f"delta_vs_doc: {info['delta_vs_doc_logPPL']:+.6f}\n"
             f"Transitions: {info['transitions']}\n"
             f"Chars: {info['char_start']}:{info['char_end']}\n"
             f"Tokens: {info['token_start']}:{info['token_end']}"
@@ -3886,6 +4432,7 @@ def launch_gui(
 
             ins_start = str(popup_state["start_idx"])
             ins_end = str(popup_state["end_idx"])
+            old_text = text_widget.get(ins_start, ins_end)
             prior_line_labels: List[Optional[str]] = []
             if selection_mode:
                 prior_line_labels = collect_line_heat_labels_for_index_range(ins_start, ins_end)
@@ -3910,6 +4457,12 @@ def launch_gui(
             queue_spellcheck(delay_ms=0)
             queue_preview_render(delay_ms=0)
             queue_preview_focus_sync(delay_ms=0)
+            remember_one_level_undo(
+                operation_label=("rewrite replacement (selection)" if selection_mode else "rewrite replacement"),
+                start_idx=ins_start,
+                old_text=old_text,
+                new_text=rewrite_text,
+            )
             mark_analysis_stale()
 
             approx_b = float(opt.get("approx_B", float("nan")))
@@ -4147,6 +4700,59 @@ def launch_gui(
             return "break"
         return None
 
+    def on_editor_left_click_release(event: Any) -> None:
+        queue_preview_focus_sync(delay_ms=0)
+        if state.get("internal_update"):
+            return
+        try:
+            click_idx = text_widget.index(f"@{event.x},{event.y}")
+        except Exception:
+            return
+        queue_synonym_lookup_for_click(click_idx)
+
+    def on_delete_key(event: Any) -> Optional[str]:
+        del event
+        if state.get("internal_update"):
+            return None
+        if state.get("analyzing") or state.get("rewrite_busy"):
+            return "break"
+        sel_pair = selection_index_pair()
+        if sel_pair is None:
+            return None
+        start_idx, end_idx = sel_pair
+        if not text_widget.compare(end_idx, ">", start_idx):
+            return None
+        old_text = text_widget.get(start_idx, end_idx)
+        if not old_text:
+            return "break"
+        text_widget.focus_set()
+        text_widget.mark_set("insert", start_idx)
+        text_widget.delete(start_idx, end_idx)
+        text_widget.tag_raise("edited")
+        text_widget.tag_raise("misspelled")
+        queue_line_numbers_refresh(delay_ms=0)
+        queue_line_bars_refresh(delay_ms=0)
+        state["spell_version"] = int(state.get("spell_version", 0)) + 1
+        queue_spellcheck(delay_ms=0)
+        queue_preview_render(delay_ms=0)
+        queue_preview_focus_sync(delay_ms=0)
+        remember_one_level_undo(
+            operation_label="delete selection",
+            start_idx=start_idx,
+            old_text=old_text,
+            new_text="",
+        )
+        mark_analysis_stale()
+        show_transient_status_then_restore_stats(
+            f"Deleted selected block.{analysis_stale_suffix()}",
+            duration_ms=8000,
+        )
+        return "break"
+
+    def on_backspace_key(event: Any) -> Optional[str]:
+        # Match Delete behavior for selected blocks so one-level Undo is available.
+        return on_delete_key(event)
+
     def on_low_segment_right_click(event: Any, tag: str) -> str:
         # Selection-based rewrite mode takes precedence if a span is highlighted.
         if maybe_start_selection_rewrite(event):
@@ -4339,6 +4945,8 @@ def launch_gui(
         if not text_widget.edit_modified():
             return
         text_widget.edit_modified(False)
+        cancel_pending_synonym_lookup()
+        state["synonym_request_id"] = int(state.get("synonym_request_id", 0)) + 1
         mark_analysis_stale()
         pending = state.get("pending_edit_job")
         if pending is not None:
@@ -4422,6 +5030,7 @@ def launch_gui(
         save_btn.configure(state=btn_state)
         clear_priors_btn.configure(state=btn_state)
         quit_btn.configure(state=btn_state)
+        sync_undo_button_state(enabled_base=enabled)
         text_widget.configure(state="normal" if enabled else "disabled")
 
     def show_progress_popup() -> None:
@@ -4693,6 +5302,8 @@ def launch_gui(
                 root.after_cancel(state["pending_focus_job"])
             except Exception:
                 pass
+        cancel_pending_synonym_lookup()
+        state["synonym_request_id"] = int(state.get("synonym_request_id", 0)) + 1
         cancel_pending_status_restore()
         hide_tooltip()
         close_rewrite_popup()
@@ -4727,12 +5338,26 @@ def launch_gui(
 
     analyze_btn = tk.Button(toolbar, text="Analyze", command=on_analyze, width=12)
     save_btn = tk.Button(toolbar, text="Save", command=on_save, width=12)
+    undo_btn = tk.Button(toolbar, text="Undo", command=on_undo, width=12)
     clear_priors_btn = tk.Button(toolbar, text="Clear Priors", command=on_clear_priors, width=12)
     quit_btn = tk.Button(toolbar, text="Quit", command=on_quit, width=12)
     analyze_btn.pack(side="left", padx=(0, 8))
     save_btn.pack(side="left", padx=(0, 8))
+    undo_btn.pack(side="left", padx=(0, 8))
     clear_priors_btn.pack(side="left", padx=(0, 8))
     quit_btn.pack(side="left")
+    for idx in range(SYNONYM_OPTION_COUNT):
+        btn = tk.Button(
+            synonym_btn_frame,
+            text=str(idx + 1),
+            width=5,
+            state="disabled",
+            command=lambda i=idx: apply_synonym_choice(i),
+        )
+        btn.pack(side="left", padx=(0, 6))
+        synonym_buttons.append(btn)
+    clear_synonym_panel()
+    sync_undo_button_state(enabled_base=True)
 
     state["internal_update"] = True
     text_widget.insert("1.0", initial_text)
@@ -4749,7 +5374,9 @@ def launch_gui(
     text_widget.bind("<Button-3>", on_editor_right_click, add="+")
     text_widget.bind("<<Selection>>", lambda _e: queue_preview_focus_sync(delay_ms=0), add="+")
     text_widget.bind("<KeyRelease>", lambda _e: queue_preview_focus_sync(delay_ms=0), add="+")
-    text_widget.bind("<ButtonRelease-1>", lambda _e: queue_preview_focus_sync(delay_ms=0), add="+")
+    text_widget.bind("<ButtonRelease-1>", on_editor_left_click_release, add="+")
+    text_widget.bind("<Delete>", on_delete_key, add="+")
+    text_widget.bind("<BackSpace>", on_backspace_key, add="+")
     root.bind("<F9>", toggle_debug_overlay, add="+")
     text_widget.mark_set("insert", "1.0")
     text_widget.see("1.0")
