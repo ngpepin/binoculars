@@ -2418,8 +2418,8 @@ def launch_gui(
         root,
         textvariable=status_var,
         anchor="w",
-        bg="#101010",
-        fg="#d9d9d9",
+        bg="#1f8a84",
+        fg="#ecfffd",
         padx=8,
         pady=6,
     )
