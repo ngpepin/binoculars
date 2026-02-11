@@ -5611,8 +5611,8 @@ def launch_gui(
             clear_priors_btn.pack_forget()
         state["clear_priors_visible"] = bool(visible)
 
-    analyze_btn.pack(side="left", padx=(0, 8))
     open_btn.pack(side="left", padx=(0, 8))
+    analyze_btn.pack(side="left", padx=(0, 8))
     save_btn.pack(side="left", padx=(0, 8))
     undo_btn.pack(side="left", padx=(0, 8))
     quit_btn.pack(side="left")
