@@ -3107,7 +3107,10 @@ def launch_gui(
             )
         except Exception as exc:
             clear_one_level_undo()
-            status_var.set(f"Undo failed: {exc}{analysis_stale_suffix()}")
+            show_transient_status_then_restore_stats(
+                f"Undo failed: {exc}{analysis_stale_suffix()}",
+                duration_ms=8000,
+            )
 
     def cancel_pending_synonym_lookup() -> None:
         pending_syn = state.get("pending_synonym_job")
@@ -3152,10 +3155,16 @@ def launch_gui(
         try:
             current_span = text_widget.get(str(start_idx), str(end_idx))
         except Exception:
-            status_var.set("Synonym target changed. Click the word again.")
+            show_transient_status_then_restore_stats(
+                "Synonym target changed. Click the word again.",
+                duration_ms=5000,
+            )
             return "break"
         if _normalize_synonym_candidate(current_span) != _normalize_synonym_candidate(target_word):
-            status_var.set("Synonym target changed. Click the word again.")
+            show_transient_status_then_restore_stats(
+                "Synonym target changed. Click the word again.",
+                duration_ms=5000,
+            )
             return "break"
 
         text_widget.focus_set()
@@ -3179,7 +3188,10 @@ def launch_gui(
             new_text=replacement,
         )
         mark_analysis_stale()
-        status_var.set(f"Applied synonym [{choice_idx + 1}] '{replacement}'.{analysis_stale_suffix()}")
+        show_transient_status_then_restore_stats(
+            f"Applied synonym [{choice_idx + 1}] '{replacement}'.{analysis_stale_suffix()}",
+            duration_ms=8000,
+        )
         return "break"
 
     def update_synonym_panel_for_word(
@@ -4383,7 +4395,10 @@ def launch_gui(
             except Exception:
                 pass
         except Exception as exc:
-            status_var.set(f"Failed to open rewrite popup: {exc}{analysis_stale_suffix()}")
+            show_transient_status_then_restore_stats(
+                f"Failed to open rewrite popup: {exc}{analysis_stale_suffix()}",
+                duration_ms=8000,
+            )
             return "break"
         state["rewrite_popup"] = popup
         state["rewrite_busy"] = True
@@ -4506,7 +4521,10 @@ def launch_gui(
                 "options": [],
             }
         except Exception as exc:
-            status_var.set(f"Rewrite popup render failed: {exc}{analysis_stale_suffix()}")
+            show_transient_status_then_restore_stats(
+                f"Rewrite popup render failed: {exc}{analysis_stale_suffix()}",
+                duration_ms=8000,
+            )
             close_rewrite_popup()
             return "break"
 
@@ -4565,7 +4583,10 @@ def launch_gui(
             if popup_active():
                 stop_wait_anim()
                 close_rewrite_popup()
-                status_var.set(f"Rewrite selection canceled.{analysis_stale_suffix()}")
+                show_transient_status_then_restore_stats(
+                    f"Rewrite selection canceled.{analysis_stale_suffix()}",
+                    duration_ms=5000,
+                )
             return "break"
 
         def apply_rewrite_choice(choice_idx: int, _event: Any = None) -> str:
@@ -4619,12 +4640,16 @@ def launch_gui(
             approx_b = float(opt.get("approx_B", float("nan")))
             delta_b = float(opt.get("delta_B", float("nan")))
             if np.isfinite(approx_b) and np.isfinite(delta_b):
-                status_var.set(
+                show_transient_status_then_restore_stats(
                     f"Applied rewrite {choice_idx + 1}. Approx B: {approx_b:.6f} ({delta_b:+.6f}). "
-                    "Full Analyze required for exact B."
+                    "Full Analyze required for exact B.",
+                    duration_ms=8000,
                 )
             else:
-                status_var.set("Applied rewrite option. Full Analyze required for exact B.")
+                show_transient_status_then_restore_stats(
+                    "Applied rewrite option. Full Analyze required for exact B.",
+                    duration_ms=8000,
+                )
             return "break"
 
         for idx in range(3):
@@ -4745,7 +4770,10 @@ def launch_gui(
                     if not popup_active():
                         return
                     stop_wait_anim()
-                    status_var.set(f"Rewrite generation failed: {msg}{analysis_stale_suffix()}")
+                    show_transient_status_then_restore_stats(
+                        f"Rewrite generation failed: {msg}{analysis_stale_suffix()}",
+                        duration_ms=8000,
+                    )
                     close_rewrite_popup()
 
                 root.after(0, on_error)
@@ -4792,13 +4820,19 @@ def launch_gui(
         if state.get("analyzing") or state.get("rewrite_busy"):
             return True
         if not state.get("has_analysis"):
-            status_var.set("Rewrite menu is available after Analyze has been run at least once.")
+            show_transient_status_then_restore_stats(
+                "Rewrite menu is available after Analyze has been run at least once.",
+                duration_ms=5000,
+            )
             return True
 
         metrics_obj = state.get("last_analysis_metrics")
         metrics = metrics_obj if isinstance(metrics_obj, dict) else None
         if metrics is None:
-            status_var.set("Rewrite menu is unavailable until Analyze completes successfully.")
+            show_transient_status_then_restore_stats(
+                "Rewrite menu is unavailable until Analyze completes successfully.",
+                duration_ms=5000,
+            )
             return True
 
         text_snapshot = current_text()
@@ -4810,20 +4844,27 @@ def launch_gui(
 
         expanded = expand_span_to_full_lines(raw_start_char, raw_end_char, text_snapshot)
         if expanded is None:
-            status_var.set("Selected text could not be expanded to full lines.")
+            show_transient_status_then_restore_stats(
+                "Selected text could not be expanded to full lines.",
+                duration_ms=5000,
+            )
             return True
         expanded_start_char, expanded_end_char = expanded
 
         clamped = clamp_span_to_scored_range(expanded_start_char, expanded_end_char, text_snapshot)
         if clamped is None:
-            status_var.set(
-                "Selected text is outside analyzed/scored range. Adjust selection or run Analyze again."
+            show_transient_status_then_restore_stats(
+                "Selected text is outside analyzed/scored range. Adjust selection or run Analyze again.",
+                duration_ms=6000,
             )
             return True
         start_char, end_char, was_clamped = clamped
         selected = text_snapshot[start_char:end_char]
         if not selected.strip():
-            status_var.set("Selected text is empty after clamping to scored range.")
+            show_transient_status_then_restore_stats(
+                "Selected text is empty after clamping to scored range.",
+                duration_ms=5000,
+            )
             return True
 
         start_idx = text_widget.index(f"1.0+{start_char}c")
@@ -4916,13 +4957,19 @@ def launch_gui(
         if state.get("analyzing") or state.get("rewrite_busy"):
             return "break"
         if not state.get("has_analysis"):
-            status_var.set("Rewrite menu is available after Analyze has been run at least once.")
+            show_transient_status_then_restore_stats(
+                "Rewrite menu is available after Analyze has been run at least once.",
+                duration_ms=5000,
+            )
             return "break"
 
         metrics_obj = state.get("last_analysis_metrics")
         metrics = metrics_obj if isinstance(metrics_obj, dict) else None
         if metrics is None:
-            status_var.set("Rewrite menu is unavailable until Analyze completes successfully.")
+            show_transient_status_then_restore_stats(
+                "Rewrite menu is unavailable until Analyze completes successfully.",
+                duration_ms=5000,
+            )
             return "break"
 
         click_idx = text_widget.index(f"@{event.x},{event.y}")
@@ -4938,7 +4985,10 @@ def launch_gui(
         raw_end_char = char_offset_for_index(end_idx)
         clamped = clamp_span_to_scored_range(raw_start_char, raw_end_char, text_snapshot)
         if clamped is None:
-            status_var.set("Selected LOW section is outside analyzed/scored text.")
+            show_transient_status_then_restore_stats(
+                "Selected LOW section is outside analyzed/scored text.",
+                duration_ms=6000,
+            )
             return "break"
         start_char, end_char, was_clamped = clamped
         if end_char <= start_char:
