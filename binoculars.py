@@ -23,6 +23,7 @@ import ctypes
 from datetime import datetime
 import difflib
 import gc
+import hashlib
 import json
 import os
 import re
@@ -6109,6 +6110,335 @@ def launch_gui(
             return
         begin_chunk_analysis(start_char, "Performing analysis on next unscored chunk...")
 
+    def sidecar_state_path_for_document(doc_path: str) -> str:
+        stem, _ext = os.path.splitext(os.path.abspath(doc_path))
+        return stem + ".json"
+
+    def text_sha256(text_value: str) -> str:
+        raw = str(text_value or "")
+        return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+
+    def to_json_compatible(value: Any) -> Any:
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, dict):
+            out: Dict[str, Any] = {}
+            for k, v in value.items():
+                out[str(k)] = to_json_compatible(v)
+            return out
+        if isinstance(value, (list, tuple, set)):
+            return [to_json_compatible(v) for v in value]
+        return str(value)
+
+    def collect_char_ranges_for_tag(tag: str) -> List[List[int]]:
+        spans: List[List[int]] = []
+        ranges = text_widget.tag_ranges(tag)
+        for i in range(0, len(ranges), 2):
+            s_idx = str(ranges[i])
+            e_idx = str(ranges[i + 1])
+            s = char_offset_for_index(s_idx)
+            e = char_offset_for_index(e_idx)
+            if e <= s:
+                continue
+            spans.append([int(s), int(e)])
+        return spans
+
+    def collect_prior_background_payload() -> List[Dict[str, Any]]:
+        payload: List[Dict[str, Any]] = []
+        for tag in state.get("prior_bg_tags", []):
+            try:
+                color = str(text_widget.tag_cget(tag, "background") or "")
+            except Exception:
+                color = ""
+            spans = collect_char_ranges_for_tag(tag)
+            if not spans:
+                continue
+            payload.append({"color": color, "ranges": spans})
+        return payload
+
+    def collect_gui_state_payload(doc_path: str, text_snapshot: str) -> Dict[str, Any]:
+        yview = text_widget.yview()
+        yview_top = float(yview[0]) if yview else 0.0
+        cursor_char = char_offset_for_index(text_widget.index("insert"))
+        return {
+            "binoculars_gui_state": True,
+            "version": 1,
+            "saved_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "document_path": os.path.abspath(doc_path),
+            "document_basename": os.path.basename(doc_path),
+            "text_sha256": text_sha256(text_snapshot),
+            "state": to_json_compatible(
+                {
+                    "baseline_text": state.get("baseline_text", text_snapshot),
+                    "prev_text": state.get("prev_text", text_snapshot),
+                    "has_analysis": bool(state.get("has_analysis")),
+                    "b_score_stale": bool(state.get("b_score_stale")),
+                    "last_b_score": state.get("last_b_score"),
+                    "last_analysis_status_core": state.get("last_analysis_status_core", ""),
+                    "last_analysis_metrics": state.get("last_analysis_metrics"),
+                    "analyzed_char_end": int(state.get("analyzed_char_end", 0)),
+                    "analysis_chunks": state.get("analysis_chunks", []),
+                    "analysis_chunk_id_seq": int(state.get("analysis_chunk_id_seq", 0)),
+                    "analysis_covered_until": int(state.get("analysis_covered_until", 0)),
+                    "analysis_next_available": bool(state.get("analysis_next_available", False)),
+                    "prior_counter": int(state.get("prior_counter", 0)),
+                    "prior_line_contrib_maps": state.get("prior_line_contrib_maps", []),
+                    "prior_backgrounds": collect_prior_background_payload(),
+                    "edited_ranges": collect_char_ranges_for_tag("edited"),
+                    "cursor_char": int(cursor_char),
+                    "yview_top": float(yview_top),
+                }
+            ),
+        }
+
+    def write_sidecar_state(doc_path: str, text_snapshot: str) -> Tuple[bool, str]:
+        sidecar_path = sidecar_state_path_for_document(doc_path)
+        payload = collect_gui_state_payload(doc_path=doc_path, text_snapshot=text_snapshot)
+        try:
+            with open(sidecar_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            return (False, f"{exc}")
+        return (True, sidecar_path)
+
+    def load_sidecar_state(doc_path: str, text_snapshot: str) -> Tuple[Optional[Dict[str, Any]], Optional[str], str]:
+        doc_abs = os.path.abspath(doc_path)
+        if os.path.splitext(doc_abs)[1].lower() != ".md":
+            return (None, None, "")
+        sidecar_path = sidecar_state_path_for_document(doc_abs)
+        if not os.path.isfile(sidecar_path):
+            return (None, None, sidecar_path)
+        try:
+            with open(sidecar_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as exc:
+            return (None, f"State sidecar found but could not be read: {exc}", sidecar_path)
+        if not isinstance(payload, dict) or not bool(payload.get("binoculars_gui_state", False)):
+            return (None, f"State sidecar ignored (unrecognized format): {sidecar_path}", sidecar_path)
+        expected_hash = str(payload.get("text_sha256", "") or "")
+        actual_hash = text_sha256(text_snapshot)
+        if expected_hash and expected_hash != actual_hash:
+            return (
+                None,
+                "State sidecar ignored: markdown content does not match saved state hash.",
+                sidecar_path,
+            )
+        raw_state = payload.get("state")
+        if not isinstance(raw_state, dict):
+            return (None, "State sidecar ignored: missing state object.", sidecar_path)
+        return (raw_state, None, sidecar_path)
+
+    def clamp_span_to_document(s_raw: Any, e_raw: Any, text_len: int) -> Optional[Tuple[int, int]]:
+        try:
+            s = int(s_raw)
+            e = int(e_raw)
+        except Exception:
+            return None
+        s = max(0, min(text_len, s))
+        e = max(s, min(text_len, e))
+        if e <= s:
+            return None
+        return (s, e)
+
+    def load_persisted_state_into_gui(raw_state: Dict[str, Any], text_snapshot: str) -> Tuple[bool, str]:
+        text_len = len(text_snapshot)
+
+        raw_chunks = raw_state.get("analysis_chunks")
+        chunks_in = raw_chunks if isinstance(raw_chunks, list) else []
+        cleaned_chunks: List[Dict[str, Any]] = []
+        max_chunk_id = 0
+        for idx, raw_chunk in enumerate(chunks_in, start=1):
+            if not isinstance(raw_chunk, dict):
+                continue
+            span = clamp_span_to_document(
+                raw_chunk.get("char_start", 0),
+                raw_chunk.get("analyzed_char_end", raw_chunk.get("char_end", raw_chunk.get("char_start", 0))),
+                text_len,
+            )
+            if span is None:
+                continue
+            cs, ce = span
+            try:
+                chunk_id = int(raw_chunk.get("id", idx))
+            except Exception:
+                chunk_id = idx
+            max_chunk_id = max(max_chunk_id, chunk_id)
+
+            metrics_raw = raw_chunk.get("metrics")
+            metrics = metrics_raw if isinstance(metrics_raw, dict) else {}
+            cleaned_metrics: Dict[str, Any] = {}
+            for key in ("binoculars_score", "observer_logPPL", "performer_logPPL", "cross_logXPPL"):
+                try:
+                    val = float(metrics.get(key, float("nan")))
+                except Exception:
+                    val = float("nan")
+                cleaned_metrics[key] = val
+            try:
+                cleaned_metrics["transitions"] = int(metrics.get("transitions", 0))
+            except Exception:
+                cleaned_metrics["transitions"] = 0
+
+            rows_raw = raw_chunk.get("rows")
+            rows_in = rows_raw if isinstance(rows_raw, list) else []
+            cleaned_rows: List[Dict[str, Any]] = []
+            for raw_row in rows_in:
+                if not isinstance(raw_row, dict):
+                    continue
+                row_span = clamp_span_to_document(
+                    raw_row.get("char_start", 0),
+                    raw_row.get("char_end", raw_row.get("char_start", 0)),
+                    text_len,
+                )
+                if row_span is None:
+                    continue
+                rs, re_ = row_span
+                row_copy = dict(raw_row)
+                row_copy["char_start"] = int(rs)
+                row_copy["char_end"] = int(re_)
+                cleaned_rows.append(row_copy)
+
+            cleaned_chunks.append(
+                {
+                    "id": int(chunk_id),
+                    "char_start": int(cs),
+                    "char_end": int(ce),
+                    "analyzed_char_end": int(ce),
+                    "metrics": cleaned_metrics,
+                    "profile": None,
+                    "rows": cleaned_rows,
+                }
+            )
+
+        cleaned_chunks.sort(key=lambda c: int(c.get("char_start", 0)))
+        state["analysis_chunks"] = cleaned_chunks
+        try:
+            seq_saved = int(raw_state.get("analysis_chunk_id_seq", 0))
+        except Exception:
+            seq_saved = 0
+        state["analysis_chunk_id_seq"] = max(seq_saved, max_chunk_id)
+        recompute_chunk_coverage_state(text_snapshot)
+
+        state["has_analysis"] = bool(raw_state.get("has_analysis")) and bool(cleaned_chunks)
+        state["analysis_next_available"] = bool(state.get("analysis_next_available", False))
+        try:
+            state["last_b_score"] = (
+                None if raw_state.get("last_b_score") is None else float(raw_state.get("last_b_score"))
+            )
+        except Exception:
+            state["last_b_score"] = None
+        state["b_score_stale"] = bool(raw_state.get("b_score_stale", False))
+        state["last_analysis_status_core"] = str(raw_state.get("last_analysis_status_core", "") or "")
+        lam_raw = raw_state.get("last_analysis_metrics")
+        state["last_analysis_metrics"] = lam_raw if isinstance(lam_raw, dict) else None
+        try:
+            state["analyzed_char_end"] = int(raw_state.get("analyzed_char_end", state.get("analysis_covered_until", 0)))
+        except Exception:
+            state["analyzed_char_end"] = int(state.get("analysis_covered_until", 0))
+
+        try:
+            state["prior_counter"] = max(0, int(raw_state.get("prior_counter", 0)))
+        except Exception:
+            state["prior_counter"] = 0
+        state["prior_line_contrib_maps"] = []
+        raw_prior_maps = raw_state.get("prior_line_contrib_maps")
+        prior_maps_in = raw_prior_maps if isinstance(raw_prior_maps, list) else []
+        for entry in prior_maps_in:
+            if not isinstance(entry, dict):
+                continue
+            map_obj = entry.get("map")
+            if not isinstance(map_obj, dict):
+                continue
+            clean_map: Dict[int, float] = {}
+            for k, v in map_obj.items():
+                try:
+                    line_no = int(k)
+                    line_val = float(v)
+                except Exception:
+                    continue
+                if line_no <= 0 or (not np.isfinite(line_val)):
+                    continue
+                clean_map[line_no] = line_val
+            if not clean_map:
+                continue
+            try:
+                max_abs = float(entry.get("max_abs", 0.0))
+            except Exception:
+                max_abs = 0.0
+            if not np.isfinite(max_abs) or max_abs <= 0.0:
+                max_abs = max(abs(v) for v in clean_map.values())
+            state["prior_line_contrib_maps"].append({"map": clean_map, "max_abs": float(max_abs)})
+        state["prior_line_contrib_maps"] = state.get("prior_line_contrib_maps", [])[-8:]
+
+        raw_prior_bgs = raw_state.get("prior_backgrounds")
+        prior_bgs_in = raw_prior_bgs if isinstance(raw_prior_bgs, list) else []
+        for entry in prior_bgs_in:
+            if not isinstance(entry, dict):
+                continue
+            color = str(entry.get("color", "") or "")
+            ranges_obj = entry.get("ranges")
+            spans = ranges_obj if isinstance(ranges_obj, list) else []
+            rebuilt: List[str] = []
+            for pair in spans:
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    continue
+                span = clamp_span_to_document(pair[0], pair[1], text_len)
+                if span is None:
+                    continue
+                s, e = span
+                rebuilt.append(f"1.0+{s}c")
+                rebuilt.append(f"1.0+{e}c")
+            if rebuilt:
+                add_prior_background_from_ranges(tuple(rebuilt), color if color else "#303030")
+
+        text_widget.tag_remove("edited", "1.0", "end")
+        raw_edited = raw_state.get("edited_ranges")
+        edited_in = raw_edited if isinstance(raw_edited, list) else []
+        for pair in edited_in:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                continue
+            span = clamp_span_to_document(pair[0], pair[1], text_len)
+            if span is None:
+                continue
+            s, e = span
+            text_widget.tag_add("edited", f"1.0+{s}c", f"1.0+{e}c")
+
+        if state["has_analysis"]:
+            render_analysis_chunks()
+        else:
+            clear_current_segment_tags()
+            text_widget.tag_remove("unscored", "1.0", "end")
+            apply_preview_segment_backgrounds()
+
+        text_widget.tag_raise("edited")
+        text_widget.tag_raise("misspelled")
+        set_clear_priors_visible(bool(state["has_analysis"]))
+        set_analyze_next_visible(bool(state.get("analysis_next_available")))
+
+        try:
+            cursor_char = int(raw_state.get("cursor_char", 0))
+        except Exception:
+            cursor_char = 0
+        cursor_char = max(0, min(text_len, cursor_char))
+        try:
+            yview_top = float(raw_state.get("yview_top", 0.0))
+        except Exception:
+            yview_top = 0.0
+        yview_top = max(0.0, min(1.0, yview_top))
+
+        try:
+            text_widget.yview_moveto(yview_top)
+        except Exception:
+            pass
+        try:
+            text_widget.mark_set("insert", f"1.0+{cursor_char}c")
+            text_widget.see(f"1.0+{cursor_char}c")
+        except Exception:
+            pass
+        text_widget.edit_modified(False)
+        return (True, "Loaded analysis state sidecar.")
+
     def save_current_document(show_status: bool = True) -> bool:
         content = current_text()
         # Saves follow the currently loaded document location.
@@ -6129,14 +6459,29 @@ def launch_gui(
             status_var.set(f"Save failed: {exc}{analysis_stale_suffix()}")
             messagebox.showerror("Save Error", str(exc))
             return False
+        sidecar_ok, sidecar_result = write_sidecar_state(doc_path=out_path, text_snapshot=content)
         close_save_popup()
         state["last_saved_text"] = content
         sync_save_button_state(enabled_base=(not bool(state.get("analyzing"))))
         if show_status:
-            show_transient_status_then_restore_stats(
-                f"Saved edited file: {out_path}{analysis_stale_suffix()}",
-                duration_ms=8000,
-            )
+            if sidecar_ok:
+                show_transient_status_then_restore_stats(
+                    f"Saved edited file: {out_path} | Saved state: {sidecar_result}{analysis_stale_suffix()}",
+                    duration_ms=8000,
+                )
+            else:
+                show_transient_status_then_restore_stats(
+                    f"Saved edited file: {out_path} | State save failed: {sidecar_result}{analysis_stale_suffix()}",
+                    duration_ms=10000,
+                )
+                messagebox.showwarning(
+                    "State Save Warning",
+                    (
+                        "Markdown save succeeded, but saving GUI state sidecar failed.\n\n"
+                        f"File: {out_path}\n"
+                        f"Reason: {sidecar_result}"
+                    ),
+                )
         return True
 
     def load_document_into_editor(new_src_path: str) -> bool:
@@ -6151,6 +6496,7 @@ def launch_gui(
             messagebox.showerror("Open Error", str(exc))
             status_var.set(f"Open failed: {exc}")
             return False
+        persisted_state, state_load_warning, sidecar_path = load_sidecar_state(new_src_path, loaded_text)
 
         pending_keys = (
             "pending_edit_job",
@@ -6216,6 +6562,39 @@ def launch_gui(
         state["spell_version"] = int(state.get("spell_version", 0)) + 1
         set_clear_priors_visible(False)
         set_analyze_next_visible(False)
+        loaded_state_message = ""
+        if isinstance(persisted_state, dict):
+            try:
+                ok, loaded_state_message = load_persisted_state_into_gui(persisted_state, loaded_text)
+            except Exception as exc:
+                ok = False
+                loaded_state_message = f"State sidecar found but could not be applied: {exc}"
+            if ok:
+                state["baseline_text"] = str(persisted_state.get("baseline_text", loaded_text))
+                state["prev_text"] = str(persisted_state.get("prev_text", loaded_text))
+                state["last_saved_text"] = loaded_text
+                sync_save_button_state(enabled_base=(not bool(state.get("analyzing"))))
+                state["spell_version"] = int(state.get("spell_version", 0)) + 1
+                queue_spellcheck(delay_ms=0)
+                queue_preview_render(delay_ms=0)
+                queue_preview_focus_sync(delay_ms=0)
+                refresh_line_numbers_now()
+                refresh_line_bars_now()
+                if state.get("has_analysis"):
+                    refresh_analysis_status_line()
+                    status_var.set(
+                        f"Opened: {src_path}. {loaded_state_message} ({sidecar_path}){analysis_stale_suffix()}"
+                    )
+                else:
+                    status_var.set(f"Opened: {src_path}. {loaded_state_message} ({sidecar_path})")
+                if state_load_warning:
+                    show_transient_status_then_restore_stats(
+                        f"{state_load_warning}{analysis_stale_suffix()}",
+                        duration_ms=8000,
+                    )
+                return True
+            state_load_warning = loaded_state_message
+
         sync_save_button_state(enabled_base=(not bool(state.get("analyzing"))))
 
         text_widget.mark_set("insert", "1.0")
@@ -6225,7 +6604,18 @@ def launch_gui(
         queue_spellcheck(delay_ms=0)
         queue_preview_render(delay_ms=0)
         queue_preview_focus_sync(delay_ms=0)
-        status_var.set(f"Opened: {src_path}. Press Analyze to score and highlight this document.")
+        base_status = f"Opened: {src_path}. Press Analyze to score and highlight this document."
+        if state_load_warning:
+            base_status += f" State load note: {state_load_warning}"
+        status_var.set(base_status)
+        if state_load_warning and ("does not match saved state hash" in state_load_warning):
+            messagebox.showwarning(
+                "State Not Loaded",
+                (
+                    "This markdown file was modified outside of Binoculars.\n\n"
+                    "The saved analysis state sidecar was not loaded."
+                ),
+            )
         return True
 
     def choose_open_file_with_dark_preference(initial_dir: str) -> str:
