@@ -3294,6 +3294,24 @@ def launch_gui(
         # Small debounce to avoid firing while drag-selection is in progress.
         state["pending_synonym_job"] = root.after(230, launch)
 
+    def warmup_synonym_lookup_async() -> None:
+        """
+        Prime synonym providers (local/WordNet/Datamuse path) in the background so the
+        first user-triggered synonym click feels fast.
+        """
+        def worker() -> None:
+            try:
+                warm_word = "text"
+                found = lookup_synonyms_fast(warm_word, max_items=SYNONYM_OPTION_COUNT)
+                cache_obj = state.get("synonym_cache")
+                if isinstance(cache_obj, dict):
+                    cache_obj[warm_word] = list(found)
+            except Exception:
+                # Warmup is opportunistic; never fail the GUI for this.
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def refresh_line_numbers_now() -> None:
         state["pending_line_numbers_job"] = None
         try:
@@ -5852,6 +5870,7 @@ def launch_gui(
     queue_spellcheck(delay_ms=0)
     queue_preview_render(delay_ms=0)
     queue_preview_focus_sync(delay_ms=0)
+    root.after(250, warmup_synonym_lookup_async)
     text_widget.focus_set()
     root.bind("<Configure>", on_root_configure, add="+")
     root.after_idle(lambda: place_initial_sash(24))
