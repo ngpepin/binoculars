@@ -2993,11 +2993,13 @@ def launch_gui(
     preview_text.tag_configure("preview_sel_high", background="#31483a")
     preview_text.tag_configure("preview_sel_neutral", background="#606060")
     preview_text.tag_configure("preview_active_line", background="#3d3d3d")
-    preview_text.tag_configure("preview_unscored", foreground="#b2bac4")
+    # Make unscored preview lines visibly distinct from analyzed content.
+    preview_text.tag_configure("preview_unscored", foreground="#bcc4cf", background="#414a56")
 
     text_widget.tag_configure("edited", foreground="#ffd54f")
     text_widget.tag_configure("misspelled", underline=1, underlinefg="#ff4d4d")
-    text_widget.tag_configure("unscored", foreground="#b2bac4")
+    # Keep unscored source text dimmer with a cool background tint.
+    text_widget.tag_configure("unscored", foreground="#8f9aaa", background="#111821")
     english_words = load_english_words()
 
     # Central GUI state store. Grouped logically:
@@ -3019,7 +3021,12 @@ def launch_gui(
         "b_score_stale": False,
         "last_analysis_status_core": "",
         "last_analysis_metrics": None,
-        "analyzed_char_end": len(initial_text),
+        "analyzed_char_end": 0,
+        "analysis_chunks": [],
+        "analysis_chunk_id_seq": 0,
+        "analysis_covered_until": 0,
+        "analysis_next_available": False,
+        "analyze_next_visible": False,
         "spell_version": 0,
         "last_spell_spans": None,
         "tooltip": None,
@@ -3067,15 +3074,302 @@ def launch_gui(
     def current_text() -> str:
         return text_widget.get("1.0", "end-1c")
 
+    def merge_char_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        valid: List[Tuple[int, int]] = []
+        for start_raw, end_raw in intervals:
+            try:
+                s = int(start_raw)
+                e = int(end_raw)
+            except Exception:
+                continue
+            if e <= s:
+                continue
+            valid.append((s, e))
+        if not valid:
+            return []
+        valid.sort(key=lambda x: (x[0], x[1]))
+        merged: List[Tuple[int, int]] = [valid[0]]
+        for s, e in valid[1:]:
+            ps, pe = merged[-1]
+            if s <= pe:
+                merged[-1] = (ps, max(pe, e))
+            else:
+                merged.append((s, e))
+        return merged
+
+    def analysis_chunk_list() -> List[Dict[str, Any]]:
+        chunks_obj = state.get("analysis_chunks")
+        if isinstance(chunks_obj, list):
+            return chunks_obj
+        return []
+
+    def get_scored_intervals(text_snapshot: str) -> List[Tuple[int, int]]:
+        text_len = len(text_snapshot)
+        raw: List[Tuple[int, int]] = []
+        for chunk in analysis_chunk_list():
+            try:
+                s = int(chunk.get("char_start", 0))
+                e = int(chunk.get("analyzed_char_end", s))
+            except Exception:
+                continue
+            s = max(0, min(text_len, s))
+            e = max(s, min(text_len, e))
+            if e > s:
+                raw.append((s, e))
+        return merge_char_intervals(raw)
+
+    def get_unscored_intervals(text_snapshot: str) -> List[Tuple[int, int]]:
+        text_len = len(text_snapshot)
+        if not state.get("has_analysis") and not analysis_chunk_list():
+            return []
+        scored = get_scored_intervals(text_snapshot)
+        if not scored:
+            return [(0, text_len)] if text_len > 0 else []
+        out: List[Tuple[int, int]] = []
+        cursor = 0
+        for s, e in scored:
+            if s > cursor:
+                out.append((cursor, s))
+            cursor = max(cursor, e)
+        if cursor < text_len:
+            out.append((cursor, text_len))
+        return out
+
+    def shift_profile_to_global_char_offsets(
+        profile: Optional[Dict[str, Any]], base_char_start: int
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(profile, dict):
+            return None
+        out = dict(profile)
+        shifted_rows: List[Dict[str, Any]] = []
+        for row in profile.get("rows", []):
+            if not isinstance(row, dict):
+                continue
+            shifted = dict(row)
+            try:
+                shifted["char_start"] = int(base_char_start + int(row.get("char_start", 0)))
+                shifted["char_end"] = int(base_char_start + int(row.get("char_end", row.get("char_start", 0))))
+            except Exception:
+                continue
+            shifted_rows.append(shifted)
+        out["rows"] = shifted_rows
+        raw_end = profile.get("analyzed_char_end")
+        if raw_end is not None:
+            try:
+                out["analyzed_char_end"] = int(base_char_start + int(raw_end))
+            except Exception:
+                pass
+        return out
+
+    def merge_chunk_descriptor(new_chunk: Dict[str, Any]) -> None:
+        try:
+            ns = int(new_chunk.get("char_start", 0))
+            ne = int(new_chunk.get("analyzed_char_end", ns))
+        except Exception:
+            return
+        if ne <= ns:
+            return
+        kept: List[Dict[str, Any]] = []
+        for old_chunk in analysis_chunk_list():
+            try:
+                os_ = int(old_chunk.get("char_start", 0))
+                oe = int(old_chunk.get("analyzed_char_end", os_))
+            except Exception:
+                continue
+            # Replace any overlapping coverage interval with the newly analyzed chunk.
+            if ne <= os_ or ns >= oe:
+                kept.append(old_chunk)
+        kept.append(new_chunk)
+        kept.sort(key=lambda c: int(c.get("char_start", 0)))
+        state["analysis_chunks"] = kept
+
+    def recompute_chunk_coverage_state(text_snapshot: str) -> None:
+        text_len = len(text_snapshot)
+        merged = get_scored_intervals(text_snapshot)
+        contiguous = 0
+        for s, e in merged:
+            if s > contiguous:
+                break
+            contiguous = max(contiguous, e)
+        contiguous = max(0, min(text_len, contiguous))
+        state["analysis_covered_until"] = int(contiguous)
+        state["analyzed_char_end"] = int(contiguous)
+        state["analysis_next_available"] = bool(merged) and contiguous < text_len
+
+    def line_range_to_char_range(start_line: int, end_line: int) -> Tuple[int, int]:
+        s_line = max(1, int(start_line))
+        e_line = max(s_line, int(end_line))
+        start_idx = f"{s_line}.0"
+        end_idx = f"{e_line}.0 lineend+1c"
+        return (char_offset_for_index(start_idx), char_offset_for_index(end_idx))
+
+    def visible_line_range() -> Optional[Tuple[int, int]]:
+        try:
+            top_idx = text_widget.index("@0,0")
+            top_line = int(str(top_idx).split(".")[0])
+        except Exception:
+            return None
+        line_idx = top_idx
+        bottom_line = top_line
+        try:
+            canvas_h = max(1, int(text_widget.winfo_height()))
+        except Exception:
+            canvas_h = 1
+        while True:
+            dline = text_widget.dlineinfo(line_idx)
+            if dline is None:
+                break
+            y = float(dline[1])
+            h = float(dline[3])
+            if y > canvas_h:
+                break
+            try:
+                bottom_line = int(str(line_idx).split(".")[0])
+            except Exception:
+                pass
+            line_idx = text_widget.index(f"{line_idx}+1line")
+        return (top_line, max(top_line, bottom_line))
+
+    def chunk_overlap_with_span(chunk: Dict[str, Any], span_start: int, span_end: int) -> int:
+        try:
+            cs = int(chunk.get("char_start", 0))
+            ce = int(chunk.get("analyzed_char_end", cs))
+        except Exception:
+            return 0
+        start = max(cs, int(span_start))
+        end = min(ce, int(span_end))
+        return max(0, end - start)
+
+    def resolve_active_chunk(text_snapshot: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        chunks = analysis_chunk_list()
+        if not chunks:
+            return None
+        txt = current_text() if text_snapshot is None else text_snapshot
+        txt_len = len(txt)
+
+        sel_pair = selection_index_pair()
+        if sel_pair is not None:
+            sel_s = char_offset_for_index(sel_pair[0])
+            sel_e = char_offset_for_index(sel_pair[1])
+            if sel_e > sel_s:
+                scored_best: Optional[Dict[str, Any]] = None
+                scored_best_ov = 0
+                for chunk in chunks:
+                    ov = chunk_overlap_with_span(chunk, sel_s, sel_e)
+                    if ov > scored_best_ov:
+                        scored_best = chunk
+                        scored_best_ov = ov
+                if scored_best is not None and scored_best_ov > 0:
+                    return scored_best
+
+        vis = visible_line_range()
+        cursor_line = 1
+        try:
+            cursor_line = int(str(text_widget.index("insert")).split(".")[0])
+        except Exception:
+            cursor_line = 1
+        cursor_visible = vis is not None and vis[0] <= cursor_line <= vis[1]
+        if cursor_visible:
+            cursor_char = char_offset_for_index(text_widget.index("insert"))
+            for chunk in chunks:
+                try:
+                    cs = int(chunk.get("char_start", 0))
+                    ce = int(chunk.get("analyzed_char_end", cs))
+                except Exception:
+                    continue
+                if cs <= cursor_char < ce:
+                    return chunk
+
+        if vis is not None:
+            vis_s, vis_e = line_range_to_char_range(vis[0], vis[1])
+            vis_s = max(0, min(txt_len, vis_s))
+            vis_e = max(vis_s, min(txt_len, vis_e))
+            best_vis: Optional[Dict[str, Any]] = None
+            best_vis_ov = 0
+            for chunk in chunks:
+                ov = chunk_overlap_with_span(chunk, vis_s, vis_e)
+                if ov > best_vis_ov:
+                    best_vis = chunk
+                    best_vis_ov = ov
+            if best_vis is not None and best_vis_ov > 0:
+                return best_vis
+
+        anchor = char_offset_for_index(text_widget.index("insert"))
+        best_chunk = None
+        best_dist = None
+        for chunk in chunks:
+            try:
+                cs = int(chunk.get("char_start", 0))
+                ce = int(chunk.get("analyzed_char_end", cs))
+            except Exception:
+                continue
+            if cs <= anchor <= ce:
+                return chunk
+            dist = min(abs(anchor - cs), abs(anchor - ce))
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_chunk = chunk
+        return best_chunk
+
+    def chunk_metrics_from_descriptor(chunk: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(chunk, dict):
+            return None
+        metrics_obj = chunk.get("metrics")
+        metrics = metrics_obj if isinstance(metrics_obj, dict) else None
+        if metrics is None:
+            return None
+        out = dict(metrics)
+        try:
+            out["chunk_char_start"] = int(chunk.get("char_start", 0))
+            out["chunk_char_end"] = int(chunk.get("analyzed_char_end", out["chunk_char_start"]))
+        except Exception:
+            pass
+        return out
+
+    def update_analysis_status_from_active_chunk() -> None:
+        if not state.get("has_analysis"):
+            return
+        text_snapshot = current_text()
+        active_chunk = resolve_active_chunk(text_snapshot)
+        metrics = chunk_metrics_from_descriptor(active_chunk)
+        if metrics is None:
+            return
+        set_analyze_next_visible(bool(state.get("analysis_next_available")))
+        chunk_start = int(metrics.get("chunk_char_start", 0))
+        chunk_end = int(metrics.get("chunk_char_end", chunk_start))
+        chunk_start_line = line_number_for_char_end(text_snapshot, chunk_start + 1 if chunk_start < len(text_snapshot) else chunk_start)
+        chunk_end_line = line_number_for_char_end(text_snapshot, max(chunk_start + 1, chunk_end))
+        status_core = (
+            "Binocular score B (high is more human-like): "
+            f"{float(metrics.get('binoculars_score', float('nan'))):.6f} | "
+            f"Chunk lines: {chunk_start_line}-{chunk_end_line} | "
+            f"Observer logPPL: {float(metrics.get('observer_logPPL', float('nan'))):.6f} | "
+            f"Performer logPPL: {float(metrics.get('performer_logPPL', float('nan'))):.6f} | "
+            f"Cross logXPPL: {float(metrics.get('cross_logXPPL', float('nan'))):.6f}"
+        )
+        state["last_analysis_status_core"] = status_core
+        state["last_analysis_metrics"] = {
+            "binoculars_score": float(metrics.get("binoculars_score", float("nan"))),
+            "observer_logPPL": float(metrics.get("observer_logPPL", float("nan"))),
+            "performer_logPPL": float(metrics.get("performer_logPPL", float("nan"))),
+            "cross_logXPPL": float(metrics.get("cross_logXPPL", float("nan"))),
+            "transitions": int(metrics.get("transitions", 0)),
+            "last_line": int(chunk_end_line),
+            "chunk_char_start": int(chunk_start),
+            "chunk_char_end": int(chunk_end),
+        }
+        suffix = analysis_stale_suffix()
+        if bool(state.get("analysis_next_available")):
+            suffix += " | Analyze Next available."
+        status_var.set(status_core + suffix)
+
     def analysis_stale_suffix() -> str:
         if state.get("has_analysis") and state.get("b_score_stale"):
             return " | B score is stale for current edits/rewrites. Run Analyze for exact B."
         return ""
 
     def refresh_analysis_status_line() -> None:
-        core = str(state.get("last_analysis_status_core", "")).strip()
-        if core:
-            status_var.set(core + analysis_stale_suffix())
+        update_analysis_status_from_active_chunk()
 
     def cancel_pending_status_restore() -> None:
         pending_restore = state.get("pending_status_restore_job")
@@ -3113,6 +3407,8 @@ def launch_gui(
         if not state.get("has_analysis"):
             return
         state["b_score_stale"] = True
+        recompute_chunk_coverage_state(current_text())
+        set_analyze_next_visible(bool(state.get("analysis_next_available")))
         refresh_analysis_status_line()
 
     def has_unsaved_changes() -> bool:
@@ -3541,6 +3837,23 @@ def launch_gui(
         except Exception:
             return
 
+        # Build line spans for unscored intervals so the gutter can clearly
+        # indicate analysis coverage boundaries.
+        text_snapshot = current_text()
+        unscored_line_spans: List[Tuple[int, int]] = []
+        for s, e in get_unscored_intervals(text_snapshot):
+            if e <= s:
+                continue
+            try:
+                start_line = int(str(text_widget.index(f"1.0+{s}c")).split(".")[0])
+                end_line = int(str(text_widget.index(f"1.0+{max(s, e - 1)}c")).split(".")[0])
+            except Exception:
+                continue
+            if end_line < start_line:
+                end_line = start_line
+            unscored_line_spans.append((start_line, end_line))
+        unscored_line_spans.sort(key=lambda pair: (pair[0], pair[1]))
+
         current_map_obj = state.get("line_contrib_map")
         current_map = current_map_obj if isinstance(current_map_obj, dict) else {}
         try:
@@ -3567,7 +3880,7 @@ def launch_gui(
                 continue
             prior_entries.append((map_obj, max_abs))
 
-        if (not current_map or current_max_abs <= 0.0) and not prior_entries:
+        if (not current_map or current_max_abs <= 0.0) and not prior_entries and not unscored_line_spans:
             return
 
         try:
@@ -3582,6 +3895,7 @@ def launch_gui(
         except Exception:
             return
 
+        unscored_span_idx = 0
         while True:
             dline = text_widget.dlineinfo(line_idx)
             if dline is None:
@@ -3599,6 +3913,18 @@ def launch_gui(
             y1 = int(y + h - pad)
             if y1 <= y0:
                 y1 = y0 + 1
+
+            # Draw a dedicated unscored marker band first for clarity.
+            while (
+                unscored_span_idx < len(unscored_line_spans)
+                and line_no > unscored_line_spans[unscored_span_idx][1]
+            ):
+                unscored_span_idx += 1
+            if (
+                unscored_span_idx < len(unscored_line_spans)
+                and unscored_line_spans[unscored_span_idx][0] <= line_no <= unscored_line_spans[unscored_span_idx][1]
+            ):
+                line_bars.create_rectangle(2, y0, canvas_w - 2, y1, fill="#3f4b5b", width=0)
 
             # Draw prior maps first as faint backgrounds.
             for prior_map, prior_max_abs in prior_entries:
@@ -3677,7 +4003,12 @@ def launch_gui(
         contrib: Dict[int, float] = {}
         top_lines: Set[int] = set()
         text_len = len(text)
-        limit = max(0, min(text_len, int(analyzed_char_end)))
+        try:
+            limit = max(0, min(text_len, int(analyzed_char_end)))
+        except Exception:
+            limit = text_len
+        if limit <= 0:
+            limit = text_len
         last_line = line_number_for_char_end(text, limit)
         for row in rows:
             para_id = int(row.get("paragraph_id", -1))
@@ -3706,9 +4037,7 @@ def launch_gui(
             except Exception:
                 continue
             c_start = max(0, min(text_len, c_start))
-            c_end = max(c_start, min(text_len, c_end, limit))
-            if c_start >= limit:
-                continue
+            c_end = max(c_start, min(text_len, c_end))
             if c_end <= c_start:
                 continue
 
@@ -3960,15 +4289,17 @@ def launch_gui(
             return
 
         src_text = current_text()
-        src_total_lines = max(1, int(text_widget.index("end-1c").split(".")[0]))
-        try:
-            analyzed_end = int(state.get("analyzed_char_end", len(src_text)))
-        except Exception:
-            analyzed_end = len(src_text)
-        analyzed_end = max(0, min(len(src_text), analyzed_end))
-        analyzed_last_line = line_number_for_char_end(src_text, analyzed_end)
-        if analyzed_last_line < src_total_lines:
-            for src_line in range(analyzed_last_line + 1, src_total_lines + 1):
+        for unscored_start, unscored_end in get_unscored_intervals(src_text):
+            if unscored_end <= unscored_start:
+                continue
+            try:
+                start_line = int(str(text_widget.index(f"1.0+{unscored_start}c")).split(".")[0])
+                end_line = int(str(text_widget.index(f"1.0+{max(unscored_start, unscored_end - 1)}c")).split(".")[0])
+            except Exception:
+                continue
+            if end_line < start_line:
+                end_line = start_line
+            for src_line in range(start_line, end_line + 1):
                 mapped = preview_line_map.get(src_line)
                 if mapped is None:
                     mapped = source_line_to_preview_line(src_line)
@@ -4153,6 +4484,8 @@ def launch_gui(
             f"left_ratio={left_ratio:.3f} preview_ratio={preview_ratio:.3f} "
             f"left_top={text_widget.yview()[0]:.3f} preview_top={preview_text.yview()[0]:.3f}"
         )
+        if state.get("has_analysis") and not state.get("analyzing") and state.get("pending_status_restore_job") is None:
+            refresh_analysis_status_line()
 
     def queue_preview_focus_sync(delay_ms: int = 30) -> None:
         pending = state.get("pending_focus_job")
@@ -4193,6 +4526,8 @@ def launch_gui(
             f"mode=scroll src_top={src_top_idx} prev_top={preview_top_idx} offset={preview_view_offset_lines()} "
             f"left_first={left_first:.3f} preview_first={preview_text.yview()[0]:.3f}"
         )
+        if state.get("has_analysis") and not state.get("analyzing") and state.get("pending_status_restore_job") is None:
+            refresh_analysis_status_line()
 
     def on_preview_scroll(*args: Any) -> None:
         if not args:
@@ -4321,14 +4656,6 @@ def launch_gui(
         state["rewrite_popup"] = None
         state["rewrite_busy"] = False
 
-    def scored_char_limit_for_text(text_snapshot: str) -> int:
-        text_len = len(text_snapshot)
-        try:
-            analyzed_end = int(state.get("analyzed_char_end", text_len))
-        except Exception:
-            analyzed_end = text_len
-        return max(0, min(text_len, analyzed_end))
-
     def selection_index_pair() -> Optional[Tuple[str, str]]:
         ranges = text_widget.tag_ranges("sel")
         if len(ranges) < 2:
@@ -4348,13 +4675,42 @@ def launch_gui(
         text_len = len(text_snapshot)
         start = max(0, min(text_len, int(start_char)))
         end = max(start, min(text_len, int(end_char)))
-        scored_end = scored_char_limit_for_text(text_snapshot)
-        clamped_start = max(0, min(scored_end, start))
-        clamped_end = max(clamped_start, min(scored_end, end))
+        scored_intervals = get_scored_intervals(text_snapshot)
+        if not scored_intervals:
+            return None
+        best: Optional[Tuple[int, int]] = None
+        best_overlap = 0
+        for s, e in scored_intervals:
+            ov_start = max(start, s)
+            ov_end = min(end, e)
+            overlap = max(0, ov_end - ov_start)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best = (ov_start, ov_end)
+        if best is None:
+            return None
+        clamped_start, clamped_end = best
         if clamped_end <= clamped_start:
             return None
         was_clamped = (clamped_start != start) or (clamped_end != end)
         return (clamped_start, clamped_end, was_clamped)
+
+    def resolve_chunk_for_span(start_char: int, end_char: int, text_snapshot: str) -> Optional[Dict[str, Any]]:
+        chunks = analysis_chunk_list()
+        if not chunks:
+            return None
+        start = max(0, min(len(text_snapshot), int(start_char)))
+        end = max(start, min(len(text_snapshot), int(end_char)))
+        best_chunk = None
+        best_overlap = 0
+        for chunk in chunks:
+            overlap = chunk_overlap_with_span(chunk, start, end)
+            if overlap > best_overlap:
+                best_chunk = chunk
+                best_overlap = overlap
+        if best_chunk is not None and best_overlap > 0:
+            return best_chunk
+        return resolve_active_chunk(text_snapshot)
 
     def expand_span_to_full_lines(
         start_char: int, end_char: int, text_snapshot: str
@@ -4943,11 +5299,30 @@ def launch_gui(
                 post_popup_status("Scoring expected impact for each rewrite option...")
                 if not external_llm_expected:
                     post_popup_log("Scoring approximate B impact...")
+                approx_full_text = text_snapshot
+                approx_start_char = start_char
+                approx_end_char = end_char
+                try:
+                    chunk_base_start = int(metrics.get("chunk_char_start", start_char))
+                    chunk_base_end = int(metrics.get("chunk_char_end", end_char))
+                except Exception:
+                    chunk_base_start = start_char
+                    chunk_base_end = end_char
+                if chunk_base_end > chunk_base_start:
+                    bounded_start = max(0, min(len(text_snapshot), chunk_base_start))
+                    bounded_end = max(bounded_start, min(len(text_snapshot), chunk_base_end))
+                    if bounded_end > bounded_start:
+                        approx_full_text = text_snapshot[bounded_start:bounded_end]
+                        approx_start_char = max(0, min(len(approx_full_text), start_char - bounded_start))
+                        approx_end_char = max(
+                            approx_start_char,
+                            min(len(approx_full_text), end_char - bounded_start),
+                        )
                 options = estimate_rewrite_b_impact_options(
                     cfg_path=cfg_path,
-                    full_text=text_snapshot,
-                    span_start=start_char,
-                    span_end=end_char,
+                    full_text=approx_full_text,
+                    span_start=approx_start_char,
+                    span_end=approx_end_char,
                     rewrites=rewrites,
                     base_doc_b=float(metrics.get("binoculars_score", float("nan"))),
                     base_doc_observer_logppl=float(metrics.get("observer_logPPL", float("nan"))),
@@ -5019,15 +5394,6 @@ def launch_gui(
             )
             return True
 
-        metrics_obj = state.get("last_analysis_metrics")
-        metrics = metrics_obj if isinstance(metrics_obj, dict) else None
-        if metrics is None:
-            show_transient_status_then_restore_stats(
-                "Rewrite menu is unavailable until Analyze completes successfully.",
-                duration_ms=5000,
-            )
-            return True
-
         text_snapshot = current_text()
         raw_start_idx, raw_end_idx = sel_pair
         raw_start_char = char_offset_for_index(raw_start_idx)
@@ -5056,6 +5422,14 @@ def launch_gui(
         if not selected.strip():
             show_transient_status_then_restore_stats(
                 "Selected text is empty after clamping to scored range.",
+                duration_ms=5000,
+            )
+            return True
+        chunk_for_span = resolve_chunk_for_span(start_char, end_char, text_snapshot)
+        metrics = chunk_metrics_from_descriptor(chunk_for_span)
+        if metrics is None:
+            show_transient_status_then_restore_stats(
+                "Rewrite menu is unavailable until Analyze completes successfully.",
                 duration_ms=5000,
             )
             return True
@@ -5156,15 +5530,6 @@ def launch_gui(
             )
             return "break"
 
-        metrics_obj = state.get("last_analysis_metrics")
-        metrics = metrics_obj if isinstance(metrics_obj, dict) else None
-        if metrics is None:
-            show_transient_status_then_restore_stats(
-                "Rewrite menu is unavailable until Analyze completes successfully.",
-                duration_ms=5000,
-            )
-            return "break"
-
         click_idx = text_widget.index(f"@{event.x},{event.y}")
         range_pair = tag_range_containing_index(tag, click_idx)
         if range_pair is None:
@@ -5189,6 +5554,14 @@ def launch_gui(
 
         selected = text_snapshot[start_char:end_char]
         if not selected.strip():
+            return "break"
+        chunk_for_span = resolve_chunk_for_span(start_char, end_char, text_snapshot)
+        metrics = chunk_metrics_from_descriptor(chunk_for_span)
+        if metrics is None:
+            show_transient_status_then_restore_stats(
+                "Rewrite menu is unavailable until Analyze completes successfully.",
+                duration_ms=5000,
+            )
             return "break"
 
         clamped_start_idx = text_widget.index(f"1.0+{start_char}c")
@@ -5361,33 +5734,88 @@ def launch_gui(
         queue_preview_render(delay_ms=120)
         queue_preview_focus_sync(delay_ms=0)
 
-    def apply_heatmap_profile(profile: Dict[str, Any], observer_logppl: float) -> None:
+    def register_analysis_chunk(
+        chunk_start_char: int,
+        analyzed_text_snapshot: str,
+        result: Dict[str, Any],
+        shifted_profile: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        doc_len = len(analyzed_text_snapshot)
+        start = max(0, min(doc_len, int(chunk_start_char)))
+        local_analyzed = len(analyzed_text_snapshot) - start
+        if isinstance(shifted_profile, dict):
+            raw_end = shifted_profile.get("analyzed_char_end")
+            if raw_end is not None:
+                try:
+                    local_analyzed = int(raw_end) - start
+                except Exception:
+                    pass
+        analyzed_end = max(start, min(doc_len, start + max(0, int(local_analyzed))))
+
+        state["analysis_chunk_id_seq"] = int(state.get("analysis_chunk_id_seq", 0)) + 1
+        chunk_id = int(state.get("analysis_chunk_id_seq", 1))
+
+        chunk_desc: Dict[str, Any] = {
+            "id": chunk_id,
+            "char_start": int(start),
+            "char_end": int(analyzed_end),
+            "analyzed_char_end": int(analyzed_end),
+            "metrics": {
+                "binoculars_score": float(result["binoculars"]["score"]),
+                "observer_logPPL": float(result["observer"]["logPPL"]),
+                "performer_logPPL": float(result["performer"]["logPPL"]),
+                "cross_logXPPL": float(result["cross"]["logXPPL"]),
+                "transitions": int(result["input"]["transitions"]),
+            },
+            "profile": shifted_profile if isinstance(shifted_profile, dict) else None,
+            "rows": list((shifted_profile or {}).get("rows", [])),
+        }
+        merge_chunk_descriptor(chunk_desc)
+        recompute_chunk_coverage_state(analyzed_text_snapshot)
+        return chunk_desc
+
+    def render_analysis_chunks() -> None:
         clear_current_segment_tags()
-        rows = list(profile.get("rows", []))
         doc_text = current_text()
         doc_len = len(doc_text)
-        analyzed_char_end_raw = profile.get("analyzed_char_end")
-        if analyzed_char_end_raw is not None:
-            try:
-                analyzed_char_end = int(analyzed_char_end_raw)
-            except Exception:
-                analyzed_char_end = doc_len
-        else:
-            analyzed_char_end = doc_len
-        analyzed_char_end = max(0, min(doc_len, analyzed_char_end))
-        state["analyzed_char_end"] = int(analyzed_char_end)
+        chunks = analysis_chunk_list()
+        combined_rows: List[Dict[str, Any]] = []
+        for chunk in chunks:
+            rows_obj = chunk.get("rows")
+            rows = rows_obj if isinstance(rows_obj, list) else []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                merged_row = dict(row)
+                combined_rows.append(merged_row)
+
+        combined_rows.sort(key=lambda r: int(r.get("char_start", 0)))
+        for idx, row in enumerate(combined_rows, start=1):
+            row["paragraph_id"] = idx
+
+        active_chunk = resolve_active_chunk(doc_text)
+        active_metrics = chunk_metrics_from_descriptor(active_chunk)
+        observer_for_annotations = (
+            float(active_metrics.get("observer_logPPL", float("nan")))
+            if isinstance(active_metrics, dict)
+            else float("nan")
+        )
+        if not np.isfinite(observer_for_annotations):
+            observer_for_annotations = 0.0
 
         annotations: Dict[int, Dict[str, Any]] = {}
-        if rows:
+        if combined_rows:
             _, _, annotations, _endnotes = _prepare_heatmap_annotations(
-                rows=rows,
+                rows=combined_rows,
                 top_k=top_k,
-                observer_logppl=observer_logppl,
+                observer_logppl=observer_for_annotations,
             )
-        rebuild_line_contribution_map(rows, annotations, analyzed_char_end)
-        if rows and annotations:
-            for row in sorted(rows, key=lambda r: r["char_start"]):
-                ann = annotations.get(row["paragraph_id"])
+
+        rebuild_line_contribution_map(combined_rows, annotations, max(0, int(state.get("analysis_covered_until", 0))))
+
+        if combined_rows and annotations:
+            for row in combined_rows:
+                ann = annotations.get(int(row.get("paragraph_id", -1)))
                 if ann is None:
                     continue
                 tag = f"heat_seg_{ann['note_num']}"
@@ -5397,14 +5825,14 @@ def launch_gui(
                 except Exception:
                     continue
                 c_start = max(0, min(doc_len, c_start))
-                c_end = max(c_start, min(doc_len, c_end, analyzed_char_end))
+                c_end = max(c_start, min(doc_len, c_end))
                 if c_end <= c_start:
                     continue
-                start = f"1.0+{c_start}c"
-                end = f"1.0+{c_end}c"
+                start_idx = f"1.0+{c_start}c"
+                end_idx = f"1.0+{c_end}c"
                 color = "#ff4d4d" if ann["label"] == "LOW" else "#39d97f"
                 text_widget.tag_configure(tag, foreground=color)
-                text_widget.tag_add(tag, start, end)
+                text_widget.tag_add(tag, start_idx, end_idx)
                 text_widget.tag_bind(tag, "<Enter>", lambda e, info=dict(ann): show_tooltip(e, info))
                 text_widget.tag_bind(tag, "<Motion>", move_tooltip)
                 text_widget.tag_bind(tag, "<Leave>", lambda _e: hide_tooltip())
@@ -5414,12 +5842,12 @@ def launch_gui(
                 state["segment_labels"][tag] = ann["label"]
                 state["segment_infos"][tag] = dict(ann)
 
-        last_line = line_number_for_char_end(doc_text, analyzed_char_end)
-        total_lines = max(1, int(text_widget.index("end-1c").split(".")[0]))
-        if last_line < total_lines:
-            text_widget.tag_add("unscored", f"{last_line + 1}.0", "end-1c")
-            text_widget.tag_raise("unscored")
-
+        text_widget.tag_remove("unscored", "1.0", "end")
+        for s, e in get_unscored_intervals(doc_text):
+            if e <= s:
+                continue
+            text_widget.tag_add("unscored", f"1.0+{s}c", f"1.0+{e}c")
+        text_widget.tag_raise("unscored")
         text_widget.tag_raise("misspelled")
         text_widget.tag_raise("edited")
         apply_preview_segment_backgrounds()
@@ -5427,6 +5855,10 @@ def launch_gui(
     def set_controls(enabled: bool) -> None:
         btn_state = "normal" if enabled else "disabled"
         analyze_btn.configure(state=btn_state)
+        try:
+            analyze_next_btn.configure(state=btn_state)
+        except Exception:
+            pass
         open_btn.configure(state=btn_state)
         sync_save_button_state(enabled_base=enabled)
         clear_priors_btn.configure(state=btn_state)
@@ -5434,7 +5866,7 @@ def launch_gui(
         sync_undo_button_state(enabled_base=enabled)
         text_widget.configure(state="normal" if enabled else "disabled")
 
-    def show_progress_popup() -> None:
+    def show_progress_popup(message: str = "Performing analysis on current text...") -> None:
         popup = tk.Toplevel(root)
         popup.title("Analyzing")
         popup.transient(root)
@@ -5442,7 +5874,7 @@ def launch_gui(
         popup.grab_set()
         msg = tk.Label(
             popup,
-            text="Performing analysis on current text...",
+            text=message,
             padx=18,
             pady=14,
         )
@@ -5521,54 +5953,31 @@ def launch_gui(
         analyzed_text: str,
         result: Dict[str, Any],
         profile: Optional[Dict[str, Any]],
+        chunk_start_char: int,
     ) -> None:
         cancel_pending_status_restore()
         close_progress_popup()
         state["internal_update"] = True
         try:
             text_widget.tag_remove("edited", "1.0", "end")
-            if profile is not None:
-                apply_heatmap_profile(profile, result["observer"]["logPPL"])
+            shifted_profile = shift_profile_to_global_char_offsets(profile, int(chunk_start_char))
+            register_analysis_chunk(
+                chunk_start_char=int(chunk_start_char),
+                analyzed_text_snapshot=analyzed_text,
+                result=result,
+                shifted_profile=shifted_profile,
+            )
+            render_analysis_chunks()
             state["baseline_text"] = analyzed_text
             state["prev_text"] = analyzed_text
             text_widget.edit_modified(False)
         finally:
             state["internal_update"] = False
 
-        prior_b = state.get("last_b_score")
-        prior_b_text = f"{prior_b:.6f}" if isinstance(prior_b, (float, int)) else "n/a"
-        analyzed_char_end = len(analyzed_text)
-        if isinstance(profile, dict):
-            raw_end = profile.get("analyzed_char_end")
-            if raw_end is not None:
-                try:
-                    analyzed_char_end = int(raw_end)
-                except Exception:
-                    analyzed_char_end = len(analyzed_text)
-        analyzed_char_end = max(0, min(len(analyzed_text), analyzed_char_end))
-        state["analyzed_char_end"] = int(analyzed_char_end)
-        last_line = line_number_for_char_end(analyzed_text, analyzed_char_end)
-        status_core = (
-            "Binocular score B (high is more human-like): "
-            f"{result['binoculars']['score']:.6f} [prior: {prior_b_text}] | "
-            f"Last Line: {last_line} | "
-            f"Observer logPPL: {result['observer']['logPPL']:.6f} | "
-            f"Performer logPPL: {result['performer']['logPPL']:.6f} | "
-            f"Cross logXPPL: {result['cross']['logXPPL']:.6f}"
-        )
-        state["last_analysis_status_core"] = status_core
-        state["last_analysis_metrics"] = {
-            "binoculars_score": float(result["binoculars"]["score"]),
-            "observer_logPPL": float(result["observer"]["logPPL"]),
-            "performer_logPPL": float(result["performer"]["logPPL"]),
-            "cross_logXPPL": float(result["cross"]["logXPPL"]),
-            "transitions": int(result["input"]["transitions"]),
-            "last_line": int(last_line),
-        }
         state["has_analysis"] = True
         set_clear_priors_visible(True)
+        set_analyze_next_visible(bool(state.get("analysis_next_available")))
         state["b_score_stale"] = False
-        status_var.set(status_core)
         state["last_b_score"] = float(result["binoculars"]["score"])
         state["analyzing"] = False
         set_controls(True)
@@ -5587,13 +5996,10 @@ def launch_gui(
             text_widget.mark_set("insert", restore_idx)
         except Exception:
             pass
+        refresh_analysis_status_line()
         queue_preview_focus_sync(delay_ms=0)
 
-    def on_analyze() -> None:
-        if state["analyzing"]:
-            return
-        cancel_pending_status_restore()
-
+    def prepare_for_analysis() -> None:
         pending = state.get("pending_edit_job")
         if pending is not None:
             try:
@@ -5611,23 +6017,38 @@ def launch_gui(
                 pass
             state["pending_spell_job"] = None
 
+    def begin_chunk_analysis(start_char: int, status_message: str) -> None:
+        if state["analyzing"]:
+            return
+        cancel_pending_status_restore()
+        prepare_for_analysis()
         snapshot_current_to_priors()
         analyzed_text = current_text()
+        start = max(0, min(len(analyzed_text), int(start_char)))
+        if start >= len(analyzed_text):
+            recompute_chunk_coverage_state(analyzed_text)
+            set_analyze_next_visible(bool(state.get("analysis_next_available")))
+            show_transient_status_then_restore_stats(
+                f"No remaining text to analyze.{analysis_stale_suffix()}",
+                duration_ms=5000,
+            )
+            return
+
         cursor_idx = text_widget.index("insert")
         yview = text_widget.yview()
         yview_top = float(yview[0]) if yview else 0.0
         state["analyze_cursor_idx"] = cursor_idx
         state["analyze_yview_top"] = yview_top
         state["analyzing"] = True
-        status_var.set("Performing analysis on current text...")
+        status_var.set(status_message)
         set_controls(False)
-        show_progress_popup()
+        show_progress_popup(status_message)
 
         def worker() -> None:
             try:
                 result, profile = analyze_text_document(
                     cfg_path=cfg_path,
-                    text=analyzed_text,
+                    text=analyzed_text[start:],
                     input_label=src_path,
                     diagnose_paragraphs=False,
                     diagnose_top_k=top_k,
@@ -5637,9 +6058,56 @@ def launch_gui(
             except Exception as exc:
                 root.after(0, lambda: finish_analysis_error(str(exc)))
                 return
-            root.after(0, lambda: finish_analysis_success(analyzed_text, result, profile))
+            root.after(0, lambda: finish_analysis_success(analyzed_text, result, profile, start))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def on_analyze() -> None:
+        if state["analyzing"]:
+            return
+        text_snapshot = current_text()
+        chunks = analysis_chunk_list()
+        if not state.get("has_analysis") or not chunks:
+            begin_chunk_analysis(0, "Performing analysis on current text...")
+            return
+        active_chunk = resolve_active_chunk(text_snapshot)
+        status_message = "Performing analysis on active chunk..."
+        if isinstance(active_chunk, dict):
+            start_char = int(active_chunk.get("char_start", 0))
+            try:
+                chunk_end_char = int(active_chunk.get("analyzed_char_end", start_char))
+            except Exception:
+                chunk_end_char = start_char
+            try:
+                chunk_start_line = int(str(text_widget.index(f"1.0+{max(0, start_char)}c")).split(".")[0])
+            except Exception:
+                chunk_start_line = 1
+            chunk_end_line = line_number_for_char_end(text_snapshot, max(start_char + 1, chunk_end_char))
+            if chunk_end_line < chunk_start_line:
+                chunk_end_line = chunk_start_line
+            status_message = (
+                f"Performing analysis on active chunk (lines {chunk_start_line}-{chunk_end_line})..."
+            )
+        else:
+            start_char = 0
+        begin_chunk_analysis(start_char, status_message)
+
+    def on_analyze_next() -> None:
+        if state["analyzing"]:
+            return
+        if not state.get("has_analysis"):
+            on_analyze()
+            return
+        text_snapshot = current_text()
+        start_char = int(state.get("analysis_covered_until", 0))
+        if start_char >= len(text_snapshot):
+            set_analyze_next_visible(False)
+            show_transient_status_then_restore_stats(
+                f"All document text is already analyzed.{analysis_stale_suffix()}",
+                duration_ms=5000,
+            )
+            return
+        begin_chunk_analysis(start_char, "Performing analysis on next unscored chunk...")
 
     def save_current_document(show_status: bool = True) -> bool:
         content = current_text()
@@ -5739,10 +6207,15 @@ def launch_gui(
         state["b_score_stale"] = False
         state["last_analysis_status_core"] = ""
         state["last_analysis_metrics"] = None
-        state["analyzed_char_end"] = len(loaded_text)
+        state["analyzed_char_end"] = 0
+        state["analysis_chunks"] = []
+        state["analysis_chunk_id_seq"] = 0
+        state["analysis_covered_until"] = 0
+        state["analysis_next_available"] = False
         state["line_count"] = 0
         state["spell_version"] = int(state.get("spell_version", 0)) + 1
         set_clear_priors_visible(False)
+        set_analyze_next_visible(False)
         sync_save_button_state(enabled_base=(not bool(state.get("analyzing"))))
 
         text_widget.mark_set("insert", "1.0")
@@ -5984,6 +6457,7 @@ def launch_gui(
         queue_line_numbers_refresh(delay_ms=0)
 
     analyze_btn = tk.Button(toolbar, text="Analyze", command=on_analyze, width=12)
+    analyze_next_btn = tk.Button(toolbar, text="Analyze Next", command=on_analyze_next, width=12)
     open_btn = tk.Button(toolbar, text="Open", command=on_open, width=12)
     save_btn = tk.Button(toolbar, text="Save", command=on_save, width=12)
     undo_btn = tk.Button(toolbar, text="Undo", command=on_undo, width=12)
@@ -5999,8 +6473,18 @@ def launch_gui(
             clear_priors_btn.pack_forget()
         state["clear_priors_visible"] = bool(visible)
 
+    def set_analyze_next_visible(visible: bool) -> None:
+        if visible == bool(state.get("analyze_next_visible")):
+            return
+        if visible:
+            analyze_next_btn.pack(side="left", padx=(0, 8), after=analyze_btn)
+        else:
+            analyze_next_btn.pack_forget()
+        state["analyze_next_visible"] = bool(visible)
+
     open_btn.pack(side="left", padx=(0, 8))
     analyze_btn.pack(side="left", padx=(0, 8))
+    set_analyze_next_visible(False)
     save_btn.pack(side="left", padx=(0, 8))
     undo_btn.pack(side="left", padx=(0, 8))
     quit_btn.pack(side="left")

@@ -321,14 +321,16 @@ Launches an editor/analyzer with:
 - Right pane: live markdown preview
 - Right-pane footer: real-time synonym panel for clicked words
 - Controls:
+  - `Open`
   - `Analyze`
+  - `Analyze Next` (shown after first chunk when unscored text remains)
   - `Save`
   - `Undo` (one level)
   - `Clear Priors`
   - `Quit`
 - Status bar:
   - `Binocular score B (high is more human-like): ...`
-  - Includes prior score and `Last Line`
+  - Shows active chunk range and chunk-relative metrics
 
 For a detailed workflow-oriented guide, see:
 
@@ -337,13 +339,41 @@ For a detailed workflow-oriented guide, see:
 ### GUI Behaviour
 
 - `Analyze`:
-  - Scores the full current document
+  - On first run, analyzes from document start (`char 0`) up to the token-limited chunk boundary
+  - On later runs, analyzes from the active chunk start (not from the cursor line itself)
+  - Replaces any overlapping prior chunk descriptor with the new analysis result
+  - Can move the effective chunk end boundary forward or backward after edits
   - Preserves cursor and top-view position
   - Updates red and green foreground highlights
   - Updates hover tooltips (`% contribution`, `logPPL`, `delta_if_removed`, `delta_vs_doc`, ranges)
-  - Updates status metrics
+  - Updates status metrics for the active chunk
   - Keeps `Performing analysis on current text...` visible until analysis finishes
   - Edits since last analysis show in yellow
+
+- `Analyze Next`:
+  - Appears after first successful analysis if unscored text remains
+  - Starts at the contiguous covered tail (`analysis_covered_until`)
+  - Extends coverage into the next token-limited chunk
+  - Remains available until contiguous coverage reaches end-of-document
+
+- Active chunk selection priority for status and `Analyze`:
+  - Selection overlap with analyzed chunks (largest overlap wins)
+  - Else cursor line if visible and inside an analyzed chunk
+  - Else majority overlap with currently visible editor window
+  - Else nearest analyzed chunk by distance
+
+- Chunk boundaries are operational, not immutable:
+  - Chunks are stored as descriptors with local metrics.
+  - Coverage intervals are merged for rendering/unscored display.
+  - Overlapping chunk descriptors are replaced on re-analysis.
+  - Result: boundaries can shift after edits and a second `Analyze`.
+
+- Example:
+  - First pass analyzes lines `1-999` as chunk 1.
+  - Cursor is at line `999` and user presses `Analyze`.
+  - Binoculars re-analyzes starting at chunk-1 start (line 1), not line 999.
+  - If edits changed token density, chunk 1 may now end at line `972` or `1031`.
+  - Status then reports metrics for that updated chunk range.
 
 - On advancing to the next `Analyze`, previous highlights or edits are reduced to faint backgrounds, indicating prior states.
 - Executing `Clear Priors` clears only these faint backgrounds, leaving other markings intact.
@@ -363,10 +393,10 @@ Synonym suggestions are available:
 - The lookup sequence is: local fallback list, then WordNet (if installed), then Datamuse API as a fallback.
 
 Rewrite suggestions can be accessed as follows:
-- Right-click a red (`LOW`) paragraph segment to open three rewrite options.; Alternatively, highlight a block (multi-line selection allowed) and right-click to request block rewrites.
-- Highlighted-block rewrites round the selection to full lines.; If the selection includes unscored text, only the scored portion is rewritten.
-- The popup displays the approximate B impact for each option (exact B requires `Analyze`).; Options are sorted by expected B increase, with more human-like choices first.
-- Select an option using the mouse or keyboard (`1`/`2`/`3`), or `Quit`.; The selected rewrite is inserted as an edit (yellow), and prior backgrounds are preserved according to previous line status.
+- Right-click a red (`LOW`) paragraph segment to open three rewrite options. Alternatively, highlight a block (multi-line selection allowed) and right-click to request block rewrites.
+- Highlighted-block rewrites round the selection to full lines. If unscored lines are included, they are preserved unchanged while scored/analyzed lines are rewritten.
+- The popup displays the approximate B impact for each option (exact B requires `Analyze`). Options are sorted by expected B increase, with more human-like choices first.
+- Select an option using the mouse or keyboard (`1`/`2`/`3`), or `Quit`. The selected rewrite is inserted as an edit (yellow), and prior backgrounds are preserved according to previous line status.
 - The B score is not automatically recalculated; the status marks it as stale until the next `Analyze`.
 
 Delete and undo operations are tracked:
@@ -485,22 +515,26 @@ For commercial applications, contact the author to discuss participation or lice
 - Markdown is processed as plain text; semantic markdown parsing is not performed.
 - Long documents may need to be truncated due to full-logit computational cost.
 
-## Planned Next Major Feature
+## Chunk-Aware Large-File Analysis (Current Behaviour)
 
-The next significant feature will be chunk-aware GUI analysis for large files that cannot be processed in a single pass.
+For files that exceed one-pass token limits, GUI analysis is chunk-aware.
 
-Planned behaviour (pending implementation):
+- First `Analyze` starts at document start and scores the first token-limited chunk.
+- `Analyze Next` progresses from contiguous covered tail into the next chunk.
+- `Analyze` on later runs targets the active chunk start, not the cursor line.
+- Active chunk metrics drive the status bar and rewrite-approximation baselines.
+- Unscored regions are rendered as complement intervals over full document length.
+- Chunk boundaries may shift after edits because overlapping chunk descriptors are replaced by the newest analysis.
 
-- `Analyze` computes the first analyzable chunk, limited by current token and memory constraints.
-- After the first chunk is analyzed, an `Analyze Next` button appears if unscored text remains.
-- `Analyze Next` analyzes the next chunk and updates the last covered line.
-- `Analyze Next` remains visible until all chunks are processed.
-- The status bar `B` should indicate the active chunk, selected by this priority:
-  - The chunk containing the currently selected line.
-  - The chunk containing the currently selected text block.
-  - Otherwise, the chunk with the most lines in the visible window.
-- Pressing `Analyze` analyzes the active chunk (not always the first chunk).
-- Rewrite suggestions for a red line or highlighted block should compute approximate B-impact for that block within the active chunk context.
+### Chunking FAQ
+
+Q: If my cursor is near the end of chunk 1 (for example line 999) and I press `Analyze`, what gets analyzed?
+
+A: Binoculars analyzes from the active chunk start, not from the cursor line. In that case it re-analyzes from the start of chunk 1 (often line 1) forward to the current token-limited boundary.
+
+Q: Will chunk boundaries stay fixed forever once discovered?
+
+A: No. Chunk metrics are always chunk-local, but chunk boundaries are operational. If text edits change token density, a later re-analysis can move the chunk end earlier or later, and overlapping prior chunk descriptors are replaced by the new result.
 
 ## Safety / Responsible Use
 

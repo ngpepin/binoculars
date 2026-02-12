@@ -69,6 +69,28 @@ Recommended cadence:
 - Run `Analyze` every few rewrites (for example, every 3–8), or after a major section change.
 - Run `Clear Priors` if faint backgrounds begin to obscure current hot spots.
 
+### 4.1) Chunk-Aware Analyze Behaviour (Large Files)
+
+When a document is too large for one-pass scoring, analysis is chunked.
+
+- First `Analyze` starts at line 1 (document start) and scores the first token-limited chunk.
+- `Analyze Next` continues from the highest contiguous covered tail into the next chunk.
+- After at least one chunk exists, pressing `Analyze` does not start at the cursor line; it starts at the active chunk start.
+- Active chunk is chosen by overlap priority (selection overlap, then visible cursor chunk, then visible-window majority, then nearest chunk).
+- Chunk metrics in the status bar always refer to the active chunk.
+- Chunk boundaries can change after edits and re-analysis.
+
+Concrete example:
+
+1. First `Analyze` produces chunk 1 covering lines `1-999`.
+2. You move cursor to line `999` and press `Analyze`.
+3. Binoculars re-analyzes from chunk-1 start (line `1`), not from line `999`.
+4. Because edits changed token density, the new chunk-1 end may shift:
+   - It could contract to line `972`, or
+   - It could extend to line `1031`.
+5. The previous overlapping chunk descriptor is replaced by this new one.
+6. Status-bar values now reflect the updated chunk range.
+
 ## 5) Requesting Rewrites
 
 ### A) Rewrite a Single Scored Red Segment
@@ -85,7 +107,7 @@ Recommended cadence:
 1. Highlight any block in the left pane (may include mixed LOW/HIGH/neutral lines).
 2. Right-click while the selection is active.
 3. The GUI rounds the selection to full lines for rewrite generation.
-4. If the selection includes unscored text, only the scored portion is rewritten.
+4. If the selection includes unscored text, those lines are retained unchanged while scored/analyzed lines are rewritten.
 5. The popup displays three options and approximate B deltas.
 6. Select an option using the button or `1`/`2`/`3`.
 

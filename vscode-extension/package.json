@@ -1,0 +1,160 @@
+{
+  "name": "binoculars-vscode",
+  "displayName": "Binoculars",
+  "description": "Binoculars scoring, contribution colorization, and rewrite workflow inside VS Code.",
+  "version": "0.1.0",
+  "publisher": "npepin",
+  "license": "SEE LICENSE IN ../../LICENSE.md",
+  "engines": {
+    "vscode": "^1.92.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:binoculars.analyze",
+    "onCommand:binoculars.analyzeNext",
+    "onCommand:binoculars.rewriteSelection",
+    "onCommand:binoculars.clearPriors",
+    "onLanguage:markdown",
+    "onLanguage:plaintext"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "binoculars.analyze",
+        "title": "Binoculars: Analyze Active Document"
+      },
+      {
+        "command": "binoculars.analyzeNext",
+        "title": "Binoculars: Analyze Next Chunk"
+      },
+      {
+        "command": "binoculars.rewriteSelection",
+        "title": "Binoculars: Rewrite Selection"
+      },
+      {
+        "command": "binoculars.clearPriors",
+        "title": "Binoculars: Clear Priors"
+      },
+      {
+        "command": "binoculars.restartBackend",
+        "title": "Binoculars: Restart Backend"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "binoculars.analyze",
+        "key": "ctrl+alt+b",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "binoculars.analyzeNext",
+        "key": "ctrl+alt+n",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "binoculars.rewriteSelection",
+        "key": "ctrl+alt+r",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "binoculars.clearPriors",
+        "key": "ctrl+alt+c",
+        "when": "editorTextFocus"
+      }
+    ],
+    "configuration": {
+      "title": "Binoculars",
+      "properties": {
+        "binoculars.backend.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Python executable used to launch the persistent Binoculars bridge backend."
+        },
+        "binoculars.backend.bridgeScriptPath": {
+          "type": "string",
+          "default": "${workspaceFolder}/vscode-extension/python/binoculars_bridge.py",
+          "description": "Path to binoculars_bridge.py. Supports ${workspaceFolder}."
+        },
+        "binoculars.configPath": {
+          "type": "string",
+          "default": "${workspaceFolder}/config.llama31.cuda12gb.fast.json",
+          "description": "Path to Binoculars model scoring config JSON."
+        },
+        "binoculars.textMaxTokensOverride": {
+          "type": ["integer", "null"],
+          "default": null,
+          "minimum": 0,
+          "description": "Optional override for text.max_tokens used by the bridge."
+        },
+        "binoculars.topK": {
+          "type": "integer",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 30,
+          "description": "Top-k size used for hotspot diagnostics in optional bridge calls."
+        },
+        "binoculars.models.observerGgufPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional override observer model path (GGUF). If set, your scoring config should reference it."
+        },
+        "binoculars.models.performerGgufPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional override performer model path (GGUF). If set, your scoring config should reference it."
+        },
+        "binoculars.externalLlm.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether rewrite generation may use external OpenAI-compatible LLM when configured in config.binoculars.llm.json."
+        },
+        "binoculars.externalLlm.endpoint": {
+          "type": "string",
+          "default": "",
+          "description": "Optional endpoint URL for OpenAI-compatible rewrite model."
+        },
+        "binoculars.externalLlm.model": {
+          "type": "string",
+          "default": "",
+          "description": "Optional model name for external rewrite LLM."
+        },
+        "binoculars.externalLlm.temperature": {
+          "type": "number",
+          "default": 0.7,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Optional external rewrite LLM temperature override."
+        },
+        "binoculars.externalLlm.maxTokens": {
+          "type": "integer",
+          "default": 280,
+          "minimum": 1,
+          "description": "Optional external rewrite LLM max_tokens override."
+        },
+        "binoculars.render.contributionBars": {
+          "type": "boolean",
+          "default": true,
+          "description": "Render per-line contribution bars in editor gutter."
+        },
+        "binoculars.render.colorizeText": {
+          "type": "boolean",
+          "default": true,
+          "description": "Render LOW/HIGH contribution colorization overlays in editor text."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.12",
+    "@types/vscode": "^1.92.0",
+    "typescript": "^5.5.4"
+  }
+}

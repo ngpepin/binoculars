@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://binoculars.local/schemas/bridge.protocol.schema.json",
+  "title": "Binoculars Bridge Protocol",
+  "description": "Line-delimited JSON protocol between VS Code extension/Tk frontend and persistent Python backend.",
+  "type": "object",
+  "oneOf": [
+    {
+      "title": "Request",
+      "type": "object",
+      "required": ["id", "method"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": ["integer", "string"],
+          "description": "Client-generated correlation id."
+        },
+        "method": {
+          "type": "string",
+          "enum": [
+            "initialize",
+            "health",
+            "analyze_document",
+            "analyze_chunk",
+            "analyze_next_chunk",
+            "rewrite_span",
+            "shutdown"
+          ]
+        },
+        "params": {
+          "type": "object",
+          "description": "Method-specific payload."
+        }
+      }
+    },
+    {
+      "title": "Success Response",
+      "type": "object",
+      "required": ["id", "result"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": ["integer", "string"]
+        },
+        "result": {
+          "type": "object",
+          "properties": {
+            "ok": { "type": "boolean" },
+            "chunk": {
+              "type": "object",
+              "properties": {
+                "char_start": { "type": "integer", "minimum": 0 },
+                "char_end": { "type": "integer", "minimum": 0 },
+                "analyzed_char_end": { "type": "integer", "minimum": 0 },
+                "metrics": {
+                  "type": "object",
+                  "properties": {
+                    "binoculars_score": { "type": "number" },
+                    "observer_logPPL": { "type": "number" },
+                    "performer_logPPL": { "type": "number" },
+                    "cross_logXPPL": { "type": "number" }
+                  },
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true
+            },
+            "analysis": {
+              "type": "object",
+              "description": "Raw analysis payload from binoculars.py",
+              "additionalProperties": true
+            },
+            "paragraph_profile": {
+              "type": ["object", "null"],
+              "additionalProperties": true
+            },
+            "rewrites": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "text": { "type": "string" },
+                  "approx_B": { "type": "number" },
+                  "delta_B": { "type": "number" }
+                },
+                "additionalProperties": true
+              }
+            },
+            "status_messages": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          },
+          "additionalProperties": true
+        }
+      }
+    },
+    {
+      "title": "Error Response",
+      "type": "object",
+      "required": ["id", "error"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": ["integer", "string"]
+        },
+        "error": {
+          "type": "object",
+          "required": ["message"],
+          "properties": {
+            "code": { "type": "string" },
+            "message": { "type": "string" },
+            "details": { "type": "object", "additionalProperties": true }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "title": "Event",
+      "type": "object",
+      "required": ["event"],
+      "additionalProperties": false,
+      "properties": {
+        "event": {
+          "type": "string",
+          "enum": ["status", "ready"]
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    }
+  ]
+}
