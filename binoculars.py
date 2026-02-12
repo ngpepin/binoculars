@@ -3416,9 +3416,38 @@ def launch_gui(
         saved_snapshot = str(state.get("last_saved_text", ""))
         return current_text() != saved_snapshot
 
+    def needs_state_save_without_text_change() -> bool:
+        """
+        Allow Save when analysis exists but the currently opened markdown does not have
+        a matching valid sidecar state for the current text hash.
+        """
+        if not bool(state.get("has_analysis")):
+            return False
+        doc_abs = os.path.abspath(src_path)
+        if os.path.splitext(doc_abs)[1].lower() != ".md":
+            # Non-md source docs still benefit from saving a timestamped md+json pair.
+            return True
+        sidecar_path = sidecar_state_path_for_document(doc_abs)
+        if not os.path.isfile(sidecar_path):
+            return True
+        try:
+            with open(sidecar_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            return True
+        if not isinstance(payload, dict) or not bool(payload.get("binoculars_gui_state", False)):
+            return True
+        expected_hash = str(payload.get("text_sha256", "") or "")
+        if not expected_hash:
+            return True
+        return expected_hash != text_sha256(current_text())
+
     def sync_save_button_state(enabled_base: bool = True) -> None:
-        # Save is enabled only when edits are allowed and content differs from last saved/opened snapshot.
-        save_enabled = bool(enabled_base) and has_unsaved_changes()
+        # Save is enabled when edits exist OR when analyzed state has not yet been
+        # persisted as a matching sidecar for the currently opened markdown.
+        save_enabled = bool(enabled_base) and (
+            has_unsaved_changes() or needs_state_save_without_text_change()
+        )
         try:
             save_btn.configure(state="normal" if save_enabled else "disabled")
         except Exception:
