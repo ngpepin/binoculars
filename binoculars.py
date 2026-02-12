@@ -28,6 +28,7 @@ import os
 import re
 import socket
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -5567,6 +5568,60 @@ def launch_gui(
         Best-effort dark file dialog on Linux.
         Native toolkit support varies by distro/desktop; fallback remains functional.
         """
+        def normalize_dialog_choice(raw_choice: Any) -> str:
+            # Some dialog APIs can return tuple-like or sentinel text values on cancel.
+            if isinstance(raw_choice, (tuple, list)):
+                if not raw_choice:
+                    return ""
+                return str(raw_choice[0] or "").strip()
+            choice = str(raw_choice or "").strip()
+            if choice in {"()", "[]", "''", '""'}:
+                return ""
+            return choice
+
+        def try_zenity_open(dialog_dir: str) -> Tuple[bool, str]:
+            if shutil.which("zenity") is None:
+                return (False, "")
+            cmd = [
+                "zenity",
+                "--file-selection",
+                "--title=Open Markdown/Text File",
+                f"--filename={os.path.join(dialog_dir, '')}",
+                "--file-filter=Markdown/Text files | *.md *.markdown *.txt",
+                "--file-filter=All files | *",
+            ]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            except Exception:
+                return (False, "")
+            if proc.returncode == 0:
+                return (True, normalize_dialog_choice(proc.stdout))
+            if proc.returncode in (1, 5):
+                # User canceled/closed the dialog.
+                return (True, "")
+            return (False, "")
+
+        def try_yad_open(dialog_dir: str) -> Tuple[bool, str]:
+            if shutil.which("yad") is None:
+                return (False, "")
+            cmd = [
+                "yad",
+                "--file-selection",
+                "--title=Open Markdown/Text File",
+                f"--filename={os.path.join(dialog_dir, '')}",
+                "--file-filter=Markdown/Text files (*.md *.markdown *.txt) | *.md *.markdown *.txt",
+                "--file-filter=All files (*) | *",
+            ]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            except Exception:
+                return (False, "")
+            if proc.returncode == 0:
+                return (True, normalize_dialog_choice(proc.stdout))
+            if proc.returncode in (1, 252):
+                return (True, "")
+            return (False, "")
+
         if not bool(state.get("open_dialog_resize_bindings_installed", False)):
             resize_script = (
                 "if {[winfo exists %W]} {"
@@ -5574,28 +5629,6 @@ def launch_gui(
                 "variable showHiddenVar; set showHiddenVar 0; "
                 "variable showHiddenBtn; set showHiddenBtn 0"
                 "}; "
-                "if {![info exists ::tk::dialog::file::binocularsDialogFont]} {"
-                "set baseSize [font actual TkDefaultFont -size]; "
-                "if {$baseSize < 0} {set baseSize [expr {-$baseSize}]}; "
-                "set newSize [expr {$baseSize + 2}]; "
-                "set ::tk::dialog::file::binocularsDialogFont "
-                "[font create -family [font actual TkDefaultFont -family] -size $newSize]"
-                "}; "
-                "set dfont $::tk::dialog::file::binocularsDialogFont; "
-                "foreach p [list "
-                "%W.contents.f1.lab %W.contents.f1.menu "
-                "%W.contents.f2.lab %W.contents.f2.ent "
-                "%W.contents.f2.lab2 %W.contents.f2.menu "
-                "%W.contents.f2.ok %W.contents.f2.cancel %W.contents.f2.hidden"
-                "] {"
-                "if {[winfo exists $p]} {catch {$p configure -font $dfont}}"
-                "}; "
-                "if {[winfo exists %W.contents.f1.menu.menu]} "
-                "{catch {%W.contents.f1.menu.menu configure -font $dfont}}; "
-                "if {[winfo exists %W.contents.f2.menu.m]} "
-                "{catch {%W.contents.f2.menu.m configure -font $dfont}}; "
-                "set ivar \"::tk::%W.contents.icons(font)\"; "
-                "if {[info exists $ivar]} {set $ivar $dfont}; "
                 "update idletasks; "
                 "set sw [winfo screenwidth %W]; "
                 "set sh [winfo screenheight %W]; "
@@ -5640,6 +5673,13 @@ def launch_gui(
             applied_temp_dark_theme = True
 
         try:
+            handled, native_choice = try_zenity_open(dialog_dir)
+            if handled:
+                return native_choice
+            handled, native_choice = try_yad_open(dialog_dir)
+            if handled:
+                return native_choice
+
             raw_choice = filedialog.askopenfilename(
                 parent=root,
                 title="Open Markdown/Text File",
@@ -5649,16 +5689,7 @@ def launch_gui(
                     ("All files", "*.*"),
                 ),
             )
-            # Some Tk/platform combinations can return an empty tuple-like value on cancel.
-            # Normalize all "cancel" shapes to "" so callers can reliably no-op.
-            if isinstance(raw_choice, (tuple, list)):
-                if not raw_choice:
-                    return ""
-                return str(raw_choice[0] or "")
-            choice = str(raw_choice or "").strip()
-            if choice in {"()", "[]", "''", '""'}:
-                return ""
-            return choice
+            return normalize_dialog_choice(raw_choice)
         finally:
             if applied_temp_dark_theme:
                 os.environ.pop("GTK_THEME", None)
