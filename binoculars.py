@@ -4673,9 +4673,7 @@ def launch_gui(
             )
             options_text.pack(side="left", fill="both", expand=True)
             options_scroll.configure(command=options_text.yview)
-            if external_llm_expected:
-                options_text.insert("1.0", "Using external LLM to generate rewrite options...\n")
-            else:
+            if not external_llm_expected:
                 options_text.insert(
                     "1.0",
                     "Preparing rewrite generation...\n\n"
