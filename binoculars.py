@@ -5570,6 +5570,32 @@ def launch_gui(
         if not bool(state.get("open_dialog_resize_bindings_installed", False)):
             resize_script = (
                 "if {[winfo exists %W]} {"
+                "namespace eval ::tk::dialog::file {"
+                "variable showHiddenVar; set showHiddenVar 0; "
+                "variable showHiddenBtn; set showHiddenBtn 0"
+                "}; "
+                "if {![info exists ::tk::dialog::file::binocularsDialogFont]} {"
+                "set baseSize [font actual TkDefaultFont -size]; "
+                "if {$baseSize < 0} {set baseSize [expr {-$baseSize}]}; "
+                "set newSize [expr {$baseSize + 2}]; "
+                "set ::tk::dialog::file::binocularsDialogFont "
+                "[font create -family [font actual TkDefaultFont -family] -size $newSize]"
+                "}; "
+                "set dfont $::tk::dialog::file::binocularsDialogFont; "
+                "foreach p [list "
+                "%W.contents.f1.lab %W.contents.f1.menu "
+                "%W.contents.f2.lab %W.contents.f2.ent "
+                "%W.contents.f2.lab2 %W.contents.f2.menu "
+                "%W.contents.f2.ok %W.contents.f2.cancel %W.contents.f2.hidden"
+                "] {"
+                "if {[winfo exists $p]} {catch {$p configure -font $dfont}}"
+                "}; "
+                "if {[winfo exists %W.contents.f1.menu.menu]} "
+                "{catch {%W.contents.f1.menu.menu configure -font $dfont}}; "
+                "if {[winfo exists %W.contents.f2.menu.m]} "
+                "{catch {%W.contents.f2.menu.m configure -font $dfont}}; "
+                "set ivar \"::tk::%W.contents.icons(font)\"; "
+                "if {[info exists $ivar]} {set $ivar $dfont}; "
                 "update idletasks; "
                 "set sw [winfo screenwidth %W]; "
                 "set sh [winfo screenheight %W]; "
@@ -5595,6 +5621,17 @@ def launch_gui(
             dialog_dir = os.path.expanduser("~")
         if not os.path.isdir(dialog_dir):
             dialog_dir = "."
+
+        try:
+            # Hide hidden files by default for readability.
+            root.tk.eval(
+                "namespace eval ::tk::dialog::file {"
+                "variable showHiddenVar; set showHiddenVar 0; "
+                "variable showHiddenBtn; set showHiddenBtn 0"
+                "}"
+            )
+        except Exception:
+            pass
 
         prior_gtk_theme = os.environ.get("GTK_THEME")
         applied_temp_dark_theme = False
