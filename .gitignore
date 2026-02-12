@@ -11,3 +11,4 @@ __pycache__/
 tests/fixtures/TE_BookOfIsms.md
 tests/fixtures/Poe.md
 config.binoculars.llm.json
+COMPARISON.md

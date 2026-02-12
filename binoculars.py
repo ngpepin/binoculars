@@ -195,6 +195,121 @@ def apply_word_case_from_template(template: str, candidate: str) -> str:
     return dst
 
 
+def _is_ascii_alpha_word(word: str) -> bool:
+    return bool(re.fullmatch(r"[a-z]+", str(word or "")))
+
+
+def _is_vowel(ch: str) -> bool:
+    return ch in {"a", "e", "i", "o", "u"}
+
+
+def _looks_cvc_ending(word: str) -> bool:
+    w = str(word or "")
+    if len(w) < 3:
+        return False
+    c1, c2, c3 = w[-3], w[-2], w[-1]
+    if not (c1.isalpha() and c2.isalpha() and c3.isalpha()):
+        return False
+    if _is_vowel(c1) or (not _is_vowel(c2)) or _is_vowel(c3):
+        return False
+    if c3 in {"w", "x", "y"}:
+        return False
+    # Keep doubling conservative to avoid odd forms.
+    return len(w) <= 5
+
+
+def detect_inflection_pattern(word: str) -> str:
+    w = _normalize_synonym_candidate(word)
+    if not w:
+        return "base"
+    if len(w) >= 5 and w.endswith("ing"):
+        return "ing"
+    if len(w) >= 4 and w.endswith("ied"):
+        return "ied"
+    if len(w) >= 4 and w.endswith("ed"):
+        return "ed"
+    if len(w) >= 4 and w.endswith("ies"):
+        return "ies"
+    if len(w) >= 5 and w.endswith("est"):
+        return "est"
+    if len(w) >= 4 and w.endswith("er"):
+        return "er"
+    if len(w) >= 4 and w.endswith("ly"):
+        return "ly"
+    if len(w) >= 3 and w.endswith("es"):
+        return "es"
+    if len(w) >= 3 and w.endswith("s") and not w.endswith("ss"):
+        return "s"
+    return "base"
+
+
+def inflect_candidate_to_pattern(base_candidate: str, pattern: str) -> str:
+    w = _normalize_synonym_candidate(base_candidate)
+    if not w:
+        return ""
+    if pattern == "base":
+        return w
+    if not _is_ascii_alpha_word(w):
+        return w
+    if pattern == "ing":
+        if w.endswith("ing"):
+            return w
+        if w.endswith("ie"):
+            return w[:-2] + "ying"
+        if w.endswith("e") and not w.endswith(("ee", "oe", "ye")):
+            return w[:-1] + "ing"
+        if _looks_cvc_ending(w):
+            return w + w[-1] + "ing"
+        return w + "ing"
+    if pattern in {"ed", "ied"}:
+        if w.endswith("ed"):
+            return w
+        if w.endswith("e"):
+            return w + "d"
+        if w.endswith("y") and len(w) >= 2 and not _is_vowel(w[-2]):
+            return w[:-1] + "ied"
+        if _looks_cvc_ending(w):
+            return w + w[-1] + "ed"
+        return w + "ed"
+    if pattern in {"s", "es", "ies"}:
+        if w.endswith("s"):
+            return w
+        if w.endswith("y") and len(w) >= 2 and not _is_vowel(w[-2]):
+            return w[:-1] + "ies"
+        if w.endswith(("s", "x", "z", "sh", "ch", "o")):
+            return w + "es"
+        return w + "s"
+    if pattern == "ly":
+        if w.endswith("ly"):
+            return w
+        if w.endswith("y") and len(w) >= 2 and not _is_vowel(w[-2]):
+            return w[:-1] + "ily"
+        if w.endswith("ic"):
+            return w + "ally"
+        return w + "ly"
+    if pattern == "er":
+        if w.endswith("er"):
+            return w
+        if w.endswith("y") and len(w) >= 2 and not _is_vowel(w[-2]):
+            return w[:-1] + "ier"
+        if w.endswith("e"):
+            return w + "r"
+        if _looks_cvc_ending(w):
+            return w + w[-1] + "er"
+        return w + "er"
+    if pattern == "est":
+        if w.endswith("est"):
+            return w
+        if w.endswith("y") and len(w) >= 2 and not _is_vowel(w[-2]):
+            return w[:-1] + "iest"
+        if w.endswith("e"):
+            return w + "st"
+        if _looks_cvc_ending(w):
+            return w + w[-1] + "est"
+        return w + "est"
+    return w
+
+
 def _get_wordnet_module() -> Optional[Any]:
     global _WORDNET_MODULE, _WORDNET_READY
     if _WORDNET_READY is False:
@@ -3205,7 +3320,31 @@ def launch_gui(
         if int(state.get("synonym_request_id", 0)) != int(request_id):
             return
 
-        cased = [apply_word_case_from_template(clicked_word, s) for s in synonyms]
+        pattern = detect_inflection_pattern(clicked_word)
+        cased: List[str] = []
+        seen: Set[str] = set()
+        for syn in synonyms:
+            base = _normalize_synonym_candidate(str(syn))
+            if not base:
+                continue
+            inflected = inflect_candidate_to_pattern(base, pattern)
+            candidate = inflected if inflected else base
+
+            # Validate transformed forms; prefer base if transformed spelling looks invalid.
+            if candidate != base:
+                transformed_ok = is_word_spelled_correctly(candidate, english_words)
+                if not transformed_ok:
+                    candidate = base
+
+            out_word = apply_word_case_from_template(clicked_word, candidate)
+            norm_out = _normalize_synonym_candidate(out_word)
+            if not norm_out or norm_out in seen:
+                continue
+            seen.add(norm_out)
+            cased.append(out_word)
+            if len(cased) >= SYNONYM_OPTION_COUNT:
+                break
+
         state["synonym_options"] = list(cased[:SYNONYM_OPTION_COUNT])
         state["synonym_target_word"] = clicked_word
         state["synonym_target_start_idx"] = start_idx
@@ -4383,6 +4522,8 @@ def launch_gui(
     ) -> str:
         close_rewrite_popup()
         hide_tooltip()
+        llm_cfg_preview, _llm_cfg_preview_issue = load_optional_rewrite_llm_config()
+        external_llm_expected = llm_cfg_preview is not None
 
         popup = None
         try:
@@ -4438,22 +4579,23 @@ def launch_gui(
             )
             title_label.pack(side="top", fill="x")
 
-            sub_label = tk.Label(
-                popup,
-                text=(
-                    "Expected B impact is approximate. Full Analyze is required for exact B. "
-                    "First run may take longer while models warm up."
-                ),
-                anchor="w",
-                justify="left",
-                bg="#111111",
-                fg="#c4c4c4",
-                padx=10,
-                pady=0,
-            )
-            sub_label.pack(side="top", fill="x", pady=(0, 4))
+            if not external_llm_expected:
+                sub_label = tk.Label(
+                    popup,
+                    text=(
+                        "Expected B impact is approximate. Full Analyze is required for exact B. "
+                        "First run may take longer while models warm up."
+                    ),
+                    anchor="w",
+                    justify="left",
+                    bg="#111111",
+                    fg="#c4c4c4",
+                    padx=10,
+                    pady=0,
+                )
+                sub_label.pack(side="top", fill="x", pady=(0, 4))
 
-            if range_note:
+            if range_note and not external_llm_expected:
                 range_note_label = tk.Label(
                     popup,
                     text=range_note,
@@ -4466,7 +4608,13 @@ def launch_gui(
                 )
                 range_note_label.pack(side="top", fill="x", pady=(0, 6))
 
-            status_label_var = tk.StringVar(value="Working...")
+            status_label_var = tk.StringVar(
+                value=(
+                    "Using external LLM to generate rewrite options..."
+                    if external_llm_expected
+                    else "Working..."
+                )
+            )
             popup_status = tk.Label(
                 popup,
                 textvariable=status_label_var,
@@ -4479,20 +4627,22 @@ def launch_gui(
             )
             popup_status.pack(side="top", fill="x", pady=(0, 8))
 
-            wait_label_var = tk.StringVar(
-                value="Performing rewrite generation and impact scoring (30-120s)."
-            )
-            wait_label = tk.Label(
-                popup,
-                textvariable=wait_label_var,
-                anchor="w",
-                justify="left",
-                bg="#111111",
-                fg="#9cc7ff",
-                padx=10,
-                pady=0,
-            )
-            wait_label.pack(side="top", fill="x", pady=(0, 10))
+            wait_label_var: Optional[tk.StringVar] = None
+            if not external_llm_expected:
+                wait_label_var = tk.StringVar(
+                    value="Performing rewrite generation and impact scoring (30-120s)."
+                )
+                wait_label = tk.Label(
+                    popup,
+                    textvariable=wait_label_var,
+                    anchor="w",
+                    justify="left",
+                    bg="#111111",
+                    fg="#9cc7ff",
+                    padx=10,
+                    pady=0,
+                )
+                wait_label.pack(side="top", fill="x", pady=(0, 10))
 
             button_frame = tk.Frame(popup, bg="#111111")
             button_frame.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
@@ -4523,14 +4673,17 @@ def launch_gui(
             )
             options_text.pack(side="left", fill="both", expand=True)
             options_scroll.configure(command=options_text.yview)
-            options_text.insert(
-                "1.0",
-                "Preparing rewrite generation...\n\n"
-                "Stages:\n"
-                "1. Select rewrite model (external LLM if configured, else internal performer)\n"
-                "2. Generate 3 rewrite candidates\n"
-                "3. Score approximate B impact\n",
-            )
+            if external_llm_expected:
+                options_text.insert("1.0", "Using external LLM to generate rewrite options...\n")
+            else:
+                options_text.insert(
+                    "1.0",
+                    "Preparing rewrite generation...\n\n"
+                    "Stages:\n"
+                    "1. Select rewrite model (external LLM if configured, else internal performer)\n"
+                    "2. Generate 3 rewrite candidates\n"
+                    "3. Score approximate B impact\n",
+                )
             options_text.bind("<Key>", lambda _e: "break")
 
             popup_state: Dict[str, Any] = {
@@ -4576,12 +4729,14 @@ def launch_gui(
                 return
             phase = int(wait_anim_phase["n"]) % 4
             dots = "." * phase
-            wait_label_var.set(
-                "Performing rewrite generation and impact scoring"
-                f"{dots} This may take 30-120s, and GPU can stay low during model load."
-            )
+            if wait_label_var is not None:
+                wait_label_var.set(
+                    "Performing rewrite generation and impact scoring"
+                    f"{dots} This may take 30-120s, and GPU can stay low during model load."
+                )
             wait_anim_phase["n"] = phase + 1
-            wait_anim_job = root.after(500, queue_wait_anim)
+            if wait_label_var is not None:
+                wait_anim_job = root.after(500, queue_wait_anim)
 
         def stop_wait_anim() -> None:
             nonlocal wait_anim_job
@@ -4698,7 +4853,10 @@ def launch_gui(
             pass
 
         status_var.set("Performing rewrite generation and impact scoring...")
-        status_label_var.set("Preparing rewrite pipeline...")
+        if external_llm_expected:
+            status_label_var.set("Using external LLM to generate rewrite options...")
+        else:
+            status_label_var.set("Preparing rewrite pipeline...")
         queue_wait_anim()
 
         def post_popup_status(message: str) -> None:
@@ -4720,12 +4878,18 @@ def launch_gui(
 
         def worker() -> None:
             try:
-                post_popup_status("Selecting rewrite model...")
-                post_popup_log("Selecting rewrite model...")
-                if range_note:
-                    post_popup_log(range_note)
+                if not external_llm_expected:
+                    post_popup_status("Selecting rewrite model...")
+                    post_popup_log("Selecting rewrite model...")
+                    if range_note:
+                        post_popup_log(range_note)
 
                 def rewrite_progress(message: str) -> None:
+                    if external_llm_expected:
+                        msg_low = str(message or "").lower()
+                        if "fall" in msg_low or "unavailable" in msg_low or "failed" in msg_low:
+                            post_popup_status(message)
+                        return
                     post_popup_status(message)
                     post_popup_log(message)
 
@@ -4758,19 +4922,29 @@ def launch_gui(
                         rewrites.append(rewrites[-1] if rewrites else original_span)
                     rewrites = rewrites[:3]
                     if repaired_lines > 0:
-                        post_popup_log(
-                            f"Preserved {repaired_lines} unchanged source line(s) omitted by model output."
-                        )
+                        if not external_llm_expected:
+                            post_popup_log(
+                                f"Preserved {repaired_lines} unchanged source line(s) omitted by model output."
+                            )
                 if rewrite_source == "external-llm":
-                    post_popup_log("Using external LLM for rewrite generation.")
+                    post_popup_status("Using external LLM for rewrite generation...")
+                    if not external_llm_expected:
+                        post_popup_log("Using external LLM for rewrite generation.")
                 elif rewrite_source == "internal-fallback":
-                    post_popup_log("External LLM unavailable; used internal performer model.")
+                    post_popup_status("External LLM unavailable; using internal performer model...")
+                    if external_llm_expected:
+                        post_popup_log("External LLM unavailable; switched to internal performer model.")
+                    else:
+                        post_popup_log("External LLM unavailable; used internal performer model.")
                 else:
-                    post_popup_log("Using internal performer model for rewrite generation.")
-                if rewrite_note:
+                    post_popup_status("Using internal performer model for rewrite generation...")
+                    if not external_llm_expected:
+                        post_popup_log("Using internal performer model for rewrite generation.")
+                if rewrite_note and not external_llm_expected:
                     post_popup_log(rewrite_note)
                 post_popup_status("Scoring expected impact for each rewrite option...")
-                post_popup_log("Scoring approximate B impact...")
+                if not external_llm_expected:
+                    post_popup_log("Scoring approximate B impact...")
                 options = estimate_rewrite_b_impact_options(
                     cfg_path=cfg_path,
                     full_text=text_snapshot,
@@ -4783,7 +4957,8 @@ def launch_gui(
                     base_doc_transitions=int(metrics.get("transitions", 0)),
                     text_max_tokens_override=text_max_tokens_override,
                 )
-                post_popup_log("Sorted options by expected increase in B (more human-like first).")
+                if not external_llm_expected:
+                    post_popup_log("Sorted options by expected increase in B (more human-like first).")
             except Exception as exc:
                 def on_error(msg: str = str(exc)) -> None:
                     if not popup_active():
@@ -4824,7 +4999,8 @@ def launch_gui(
                     else ("internal fallback" if rewrite_source == "internal-fallback" else "internal model")
                 )
                 status_label_var.set(f"Select rewrite 1, 2, or 3. Press Quit to cancel. Source: {src_label}.")
-                wait_label_var.set("Generation complete.")
+                if wait_label_var is not None:
+                    wait_label_var.set("Generation complete.")
                 refresh_analysis_status_line()
 
             root.after(0, on_ready)
