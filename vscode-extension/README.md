@@ -1,13 +1,15 @@
-# Binoculars VS Code Extension (Scaffold)
+# Binoculars VS Code Extension
 
-This directory contains a first-pass scaffold for a native VS Code extension front end that reuses Binoculars scoring/rewrite logic through a persistent Python bridge.
+This directory contains a working VS Code extension front end that reuses Binoculars scoring/rewrite logic through a persistent Python bridge.
 
 ## Current Scope
 
-Included in this scaffold:
+Implemented:
+- Activity Bar container (`Binoculars`) with `media/binoculars-icon.png`
+- Controls view in Activity Bar with one-click commands and live status
 - Persistent backend bridge process (`python/binoculars_bridge.py`)
 - Extension commands + default hotkeys
-- Settings contract for GGUF paths/config and external LLM details
+- Settings-driven runtime configuration (Python path, bridge path, config path, GGUF overrides, rewrite LLM config path)
 - Analysis rendering in editor:
   - LOW/HIGH text colorization
   - Unscored-region rendering
@@ -22,6 +24,7 @@ Included in this scaffold:
 Intentionally out of scope here:
 - Markdown preview pane integration
 - Synonym functionality (already covered by existing VS Code ecosystem)
+- Spellchecking integration
 
 ## Directory Layout
 
@@ -30,11 +33,12 @@ Intentionally out of scope here:
 - `src/backendClient.ts`: persistent bridge client (JSON over stdio)
 - `python/binoculars_bridge.py`: backend API adaptor over core `binoculars.py`
 - `schemas/bridge.protocol.schema.json`: protocol schema for request/response envelopes
+- `media/binoculars-icon.png`: Activity Bar icon
 
 ## Commands / Hotkeys
 
 Default bindings (users can remap via Keyboard Shortcuts):
-- `Binoculars: Analyze Active Document` -> `Ctrl+Alt+B`
+- `Binoculars: Analyze Chunk` -> `Ctrl+Alt+B`
 - `Binoculars: Analyze Next Chunk` -> `Ctrl+Alt+N`
 - `Binoculars: Rewrite Selection` -> `Ctrl+Alt+R`
 - `Binoculars: Clear Priors` -> `Ctrl+Alt+C`
@@ -52,7 +56,18 @@ Key settings contributed by this extension:
 - `binoculars.externalLlm.*`
 - `binoculars.render.*`
 
-Note: model overrides are declared now for forward compatibility. Current bridge behavior still relies on the supplied scoring config file.
+Notes:
+- Current defaults point to the existing local paths used in this repository.
+- All paths remain configurable in VS Code settings.
+- GGUF overrides are applied by bridge-generated runtime config patching.
+- External rewrite LLM config path is passed via `BINOCULARS_REWRITE_LLM_CONFIG_PATH`.
+
+## Theme Mode
+
+This implementation is tuned for dark mode first.
+
+- Dark palette is primary for LOW/HIGH/unscored overlays and gutter bars.
+- A conservative light-theme palette fallback is included, but full light-mode tuning is a follow-up task.
 
 ## Build / Run (from this folder)
 
@@ -78,4 +93,3 @@ Recommended migration path:
 2. Route Tk Analyze/AnalyzeNext/Rewrite calls through bridge methods behind a feature flag.
 3. Move chunk-state logic and rewrite approximation baseline logic into bridge responses.
 4. Retire duplicated Tk-only scoring paths after parity tests pass.
-

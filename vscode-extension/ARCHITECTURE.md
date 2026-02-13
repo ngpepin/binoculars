@@ -24,6 +24,17 @@ Yes. Refactoring the Tkinter GUI to use the same persistent bridge backend is th
 - `rewrite_span`
 - `shutdown`
 
+## VS Code UI Surface
+
+- Activity Bar container: `Binoculars`
+- Activity view: `Controls` (commands + live status/chunk counters)
+- Editor overlays:
+  - LOW/HIGH colorization
+  - unscored-region dimming
+  - line-level contribution gutter bars
+
+Dark mode is the primary tuned theme. Light-mode palette fallback is present but should be tuned in a dedicated pass.
+
 ## Migration Plan for Tk
 
 1. Add a `--bridge` runtime mode in Tk path.
@@ -38,4 +49,3 @@ Yes. Refactoring the Tkinter GUI to use the same persistent bridge backend is th
 - Lower maintenance and fewer behavior drifts.
 - Easier testing via protocol-level regression fixtures.
 - Faster future client implementations.
-

@@ -644,6 +644,9 @@ def default_master_config_path() -> str:
 
 
 def default_rewrite_llm_config_path() -> str:
+    env_path = str(os.environ.get("BINOCULARS_REWRITE_LLM_CONFIG_PATH", "")).strip()
+    if env_path:
+        return env_path
     script_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(script_dir, "config.binoculars.llm.json")
 
@@ -2809,13 +2812,37 @@ def launch_gui(
         except Exception:
             return None
 
-    root.title(f"Binoculars - {os.path.basename(src_path)}")
-    app_icon = create_owl_icon_image()
-    if app_icon is not None:
+    def load_app_icon_images() -> List[Any]:
+        images: List[Any] = []
         try:
-            root.iconphoto(True, app_icon)
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            script_dir = os.getcwd()
+        candidates = (
+            os.path.join(script_dir, "media", "binoculars-icon.png"),
+            os.path.join(script_dir, "media", "binoculars-icon-large.png"),
+        )
+        for icon_path in candidates:
+            if not os.path.isfile(icon_path):
+                continue
+            try:
+                images.append(tk.PhotoImage(file=icon_path))
+            except Exception:
+                continue
+        if images:
+            return images
+        fallback = create_owl_icon_image()
+        if fallback is not None:
+            images.append(fallback)
+        return images
+
+    root.title(f"Binoculars - {os.path.basename(src_path)}")
+    app_icons = load_app_icon_images()
+    if app_icons:
+        try:
+            root.iconphoto(True, *app_icons)
             # Keep a strong reference; Tk can drop icons if image is GC'd.
-            root._binoculars_app_icon = app_icon  # type: ignore[attr-defined]
+            root._binoculars_app_icons = app_icons  # type: ignore[attr-defined]
         except Exception:
             pass
     root.geometry("1200x800")
@@ -4609,9 +4636,19 @@ def launch_gui(
 
     def tooltip_text(info: Dict[str, Any]) -> str:
         pct = info.get("pct_contribution", float("nan"))
-        pct_str = f"{pct:+.2f}%" if np.isfinite(pct) else "n/a"
+        if not np.isfinite(float(pct if pct is not None else float("nan"))):
+            # Fallback if pct_contribution is absent in a future annotation path.
+            try:
+                delta_if_removed = float(info.get("delta_doc_logPPL_if_removed", float("nan")))
+                doc_logppl = float(state.get("last_analysis_metrics", {}).get("observer_logPPL", float("nan")))
+                if np.isfinite(delta_if_removed) and np.isfinite(doc_logppl) and doc_logppl != 0.0:
+                    pct = (delta_if_removed / doc_logppl) * 100.0
+            except Exception:
+                pct = float("nan")
+        pct_str = f"{float(pct):+.3f}%" if np.isfinite(float(pct)) else "n/a"
         return (
-            f"% contribution: {pct_str}\n"
+            f"Contribution (% of doc logPPL): {pct_str}\n"
+            f"Label: {info.get('label', 'n/a')}\n"
             f"Paragraph: {info['paragraph_id']}\n"
             f"logPPL: {info['logPPL']:.6f}\n"
             f"delta_if_removed: {info['delta_doc_logPPL_if_removed']:+.6f}\n"
@@ -6875,13 +6912,23 @@ def launch_gui(
             place_initial_sash(retries=0)
         queue_line_numbers_refresh(delay_ms=0)
 
-    analyze_btn = tk.Button(toolbar, text="Analyze", command=on_analyze, width=12)
-    analyze_next_btn = tk.Button(toolbar, text="Analyze Next", command=on_analyze_next, width=12)
-    open_btn = tk.Button(toolbar, text="Open", command=on_open, width=12)
-    save_btn = tk.Button(toolbar, text="Save", command=on_save, width=12)
-    undo_btn = tk.Button(toolbar, text="Undo", command=on_undo, width=12)
-    clear_priors_btn = tk.Button(toolbar, text="Clear Priors", command=on_clear_priors, width=12)
-    quit_btn = tk.Button(toolbar, text="Quit", command=on_quit, width=12)
+    toolbar_button_style = {
+        "bg": "#1e1e1e",
+        "fg": "#f2f2f2",
+        "activebackground": "#2d2d2d",
+        "activeforeground": "#ffffff",
+        "disabledforeground": "#778290",
+        "relief": "flat",
+        "bd": 0,
+        "highlightthickness": 0,
+    }
+    analyze_btn = tk.Button(toolbar, text="Analyze", command=on_analyze, width=12, **toolbar_button_style)
+    analyze_next_btn = tk.Button(toolbar, text="Analyze Next", command=on_analyze_next, width=12, **toolbar_button_style)
+    open_btn = tk.Button(toolbar, text="Open", command=on_open, width=12, **toolbar_button_style)
+    save_btn = tk.Button(toolbar, text="Save", command=on_save, width=12, **toolbar_button_style)
+    undo_btn = tk.Button(toolbar, text="Undo", command=on_undo, width=12, **toolbar_button_style)
+    clear_priors_btn = tk.Button(toolbar, text="Clear Priors", command=on_clear_priors, width=12, **toolbar_button_style)
+    quit_btn = tk.Button(toolbar, text="Quit", command=on_quit, width=12, **toolbar_button_style)
 
     def set_clear_priors_visible(visible: bool) -> None:
         if visible == bool(state.get("clear_priors_visible")):
@@ -6908,6 +6955,7 @@ def launch_gui(
     undo_btn.pack(side="left", padx=(0, 8))
     quit_btn.pack(side="left")
     set_clear_priors_visible(False)
+
     for idx in range(SYNONYM_OPTION_COUNT):
         btn = tk.Button(
             synonym_btn_frame,

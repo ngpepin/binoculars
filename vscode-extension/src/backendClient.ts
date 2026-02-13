@@ -52,11 +52,21 @@ export class BackendClient implements vscode.Disposable {
     return this.startPromise;
   }
 
-  public async initialize(cfgPath: string, topK: number, textMaxTokensOverride: number | null): Promise<void> {
+  public async initialize(
+    cfgPath: string,
+    topK: number,
+    textMaxTokensOverride: number | null,
+    observerModelPath: string,
+    performerModelPath: string,
+    rewriteLlmConfigPath: string,
+  ): Promise<void> {
     await this.request('initialize', {
       cfg_path: cfgPath,
       top_k: topK,
       text_max_tokens_override: textMaxTokensOverride,
+      observer_model_path: observerModelPath,
+      performer_model_path: performerModelPath,
+      rewrite_llm_config_path: rewriteLlmConfigPath,
     });
   }
 

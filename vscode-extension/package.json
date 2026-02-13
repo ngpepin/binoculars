@@ -12,19 +12,39 @@
     "Other"
   ],
   "activationEvents": [
+    "onView:binoculars.controlsView",
     "onCommand:binoculars.analyze",
     "onCommand:binoculars.analyzeNext",
     "onCommand:binoculars.rewriteSelection",
+    "onCommand:binoculars.rewriteSelectionOrLine",
+    "onCommand:binoculars.recommendRewrite",
     "onCommand:binoculars.clearPriors",
     "onLanguage:markdown",
     "onLanguage:plaintext"
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "binoculars",
+          "title": "Binoculars",
+          "icon": "media/binoculars-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "binoculars": [
+        {
+          "id": "binoculars.controlsView",
+          "name": "Controls"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "binoculars.analyze",
-        "title": "Binoculars: Analyze Active Document"
+        "title": "Binoculars: Analyze Chunk"
       },
       {
         "command": "binoculars.analyzeNext",
@@ -32,6 +52,14 @@
       },
       {
         "command": "binoculars.rewriteSelection",
+        "title": "Binoculars: Rewrite Selection"
+      },
+      {
+        "command": "binoculars.rewriteSelectionOrLine",
+        "title": "Binoculars: Rewrite Selection"
+      },
+      {
+        "command": "binoculars.recommendRewrite",
         "title": "Binoculars: Rewrite Selection"
       },
       {
@@ -55,7 +83,7 @@
         "when": "editorTextFocus"
       },
       {
-        "command": "binoculars.rewriteSelection",
+        "command": "binoculars.rewriteSelectionOrLine",
         "key": "ctrl+alt+r",
         "when": "editorTextFocus"
       },
@@ -65,22 +93,79 @@
         "when": "editorTextFocus"
       }
     ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "binoculars.analyze",
+          "when": "view == binoculars.controlsView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "binoculars.analyzeNext",
+          "when": "view == binoculars.controlsView",
+          "group": "navigation@2"
+        },
+        {
+          "command": "binoculars.rewriteSelectionOrLine",
+          "when": "view == binoculars.controlsView",
+          "group": "navigation@3"
+        },
+        {
+          "command": "binoculars.clearPriors",
+          "when": "view == binoculars.controlsView",
+          "group": "navigation@4"
+        },
+        {
+          "command": "binoculars.restartBackend",
+          "when": "view == binoculars.controlsView",
+          "group": "navigation@5"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "binoculars.analyze",
+          "when": "editorTextFocus",
+          "group": "2_binoculars@1"
+        },
+        {
+          "command": "binoculars.analyzeNext",
+          "when": "editorTextFocus",
+          "group": "2_binoculars@2"
+        },
+        {
+          "command": "binoculars.rewriteSelectionOrLine",
+          "when": "editorTextFocus",
+          "group": "2_binoculars@3"
+        },
+        {
+          "command": "binoculars.clearPriors",
+          "when": "editorTextFocus",
+          "group": "2_binoculars@4"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "binoculars.recommendRewrite",
+          "when": "editorIsOpen"
+        }
+      ]
+    },
     "configuration": {
       "title": "Binoculars",
       "properties": {
         "binoculars.backend.pythonPath": {
           "type": "string",
-          "default": "python",
+          "default": "/home/npepin/Projects/binoculars/venv/bin/python",
           "description": "Python executable used to launch the persistent Binoculars bridge backend."
         },
         "binoculars.backend.bridgeScriptPath": {
           "type": "string",
-          "default": "${workspaceFolder}/vscode-extension/python/binoculars_bridge.py",
+          "default": "/home/npepin/Projects/binoculars/vscode-extension/python/binoculars_bridge.py",
           "description": "Path to binoculars_bridge.py. Supports ${workspaceFolder}."
         },
         "binoculars.configPath": {
           "type": "string",
-          "default": "${workspaceFolder}/config.llama31.cuda12gb.fast.json",
+          "default": "/home/npepin/Projects/binoculars/config.llama31.cuda12gb.fast.json",
           "description": "Path to Binoculars model scoring config JSON."
         },
         "binoculars.textMaxTokensOverride": {
@@ -98,18 +183,23 @@
         },
         "binoculars.models.observerGgufPath": {
           "type": "string",
-          "default": "",
-          "description": "Optional override observer model path (GGUF). If set, your scoring config should reference it."
+          "default": "/home/npepin/Projects/binoculars/models/Meta-Llama-3.1-8B-Q5_K_M-GGUF/meta-llama-3.1-8b-q5_k_m.gguf",
+          "description": "Optional override observer model path (GGUF)."
         },
         "binoculars.models.performerGgufPath": {
           "type": "string",
-          "default": "",
-          "description": "Optional override performer model path (GGUF). If set, your scoring config should reference it."
+          "default": "/home/npepin/Projects/binoculars/models/Meta-Llama-3.1-8B-Instruct-Q5_K_M-GGUF/meta-llama-3.1-8b-instruct-q5_k_m.gguf",
+          "description": "Optional override performer model path (GGUF)."
         },
         "binoculars.externalLlm.enabled": {
           "type": "boolean",
           "default": true,
           "description": "Whether rewrite generation may use external OpenAI-compatible LLM when configured in config.binoculars.llm.json."
+        },
+        "binoculars.externalLlm.configPath": {
+          "type": "string",
+          "default": "/home/npepin/Projects/binoculars/config.binoculars.llm.json",
+          "description": "Optional explicit path to rewrite LLM config JSON (OpenAI-compatible)."
         },
         "binoculars.externalLlm.endpoint": {
           "type": "string",
