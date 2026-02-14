@@ -15,7 +15,8 @@ Reference paper (also in `background/`): https://arxiv.org/abs/2401.12070
 
 Acknowledgment: The Binoculars paper authors - Abhimanyu Hans, Avi Schwarzschild, Valeriia Cherepanova, Hamid Kazemi, Aniruddha Saha, Micah Goldblum, Jonas Geiping, and Tom Goldstein - provided the foundational method for this project.
 
-<p align="center"> <img src="media/screenshot.png" width="900"> <br/> <em>Screenshot of the GUI</em> </p>
+<p align="center"> <img src="media/screenshot.png" width="900"> <br/> <em>Screenshot of the tkinter GUI</em> </p>
+<p align="center"> <img src="media/screenshot-vs.png" width="900"> <br/> <em>Screenshot of the VS Code extension</em> </p>
 
 ## VS Code Extension
 
