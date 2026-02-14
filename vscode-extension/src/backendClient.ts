@@ -89,12 +89,16 @@ export class BackendClient implements vscode.Disposable {
     analyzed_char_end: number;
     truncated_by_limit: boolean;
   }> {
-    return this.request('estimate_live_b', {
-      text,
-      input_label: inputLabel,
-      start_char: startChar,
-      base_cross_logxppl: baseCrossLogXppl,
-    });
+    return this.request(
+      'estimate_live_b',
+      {
+        text,
+        input_label: inputLabel,
+        start_char: startChar,
+        base_cross_logxppl: baseCrossLogXppl,
+      },
+      600000,
+    );
   }
 
   public rewriteSpan(
@@ -290,6 +294,7 @@ export class BackendClient implements vscode.Disposable {
       msg = JSON.parse(trimmed) as BridgeResponse;
     } catch {
       this.output.appendLine(`[bridge:raw] ${trimmed}`);
+      this.cleanupPending(new Error('Invalid JSON from Binoculars daemon.'));
       return;
     }
 

@@ -341,8 +341,18 @@ def _runtime_cfg_path(state: BridgeState) -> str:
 
 
 def _send(msg: Dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(msg, ensure_ascii=True) + "\n")
+    sys.stdout.write(json.dumps(_json_safe(msg), ensure_ascii=True) + "\n")
     sys.stdout.flush()
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
 
 
 def _err(request_id: Any, message: str, code: str = "bridge_error", details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -682,7 +692,7 @@ class _DaemonRequestHandler(socketserver.StreamRequestHandler):
         )
 
     def _send(self, msg: Dict[str, Any]) -> None:
-        payload = (json.dumps(msg, ensure_ascii=True) + "\n").encode("utf-8")
+        payload = (json.dumps(_json_safe(msg), ensure_ascii=True) + "\n").encode("utf-8")
         self.wfile.write(payload)
         self.wfile.flush()
 

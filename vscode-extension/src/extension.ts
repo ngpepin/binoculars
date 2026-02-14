@@ -140,7 +140,6 @@ function scheduleLiveEstimate(key: string): void {
   const nextEpoch = (liveEstimateEpochs.get(key) ?? 0) + 1;
   liveEstimateEpochs.set(key, nextEpoch);
   state.forecastPending = true;
-  state.forecastEstimate = undefined;
   updateStatusForEditor(editor);
   const timer = setTimeout(() => {
     void computeLiveEstimate(key, nextEpoch);
@@ -213,7 +212,6 @@ async function computeLiveEstimate(key: string, epoch: number): Promise<void> {
     const liveEditor = activeEditorForDocKey(key);
     if (liveState) {
       liveState.forecastPending = false;
-      liveState.forecastEstimate = undefined;
     }
     if (liveEditor) {
       updateStatusForEditor(liveEditor);
@@ -588,7 +586,6 @@ export function activate(context: vscode.ExtensionContext): void {
       const state = docStates.get(key);
       if (state && evt.contentChanges.length > 0) {
         state.stale = true;
-        state.forecastEstimate = undefined;
         state.forecastPending = state.chunks.length > 0;
         shiftChunkStateForContentChanges(state, evt.contentChanges, evt.document.getText().length);
         state.editedRanges = applyContentChangesToEditedRanges(state.editedRanges, evt.contentChanges);
@@ -996,9 +993,22 @@ async function runRewriteForSpan(
           end: start + selected.text.length,
         },
       ]);
+      const exactApproxB = Number(selected.approx_B ?? NaN);
+      const rewrittenText = editor.document.getText();
+      const rewrittenChunk = getActiveChunk(editor, rewrittenText, next);
+      if (rewrittenChunk && Number.isFinite(exactApproxB)) {
+        next.forecastEstimate = {
+          chunkStart: rewrittenChunk.charStart,
+          docVersion: editor.document.version,
+          b: exactApproxB,
+        };
+      }
+      next.forecastPending = true;
       applyDecorations(editor, next);
+      scheduleLiveEstimate(stateKey);
+      updateStatusForEditor(editor);
     }
-    updateStatus('Rewrite applied. Re-run Analyze for exact B score.');
+    void vscode.window.setStatusBarMessage('Binoculars rewrite applied. Analyze to confirm exact B.', 2500);
 
     const newDoc = editor.document.getText();
     const newPos = positionAt(newDoc, start + selected.text.length);
@@ -2641,31 +2651,45 @@ function updateStatusForEditor(editor: vscode.TextEditor): void {
     updateStatus('Binoculars analyzed chunk available.');
     return;
   }
-  const staleSuffix = state.stale ? ' | stale (run Analyze)' : '';
-  const estimateSuffix = (() => {
-    if (!state.stale) {
-      return '';
-    }
+  const exactB = Number(cursorChunk.metrics.binoculars_score);
+  const staleSuffix = state.stale ? ' | stale (run Analyze; estimate may differ from exact)' : '';
+  const estimateState = (() => {
     const estimate = state.forecastEstimate;
-    if (
-      estimate &&
+    const hasMatchingEstimate =
+      !!estimate &&
       estimate.chunkStart === cursorChunk.charStart &&
       estimate.docVersion === editor.document.version &&
-      Number.isFinite(estimate.b)
-    ) {
-      return ` | Est. B ${formatStatusMetric(estimate.b)} (approx)`;
+      Number.isFinite(estimate.b);
+    if (!hasMatchingEstimate) {
+      return {
+        text: '',
+        value: undefined as number | undefined,
+      };
     }
-    if (state.forecastPending) {
-      return ' | Est. B estimating...';
-    }
-    return '';
+    return {
+      text: state.forecastPending
+        ? `${formatSignedMetric(estimate.b)} (approx, updating...)`
+        : `${formatSignedMetric(estimate.b)} (approx)`,
+      value: Number(estimate.b),
+    };
   })();
+  const estimateDiffValue =
+    typeof estimateState.value === 'number' && Number.isFinite(estimateState.value) && Number.isFinite(exactB)
+      ? estimateState.value - exactB
+      : undefined;
+  const shouldShowEstimate =
+    typeof estimateDiffValue === 'number' && Number.isFinite(estimateDiffValue)
+      ? Number(estimateDiffValue.toFixed(DISPLAY_DECIMALS)) !== 0
+      : false;
+  const estimateSuffix = shouldShowEstimate
+    ? ` | B Est.: ${estimateState.text} | B Diff. Est.: ${formatSignedMetric(estimateDiffValue ?? 0)}`
+    : '';
   const priorBSuffix =
     typeof state.priorChunkB === 'number' && Number.isFinite(state.priorChunkB)
-      ? ` | Prior B ${formatStatusMetric(state.priorChunkB)}`
+      ? ` | Prior B ${formatSignedMetric(state.priorChunkB)}`
       : '';
   const moreSuffix = hasMore ? ` | Analyze Next available (line ${lineNumberFromOffset(text, covered)})` : '';
-  const metricCore = `B: ${formatStatusMetric(cursorChunk.metrics.binoculars_score)}${priorBSuffix}${estimateSuffix} | Obs: ${formatStatusMetric(cursorChunk.metrics.observer_logPPL)} | Cross: ${formatStatusMetric(cursorChunk.metrics.cross_logXPPL)}${staleSuffix}${moreSuffix}`;
+  const metricCore = `B: ${formatSignedMetric(exactB)}${priorBSuffix}${estimateSuffix} | Obs: ${formatStatusMetric(cursorChunk.metrics.observer_logPPL)} | Cross: ${formatStatusMetric(cursorChunk.metrics.cross_logXPPL)}${staleSuffix}${moreSuffix}`;
   if (orderedChunks.length > 1) {
     const chunkIndex = Math.max(1, orderedChunks.indexOf(cursorChunk) + 1);
     updateStatus(`Binoculars (chunk ${chunkIndex}): ${metricCore}`);
