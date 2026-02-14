@@ -17,6 +17,24 @@ Acknowledgment: The Binoculars paper authors - Abhimanyu Hans, Avi Schwarzschild
 
 <p align="center"> <img src="media/screenshot.png" width="900"> <br/> <em>Screenshot of the GUI</em> </p>
 
+## VS Code Extension
+
+This repository also includes a native VS Code extension in `vscode-extension/` that provides the Binoculars workflow directly inside the editor.
+
+Current extension capabilities:
+
+- Analyze current chunk and analyze next chunk.
+- Rewrite current selection/line with ranked options.
+- LOW/HIGH text overlays plus per-line contribution gutter bars.
+- One-click `Clear Priors` plus prior contributor faint backgrounds (major contributors only) after re-analysis.
+- `Toggle Colorization` to hide/show text overlays without losing analysis state.
+- Chunk-aware status bar metrics, including `Prior B` when available.
+- Sidecar persistence in `*.json` next to markdown files for restoring analysis state.
+
+Detailed extension guide:
+
+- `USERGUIDE-VC.md`
+
 ## What This Does
 
 Given input text, `binoculars` computes:
@@ -76,6 +94,8 @@ Important: This is a scoring signal, not proof of authorship.
 - `binocular.sh`: alias wrapper (`exec binoculars.sh`); `config.binoculars.json`: master profile selector (`default` and `profiles`)
 - `config.binoculars.llm.json`: optional OpenAI-compatible rewrite backend config for GUI rewrite suggestions; `config.llama31.cuda12gb.fast.json`: fast profile (currently `text.max_tokens=4096`)
 - `config.llama31.cuda12gb.long.json`: long profile (currently `text.max_tokens=12288`); `USERGUIDE-GUI.md`: detailed GUI user guide and iterative workflow guidance
+- `vscode-extension/`: VS Code extension source, manifest, bridge, and packaging assets
+- `USERGUIDE-VC.md`: detailed VS Code extension user guide
 - `background/2401.12070v3.pdf`: background paper; `samples/`: sample markdown inputs
 - `tests/test_regression_v1_1_x.py`: regression suite; `tests/fixtures/`: fixture docs used by regression tests
 

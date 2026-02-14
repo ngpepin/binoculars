@@ -2,6 +2,10 @@
 
 This directory contains a working VS Code extension front end that reuses Binoculars scoring/rewrite logic through a persistent Python bridge.
 
+For complete end-user workflows and troubleshooting, see:
+
+- `../USERGUIDE-VC.md`
+
 ## Current Scope
 
 Implemented:

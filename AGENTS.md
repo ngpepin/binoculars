@@ -21,6 +21,13 @@ Status:
 - Core scoring is stable; calibration/classification is not implemented.
 - GUI supports iterative rewrite workflows with approximate impact scoring and explicit full re-analysis.
 - GUI also supports fast synonym-assisted edits, one-level undo for tracked mutations, and transient status messaging that restores metrics automatically.
+- VS Code extension is active and featureful:
+  - chunk-aware `Analyze Chunk` / `Analyze Next Chunk`
+  - rewrite selection/line with ranked options
+  - colorization + gutter bars + hover diagnostics
+  - `Toggle Colorization` runtime command
+  - prior contributor faint backgrounds (major contributors only)
+  - sidecar state restore (`<doc>.json`)
 
 Latest known commit at time of this guide update:
 - `225b75e`
@@ -37,6 +44,11 @@ Key files:
 - `config.llama31.cuda12gb.long.json`: long profile (`text.max_tokens=12288`).
 - `README.md`: project overview and CLI/GUI reference.
 - `USERGUIDE-GUI.md`: GUI-specific interactive workflow guide.
+- `USERGUIDE-VC.md`: VS Code extension workflow guide.
+- `vscode-extension/src/extension.ts`: extension UI/decoration/command logic.
+- `vscode-extension/src/backendClient.ts`: persistent JSON bridge client.
+- `vscode-extension/python/binoculars_bridge.py`: bridge backend process adapter.
+- `vscode-extension/package.json`: command/menu/settings manifest.
 - `tests/test_regression_v1_1_x.py`: regression checks.
 - `tests/fixtures/Athens.md`: stable fixture copy for regression tests.
 - `initial-scoping.md`: technical scoping and tuning lessons.
@@ -171,6 +183,29 @@ GUI identity details:
 - Window/app name is set to `Binoculars` (including Linux WM class/appname hints).
 - GUI icon is drawn in code (owl with large eyes) via Tk `PhotoImage`.
 
+VS Code extension behavior (current):
+- Commands:
+  - `Binoculars: Analyze Chunk`
+  - `Binoculars: Analyze Next Chunk`
+  - `Binoculars: Rewrite Selection`
+  - `Binoculars: Clear Priors`
+  - `Binoculars: Toggle Colorization`
+  - `Binoculars: Restart Backend`
+- Color model:
+  - Major LOW/HIGH contributors are colorized.
+  - Minor contributors are rendered neutral (`light gray` in dark theme, `black` in light theme).
+  - Gutter bars remain available independently of text colorization.
+- Prior overlays:
+  - After re-analysis, prior contributor overlays are captured as faint backgrounds.
+  - Prior overlays are restricted to prior major contributors (top-`k` LOW/HIGH), not minor rows.
+  - `Clear Priors` clears prior overlays without deleting current analysis state.
+- Toggle colorization:
+  - `Toggle Colorization` hides/shows text overlays at runtime.
+  - Re-enabling restores overlays from in-memory state (including prior/edited backgrounds when present).
+- Persistence:
+  - Sidecar save/load includes chunk state, edited ranges, rewrite ranges, and prior overlay ranges.
+  - `priorChunkB` remains in-session and is intentionally not restored from persisted state.
+
 ## 8) Lessons Learned / Gotchas
 
 1. Full-logit requirement is non-negotiable for faithful Binoculars.
@@ -291,3 +326,82 @@ Not currently in scope:
 - Definitive authorship claims.
 - Remote API-only detector approximations for scoring core.
 - Production web service deployment.
+
+## 13) VS Code Marketplace Roadmap
+
+Goal:
+- Publish `vscode-extension` to the VS Code Marketplace in a way that non-technical users can install and run it successfully.
+
+### 13.1) Publishing Prerequisites
+
+1. Publisher setup:
+- Create/verify Azure DevOps publisher identity for Marketplace.
+- Generate Personal Access Token (PAT) with Marketplace publish permissions.
+- Add secure local/CI publishing flow (`vsce publish` or GitHub Action).
+
+2. Manifest hardening (`vscode-extension/package.json`):
+- Add `repository` field (currently missing warning during packaging).
+- Keep `displayName`, `description`, `categories`, icon, and command titles user-friendly.
+- Ensure license path is valid for packaged extension.
+
+3. Release hygiene:
+- Add `CHANGELOG.md`.
+- Define semantic versioning and release notes process.
+- Add automated prepublish checks (`npm run compile`, smoke checks).
+
+### 13.2) Installation Friction Assessment (Config Streamlining)
+
+Short answer:
+- Yes, streamlining is likely needed for broad adoption.
+- For expert users, current explicit paths can work; for general users, manual path/model setup is too error-prone.
+
+Why:
+- Current defaults point to machine-specific absolute paths.
+- Users must have Python, dependencies, config JSON, and GGUF model paths aligned.
+- Without guided setup, first-run failure rate will be high outside the current dev environment.
+
+### 13.3) Accessibility Roadmap (Broader Audience)
+
+Phase 1 (minimum for Marketplace launch):
+1. Replace machine-specific defaults with portable defaults:
+- Use `${workspaceFolder}` where appropriate.
+- Leave optional paths empty when unknown and detect at runtime.
+
+2. Add first-run preflight + guided setup command:
+- Validate Python executable, bridge script, config file, model files.
+- Show actionable one-click fixes/open-settings shortcuts.
+- Persist discovered valid paths automatically.
+
+3. Improve error UX:
+- Human-readable diagnostics in notifications and output channel.
+- Clear distinction between missing dependency, missing model, bad config, and backend startup failure.
+
+Phase 2 (recommended post-launch):
+1. Setup wizard:
+- Multi-step onboarding UI for selecting profile/config/models.
+- “Test backend” button before first analyze.
+
+2. Optional quickstart profile:
+- Ship a template config and docs that minimize manual edits.
+- Provide explicit “local-only” and “external rewrite backend” setup paths.
+
+3. Telemetry-free health metrics (local only):
+- Count setup failures in session and surface targeted help (no remote telemetry required).
+
+Phase 3 (best usability):
+1. Dependency/bootstrap helper:
+- Command to create/check venv and install Python dependencies.
+- Optional model path validator/downloader integration (if licensing/distribution allows).
+
+2. Cross-platform QA matrix:
+- Linux/macOS/Windows first-run validation with clean machines.
+
+### 13.4) Acceptance Criteria Before Public Marketplace Push
+
+1. Fresh-machine install succeeds with guided steps (no code edits required).
+2. User can run first `Analyze Chunk` within a short onboarding flow.
+3. Common failures provide direct remediation links/commands.
+4. Documentation is aligned:
+- Root `README.md`
+- `vscode-extension/README.md`
+- `USERGUIDE-VC.md`
