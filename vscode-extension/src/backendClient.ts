@@ -1,54 +1,36 @@
 import * as cp from 'node:child_process';
+import * as fs from 'node:fs';
+import * as net from 'node:net';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import * as readline from 'node:readline';
 import * as vscode from 'vscode';
 import { AnalyzeResult, BridgeRequest, BridgeResponse, RewriteResult } from './types';
 
 export class BackendClient implements vscode.Disposable {
-  private proc: cp.ChildProcessWithoutNullStreams | undefined;
+  private socket: net.Socket | undefined;
   private rl: readline.Interface | undefined;
   private requestSeq = 1;
   private pending = new Map<number, { resolve: (value: unknown) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }>();
   private readonly output: vscode.OutputChannel;
   private readyResolver: (() => void) | undefined;
   private readyRejecter: ((err: Error) => void) | undefined;
+  private readySeen = false;
   private startPromise: Promise<void> | undefined;
+  private socketPath = '';
 
   constructor(output: vscode.OutputChannel) {
     this.output = output;
   }
 
   public async start(pythonPath: string, bridgeScriptPath: string): Promise<void> {
-    if (this.proc) {
+    if (this.socket && !this.socket.destroyed) {
       return;
     }
     if (this.startPromise) {
       return this.startPromise;
     }
-
-    this.proc = cp.spawn(pythonPath, [bridgeScriptPath], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
-      env: process.env,
-    });
-
-    this.proc.stderr.on('data', (buf: Buffer) => {
-      this.output.appendLine(`[bridge:stderr] ${buf.toString('utf8').trimEnd()}`);
-    });
-
-    this.proc.on('exit', (code, signal) => {
-      this.output.appendLine(`Binoculars bridge exited (code=${code}, signal=${signal ?? 'none'})`);
-      this.cleanupPending(new Error('Binoculars bridge terminated.'));
-      this.readyRejecter?.(new Error('Binoculars bridge terminated before ready.'));
-      this.proc = undefined;
-      this.rl?.close();
-      this.rl = undefined;
-      this.startPromise = undefined;
-    });
-
-    this.rl = readline.createInterface({ input: this.proc.stdout });
-    this.rl.on('line', (line: string) => this.onLine(line));
-
-    this.startPromise = this.waitForReady();
+    this.startPromise = this.startInternal(pythonPath, bridgeScriptPath);
     return this.startPromise;
   }
 
@@ -111,7 +93,8 @@ export class BackendClient implements vscode.Disposable {
   }
 
   public async shutdown(): Promise<void> {
-    if (!this.proc) {
+    if (!this.socket || this.socket.destroyed) {
+      this.cleanupConnectionState();
       return;
     }
     try {
@@ -119,11 +102,160 @@ export class BackendClient implements vscode.Disposable {
     } catch {
       // ignore
     }
-    this.proc.kill();
+    this.socket.end();
+    this.socket.destroy();
+    this.cleanupConnectionState();
+  }
+
+  public async shutdownDaemon(): Promise<void> {
+    if (this.socket && !this.socket.destroyed) {
+      try {
+        await this.request('shutdown_daemon', {}, 3000);
+      } catch {
+        // ignore
+      }
+      this.socket.end();
+      this.socket.destroy();
+      this.cleanupConnectionState();
+      return;
+    }
+
+    const socketPath = this.socketPath || BackendClient.defaultSocketPath();
+    const tmp = new net.Socket();
+    await new Promise<void>((resolve, reject) => {
+      let done = false;
+      const finish = (err?: Error) => {
+        if (done) {
+          return;
+        }
+        done = true;
+        clearTimeout(timer);
+        tmp.removeAllListeners();
+        if (err) {
+          reject(err);
+        } else {
+          resolve();
+        }
+      };
+      const timer = setTimeout(() => finish(new Error('Timed out connecting to Binoculars daemon.')), 1200);
+      tmp.once('error', (err) => finish(err as Error));
+      tmp.connect(socketPath, () => {
+        const req: BridgeRequest = { id: 1, method: 'shutdown_daemon', params: {} };
+        tmp.write(JSON.stringify(req) + '\n', 'utf8', () => {
+          tmp.end();
+          finish();
+        });
+      });
+    }).catch(() => undefined);
   }
 
   public dispose(): void {
     void this.shutdown();
+  }
+
+  private async startInternal(pythonPath: string, bridgeScriptPath: string): Promise<void> {
+    const socketPath = BackendClient.defaultSocketPath();
+    this.socketPath = socketPath;
+
+    const connected = await this.tryConnect(socketPath, 1200);
+    if (!connected) {
+      this.spawnDaemonProcess(pythonPath, bridgeScriptPath, socketPath);
+      const ready = await this.waitForDaemon(socketPath, 12000);
+      if (!ready) {
+        this.startPromise = undefined;
+        throw new Error(`Timed out waiting for Binoculars daemon socket at ${socketPath}`);
+      }
+      const retryConnected = await this.tryConnect(socketPath, 1500);
+      if (!retryConnected) {
+        this.startPromise = undefined;
+        throw new Error(`Unable to connect to Binoculars daemon at ${socketPath}`);
+      }
+    }
+
+    await this.waitForReady();
+  }
+
+  private static defaultSocketPath(): string {
+    const uid = typeof process.getuid === 'function' ? String(process.getuid()) : String(process.env.USER ?? 'user');
+    return path.join(os.tmpdir(), `binoculars-vscode-${uid}.sock`);
+  }
+
+  private spawnDaemonProcess(pythonPath: string, bridgeScriptPath: string, socketPath: string): void {
+    try {
+      const socketDir = path.dirname(socketPath);
+      fs.mkdirSync(socketDir, { recursive: true });
+    } catch {
+      // ignore; python side will fail with actionable error if unusable
+    }
+
+    const child = cp.spawn(pythonPath, [bridgeScriptPath, '--daemon', '--socket-path', socketPath], {
+      stdio: 'ignore',
+      detached: true,
+      cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+      env: process.env,
+    });
+    child.unref();
+  }
+
+  private async waitForDaemon(socketPath: string, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (fs.existsSync(socketPath)) {
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return fs.existsSync(socketPath);
+  }
+
+  private async tryConnect(socketPath: string, timeoutMs: number): Promise<boolean> {
+    this.cleanupConnectionState();
+    this.readySeen = false;
+
+    return new Promise<boolean>((resolve) => {
+      const sock = net.createConnection(socketPath);
+      let settled = false;
+      const finish = (ok: boolean) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        sock.removeAllListeners('error');
+        sock.removeAllListeners('connect');
+        resolve(ok);
+      };
+      const timer = setTimeout(() => {
+        sock.destroy();
+        finish(false);
+      }, timeoutMs);
+
+      sock.once('error', () => {
+        sock.destroy();
+        finish(false);
+      });
+
+      sock.once('connect', () => {
+        this.attachSocket(sock);
+        finish(true);
+      });
+    });
+  }
+
+  private attachSocket(sock: net.Socket): void {
+    this.socket = sock;
+    this.rl = readline.createInterface({ input: sock });
+    this.rl.on('line', (line: string) => this.onLine(line));
+    sock.on('close', () => {
+      this.output.appendLine('Binoculars daemon connection closed.');
+      this.cleanupPending(new Error('Binoculars daemon connection closed.'));
+      this.cleanupConnectionState();
+    });
+    sock.on('error', (err) => {
+      this.output.appendLine(`Binoculars daemon socket error: ${(err as Error).message}`);
+      this.cleanupPending(new Error('Binoculars daemon socket error.'));
+      this.cleanupConnectionState();
+    });
   }
 
   private onLine(line: string): void {
@@ -142,14 +274,13 @@ export class BackendClient implements vscode.Disposable {
 
     if (msg.event) {
       if (msg.event === 'ready') {
+        this.readySeen = true;
         this.readyResolver?.();
         this.readyResolver = undefined;
         this.readyRejecter = undefined;
         return;
       }
-      if (msg.event !== 'ready') {
-        this.output.appendLine(`[bridge:event:${msg.event}] ${JSON.stringify(msg.payload ?? {})}`);
-      }
+      this.output.appendLine(`[bridge:event:${msg.event}] ${JSON.stringify(msg.payload ?? {})}`);
       return;
     }
 
@@ -174,6 +305,9 @@ export class BackendClient implements vscode.Disposable {
   }
 
   private waitForReady(timeoutMs = 10000): Promise<void> {
+    if (this.readySeen) {
+      return Promise.resolve();
+    }
     return new Promise((resolve, reject) => {
       this.readyResolver = resolve;
       this.readyRejecter = reject;
@@ -181,15 +315,15 @@ export class BackendClient implements vscode.Disposable {
         if (this.readyResolver) {
           this.readyResolver = undefined;
           this.readyRejecter = undefined;
-          reject(new Error('Timed out waiting for bridge ready event.'));
+          reject(new Error('Timed out waiting for daemon ready event.'));
         }
       }, timeoutMs);
     });
   }
 
   private request<T = unknown>(method: string, params: Record<string, unknown>, timeoutMs = 180000): Promise<T> {
-    if (!this.proc) {
-      return Promise.reject(new Error('Bridge is not started.'));
+    if (!this.socket || this.socket.destroyed) {
+      return Promise.reject(new Error('Binoculars daemon is not connected.'));
     }
 
     const id = this.requestSeq++;
@@ -202,7 +336,7 @@ export class BackendClient implements vscode.Disposable {
       }, timeoutMs);
       this.pending.set(id, { resolve: (v) => resolve(v as T), reject, timer });
 
-      this.proc?.stdin.write(JSON.stringify(req) + '\n', 'utf8', (err) => {
+      this.socket?.write(JSON.stringify(req) + '\n', 'utf8', (err) => {
         if (err) {
           clearTimeout(timer);
           this.pending.delete(id);
@@ -210,6 +344,16 @@ export class BackendClient implements vscode.Disposable {
         }
       });
     });
+  }
+
+  private cleanupConnectionState(): void {
+    this.rl?.close();
+    this.rl = undefined;
+    this.socket = undefined;
+    this.startPromise = undefined;
+    this.readyResolver = undefined;
+    this.readyRejecter = undefined;
+    this.readySeen = false;
   }
 
   private cleanupPending(err: Error): void {

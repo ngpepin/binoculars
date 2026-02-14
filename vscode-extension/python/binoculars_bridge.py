@@ -7,11 +7,14 @@ Each request must include: {"id": ..., "method": "...", "params": {...}}
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
+import socketserver
 import sys
 import tempfile
+import threading
 import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -454,6 +457,113 @@ def _handle_request(state: BridgeState, request: Dict[str, Any]) -> Tuple[Dict[s
     return _err(request_id, f"Unknown method: {method}", "unknown_method"), False
 
 
+class _ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, server_address: str, request_handler_cls: type[socketserver.BaseRequestHandler]):
+        super().__init__(server_address, request_handler_cls)
+        self.request_lock = threading.Lock()
+
+
+class _DaemonRequestHandler(socketserver.StreamRequestHandler):
+    def setup(self) -> None:
+        super().setup()
+        self.state = BridgeState()
+        self._send(
+            {
+                "event": "ready",
+                "payload": {
+                    "root_dir": ROOT_DIR,
+                },
+            }
+        )
+
+    def _send(self, msg: Dict[str, Any]) -> None:
+        payload = (json.dumps(msg, ensure_ascii=True) + "\n").encode("utf-8")
+        self.wfile.write(payload)
+        self.wfile.flush()
+
+    def handle(self) -> None:
+        while True:
+            raw = self.rfile.readline()
+            if not raw:
+                return
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+                if not isinstance(req, dict):
+                    self._send(_err(None, "Request must be a JSON object", "invalid_request"))
+                    continue
+            except Exception as exc:
+                self._send(_err(None, f"Invalid JSON: {exc}", "invalid_json"))
+                continue
+
+            method = str(req.get("method", "")).strip()
+            if method == "shutdown_daemon":
+                self._send({"id": req.get("id"), "result": {"ok": True}})
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                return
+
+            try:
+                with self.server.request_lock:  # type: ignore[attr-defined]
+                    response, should_exit = _handle_request(self.state, req)
+                self._send(response)
+                if should_exit:
+                    return
+            except Exception as exc:
+                self._send(
+                    _err(
+                        req.get("id"),
+                        f"Unhandled bridge error: {exc}",
+                        "unhandled_exception",
+                        {
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+                )
+
+    def finish(self) -> None:
+        try:
+            _cleanup_runtime_cfg(self.state)
+        except Exception:
+            pass
+        super().finish()
+
+
+def daemon_main(socket_path: str) -> int:
+    if not socket_path:
+        raise ValueError("socket_path is required in daemon mode.")
+
+    socket_path = os.path.abspath(socket_path)
+    socket_dir = os.path.dirname(socket_path) or "."
+    os.makedirs(socket_dir, exist_ok=True)
+
+    if os.path.exists(socket_path):
+        try:
+            os.unlink(socket_path)
+        except Exception as exc:
+            raise RuntimeError(f"Unable to remove stale socket path: {socket_path}: {exc}") from exc
+
+    server = _ThreadingUnixServer(socket_path, _DaemonRequestHandler)
+    try:
+        try:
+            os.chmod(socket_path, 0o600)
+        except Exception:
+            pass
+        server.serve_forever(poll_interval=0.2)
+    finally:
+        server.server_close()
+        try:
+            if os.path.exists(socket_path):
+                os.unlink(socket_path)
+        except Exception:
+            pass
+    return 0
+
+
 def main() -> int:
     state = BridgeState()
     _send({"event": "ready", "payload": {"root_dir": ROOT_DIR}})
@@ -495,4 +605,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--daemon", action="store_true", help="Run as shared Unix-socket daemon.")
+    parser.add_argument("--socket-path", default="", help="Unix socket path for daemon mode.")
+    args = parser.parse_args()
+    if args.daemon:
+        raise SystemExit(daemon_main(str(args.socket_path or "").strip()))
     raise SystemExit(main())

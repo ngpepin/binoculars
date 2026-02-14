@@ -13,6 +13,8 @@
   ],
   "activationEvents": [
     "onView:binoculars.controlsView",
+    "onCommand:binoculars.enable",
+    "onCommand:binoculars.disable",
     "onCommand:binoculars.analyze",
     "onCommand:binoculars.analyzeNext",
     "onCommand:binoculars.rewriteSelection",
@@ -43,6 +45,14 @@
       ]
     },
     "commands": [
+      {
+        "command": "binoculars.enable",
+        "title": "Binoculars: Enable"
+      },
+      {
+        "command": "binoculars.disable",
+        "title": "Binoculars: Disable"
+      },
       {
         "command": "binoculars.analyze",
         "title": "Binoculars: Analyze Chunk"
@@ -80,94 +90,155 @@
       {
         "command": "binoculars.analyze",
         "key": "ctrl+alt+b",
-        "when": "editorTextFocus"
+        "when": "editorTextFocus && config.binoculars.enabled"
       },
       {
         "command": "binoculars.analyzeNext",
         "key": "ctrl+alt+n",
-        "when": "editorTextFocus"
+        "when": "editorTextFocus && config.binoculars.enabled"
       },
       {
         "command": "binoculars.rewriteSelectionOrLine",
         "key": "ctrl+alt+r",
-        "when": "editorTextFocus"
+        "when": "editorTextFocus && config.binoculars.enabled"
       },
       {
         "command": "binoculars.clearPriors",
         "key": "ctrl+alt+c",
-        "when": "editorTextFocus"
+        "when": "editorTextFocus && config.binoculars.enabled"
       }
     ],
     "menus": {
       "view/title": [
         {
+          "command": "binoculars.enable",
+          "when": "view == binoculars.controlsView && !config.binoculars.enabled",
+          "group": "navigation@0"
+        },
+        {
+          "command": "binoculars.disable",
+          "when": "view == binoculars.controlsView && config.binoculars.enabled",
+          "group": "navigation@0"
+        },
+        {
           "command": "binoculars.analyze",
-          "when": "view == binoculars.controlsView",
+          "when": "view == binoculars.controlsView && config.binoculars.enabled",
           "group": "navigation@1"
         },
         {
           "command": "binoculars.analyzeNext",
-          "when": "view == binoculars.controlsView",
+          "when": "view == binoculars.controlsView && config.binoculars.enabled",
           "group": "navigation@2"
         },
         {
           "command": "binoculars.rewriteSelectionOrLine",
-          "when": "view == binoculars.controlsView",
+          "when": "view == binoculars.controlsView && config.binoculars.enabled",
           "group": "navigation@3"
         },
         {
           "command": "binoculars.clearPriors",
-          "when": "view == binoculars.controlsView",
+          "when": "view == binoculars.controlsView && config.binoculars.enabled",
           "group": "navigation@4"
         },
         {
           "command": "binoculars.toggleColorization",
-          "when": "view == binoculars.controlsView",
+          "when": "view == binoculars.controlsView && config.binoculars.enabled",
           "group": "navigation@5"
         },
         {
           "command": "binoculars.restartBackend",
-          "when": "view == binoculars.controlsView",
+          "when": "view == binoculars.controlsView && config.binoculars.enabled",
           "group": "navigation@6"
         }
       ],
       "editor/context": [
         {
+          "command": "binoculars.enable",
+          "when": "editorTextFocus && !config.binoculars.enabled",
+          "group": "2_binoculars@0"
+        },
+        {
+          "command": "binoculars.disable",
+          "when": "editorTextFocus && config.binoculars.enabled",
+          "group": "2_binoculars@0"
+        },
+        {
           "command": "binoculars.analyze",
-          "when": "editorTextFocus",
+          "when": "editorTextFocus && config.binoculars.enabled",
           "group": "2_binoculars@1"
         },
         {
           "command": "binoculars.analyzeNext",
-          "when": "editorTextFocus",
+          "when": "editorTextFocus && config.binoculars.enabled",
           "group": "2_binoculars@2"
         },
         {
           "command": "binoculars.rewriteSelectionOrLine",
-          "when": "editorTextFocus",
+          "when": "editorTextFocus && config.binoculars.enabled",
           "group": "2_binoculars@3"
         },
         {
           "command": "binoculars.clearPriors",
-          "when": "editorTextFocus",
+          "when": "editorTextFocus && config.binoculars.enabled",
           "group": "2_binoculars@4"
         },
         {
           "command": "binoculars.toggleColorization",
-          "when": "editorTextFocus",
+          "when": "editorTextFocus && config.binoculars.enabled",
           "group": "2_binoculars@5"
         }
       ],
       "commandPalette": [
         {
+          "command": "binoculars.analyze",
+          "when": "config.binoculars.enabled"
+        },
+        {
+          "command": "binoculars.analyzeNext",
+          "when": "config.binoculars.enabled"
+        },
+        {
+          "command": "binoculars.rewriteSelection",
+          "when": "config.binoculars.enabled"
+        },
+        {
+          "command": "binoculars.rewriteSelectionOrLine",
+          "when": "config.binoculars.enabled"
+        },
+        {
           "command": "binoculars.recommendRewrite",
-          "when": "editorIsOpen"
+          "when": "editorIsOpen && config.binoculars.enabled"
+        },
+        {
+          "command": "binoculars.clearPriors",
+          "when": "config.binoculars.enabled"
+        },
+        {
+          "command": "binoculars.toggleColorization",
+          "when": "config.binoculars.enabled"
+        },
+        {
+          "command": "binoculars.restartBackend",
+          "when": "config.binoculars.enabled"
+        },
+        {
+          "command": "binoculars.enable",
+          "when": "!config.binoculars.enabled"
+        },
+        {
+          "command": "binoculars.disable",
+          "when": "config.binoculars.enabled"
         }
       ]
     },
     "configuration": {
       "title": "Binoculars",
       "properties": {
+        "binoculars.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable/disable Binoculars commands and backend globally across VS Code windows."
+        },
         "binoculars.backend.pythonPath": {
           "type": "string",
           "default": "/home/npepin/Projects/binoculars/venv/bin/python",

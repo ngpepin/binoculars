@@ -64,11 +64,28 @@ let backend: BackendClient | undefined;
 let backendStarted = false;
 let statusBar: vscode.StatusBarItem;
 let output: vscode.OutputChannel;
-let lastStatusMessage = 'Ready. Run Binoculars: Analyze Chunk.';
+let lastStatusMessage = 'Binoculars Ready. Select Analyze Chunk to begin.';
 let controlsProvider: BinocularsControlsProvider | undefined;
 let renderPalette: RenderPalette;
 let extensionCtx: vscode.ExtensionContext;
 let runtimeColorizationEnabled = true;
+
+function isExtensionEnabled(): boolean {
+  const cfg = vscode.workspace.getConfiguration('binoculars');
+  return cfg.get<boolean>('enabled', true);
+}
+
+async function setEnablementContext(enabled: boolean): Promise<void> {
+  await vscode.commands.executeCommand('setContext', 'binoculars:isEnabled', enabled);
+}
+
+function ensureEnabledOrNotify(): boolean {
+  if (isExtensionEnabled()) {
+    return true;
+  }
+  void vscode.window.showInformationMessage('Binoculars is disabled. Run "Binoculars: Enable" to re-enable.');
+  return false;
+}
 
 function resolveRenderPalette(): RenderPalette {
   // Dark-first palette. Light-mode palette remains intentionally conservative
@@ -170,6 +187,15 @@ class BinocularsControlsProvider implements vscode.TreeDataProvider<BinocularsCo
   }
 
   getChildren(_element?: BinocularsControlItem): Thenable<BinocularsControlItem[]> {
+    if (!isExtensionEnabled()) {
+      return Promise.resolve([
+        new BinocularsControlItem('Enable', {
+          commandId: 'binoculars.enable',
+          icon: new vscode.ThemeIcon('play'),
+        }),
+      ]);
+    }
+
     const editor = vscode.window.activeTextEditor;
     const key = editor?.document.uri.toString() ?? '';
     const state = key ? docStates.get(key) : undefined;
@@ -207,6 +233,10 @@ class BinocularsControlsProvider implements vscode.TreeDataProvider<BinocularsCo
         commandId: 'binoculars.toggleColorization',
         icon: new vscode.ThemeIcon('symbol-color'),
         description: runtimeColorizationEnabled ? 'on' : 'off',
+      }),
+      new BinocularsControlItem('Disable', {
+        commandId: 'binoculars.disable',
+        icon: new vscode.ThemeIcon('debug-stop'),
       }),
       new BinocularsControlItem('Restart Backend', {
         commandId: 'binoculars.restartBackend',
@@ -275,7 +305,6 @@ export function activate(context: vscode.ExtensionContext): void {
   output = vscode.window.createOutputChannel('Binoculars');
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   statusBar.name = 'Binoculars';
-  statusBar.show();
   renderPalette = resolveRenderPalette();
   gutterPalette = new GutterPalette(renderPalette.lowColor, renderPalette.highColor);
   controlsProvider = new BinocularsControlsProvider();
@@ -292,6 +321,8 @@ export function activate(context: vscode.ExtensionContext): void {
     priorHighDecoration,
     unscoredDecoration,
     editedDecoration,
+    vscode.commands.registerCommand('binoculars.enable', () => void enableExtension()),
+    vscode.commands.registerCommand('binoculars.disable', () => void disableExtension()),
     vscode.commands.registerCommand('binoculars.analyze', () => void runAnalyze()),
     vscode.commands.registerCommand('binoculars.analyzeNext', () => void runAnalyzeNext()),
     vscode.commands.registerCommand('binoculars.rewriteSelection', () => void runRewriteSelection()),
@@ -303,6 +334,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.registerTreeDataProvider('binoculars.controlsView', controlsProvider),
     vscode.languages.registerHoverProvider([{ language: 'markdown' }, { language: 'plaintext' }], {
       provideHover(document, position, token) {
+        if (!isExtensionEnabled()) {
+          return undefined;
+        }
         const decision = hoverForPosition(document, position);
         if (!decision) {
           return undefined;
@@ -333,9 +367,17 @@ export function activate(context: vscode.ExtensionContext): void {
         });
       },
     }),
-    vscode.window.onDidChangeTextEditorSelection((evt) => updateStatusForEditor(evt.textEditor)),
+    vscode.window.onDidChangeTextEditorSelection((evt) => {
+      if (isExtensionEnabled()) {
+        updateStatusForEditor(evt.textEditor);
+      }
+    }),
     vscode.window.onDidChangeActiveTextEditor((editor) => {
       if (editor) {
+        if (!isExtensionEnabled()) {
+          clearAllDecorations(editor);
+          return;
+        }
         maybeLoadStateSidecar(editor.document, 'activate');
         maybeRestoreStateFromRecentClosed(editor.document, 'activate');
         const state = docStates.get(editor.document.uri.toString());
@@ -346,10 +388,15 @@ export function activate(context: vscode.ExtensionContext): void {
         }
         updateStatusForEditor(editor);
       } else {
-        updateStatus('Ready. Run Binoculars: Analyze Chunk.');
+        if (isExtensionEnabled()) {
+          updateStatus('Binoculars Ready. Select Analyze Chunk to begin.');
+        }
       }
     }),
     vscode.workspace.onDidOpenTextDocument((doc) => {
+      if (!isExtensionEnabled()) {
+        return;
+      }
       maybeLoadStateSidecar(doc, 'open');
       maybeRestoreStateFromRecentClosed(doc, 'open');
     }),
@@ -364,14 +411,24 @@ export function activate(context: vscode.ExtensionContext): void {
       controlsProvider?.refresh();
     }),
     vscode.workspace.onDidSaveTextDocument((doc) => {
+      if (!isExtensionEnabled()) {
+        return;
+      }
       autoSaveStateSidecar(doc);
     }),
     vscode.workspace.onDidChangeConfiguration((evt) => {
-      if (evt.affectsConfiguration('binoculars')) {
+      if (evt.affectsConfiguration('binoculars.enabled')) {
+        void applyEnablementMode();
+        return;
+      }
+      if (evt.affectsConfiguration('binoculars') && isExtensionEnabled()) {
         void restartBackend();
       }
     }),
     vscode.workspace.onDidChangeTextDocument((evt) => {
+      if (!isExtensionEnabled()) {
+        return;
+      }
       const key = evt.document.uri.toString();
       const state = docStates.get(key);
       if (state && evt.contentChanges.length > 0) {
@@ -398,30 +455,17 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
-  for (const doc of vscode.workspace.textDocuments) {
-    maybeLoadStateSidecar(doc, 'activate');
-  }
-  if (vscode.window.activeTextEditor) {
-    const active = vscode.window.activeTextEditor;
-    const state = docStates.get(active.document.uri.toString());
-    if (state) {
-      applyDecorations(active, state);
-    } else {
-      clearAllDecorations(active);
-    }
-    updateStatusForEditor(active);
-  } else {
-    updateStatus('Ready. Run Binoculars: Analyze Chunk.');
-  }
+  void applyEnablementMode();
 }
 
 export async function deactivate(): Promise<void> {
-  await backend?.shutdown();
-  backend = undefined;
-  backendStarted = false;
+  await stopBackend();
 }
 
 async function runAnalyze(): Promise<void> {
+  if (!ensureEnabledOrNotify()) {
+    return;
+  }
   const editor = vscode.window.activeTextEditor;
   if (!editor) {
     return;
@@ -459,6 +503,9 @@ async function runAnalyze(): Promise<void> {
 }
 
 async function runAnalyzeNext(): Promise<void> {
+  if (!ensureEnabledOrNotify()) {
+    return;
+  }
   const editor = vscode.window.activeTextEditor;
   if (!editor) {
     return;
@@ -478,12 +525,13 @@ async function runAnalyzeNext(): Promise<void> {
     return;
   }
 
-  updateStatus(`Analyzing next chunk from char ${start}...`);
+  const startLine = lineNumberFromOffset(fullText, start);
+  updateStatus(`Analyzing next chunk from line ${startLine}...`);
 
   try {
     const result = await runWithBusyQuickPick(
       'Binoculars: Analyze Next Chunk',
-      `Analyzing next chunk from char ${start}...`,
+      `Analyzing next chunk from line ${startLine}...`,
       async () => {
         const client = await ensureBackend();
         return await client.analyzeNextChunk(fullText, inputLabel(editor.document), start);
@@ -525,6 +573,9 @@ async function runWithBusyQuickPick<T>(title: string, placeholder: string, actio
 }
 
 async function runRewriteSelection(): Promise<void> {
+  if (!ensureEnabledOrNotify()) {
+    return;
+  }
   const editor = vscode.window.activeTextEditor;
   if (!editor) {
     return;
@@ -548,6 +599,9 @@ async function runRewriteSelection(): Promise<void> {
 }
 
 async function runRewriteSelectionOrLine(): Promise<void> {
+  if (!ensureEnabledOrNotify()) {
+    return;
+  }
   const editor = vscode.window.activeTextEditor;
   if (!editor) {
     return;
@@ -723,6 +777,9 @@ async function pickRewriteOptionWithWebview(source: string, options: RewriteOpti
 }
 
 function clearPriors(): void {
+  if (!ensureEnabledOrNotify()) {
+    return;
+  }
   const editor = vscode.window.activeTextEditor;
   if (!editor) {
     return;
@@ -739,6 +796,9 @@ function clearPriors(): void {
 }
 
 function toggleColorization(): void {
+  if (!ensureEnabledOrNotify()) {
+    return;
+  }
   runtimeColorizationEnabled = !runtimeColorizationEnabled;
   for (const editor of vscode.window.visibleTextEditors) {
     const state = docStates.get(editor.document.uri.toString());
@@ -758,12 +818,29 @@ function toggleColorization(): void {
 }
 
 function isTextOverlayColorizationEnabled(): boolean {
+  if (!isExtensionEnabled()) {
+    return false;
+  }
   const cfg = vscode.workspace.getConfiguration('binoculars');
   const configured = cfg.get<boolean>('render.colorizeText', true);
   return configured && runtimeColorizationEnabled;
 }
 
-async function restartBackend(): Promise<void> {
+async function stopBackend(opts?: { shutdownDaemon?: boolean }): Promise<void> {
+  const shutdownDaemon = opts?.shutdownDaemon === true;
+  if (shutdownDaemon) {
+    try {
+      if (backend) {
+        await backend.shutdownDaemon();
+      } else {
+        const probe = new BackendClient(output);
+        await probe.shutdownDaemon();
+        probe.dispose();
+      }
+    } catch {
+      // ignore
+    }
+  }
   try {
     await backend?.shutdown();
   } catch {
@@ -771,11 +848,71 @@ async function restartBackend(): Promise<void> {
   }
   backend = undefined;
   backendStarted = false;
+}
+
+async function enableExtension(): Promise<void> {
+  const cfg = vscode.workspace.getConfiguration('binoculars');
+  await cfg.update('enabled', true, vscode.ConfigurationTarget.Global);
+}
+
+async function disableExtension(): Promise<void> {
+  const cfg = vscode.workspace.getConfiguration('binoculars');
+  await cfg.update('enabled', false, vscode.ConfigurationTarget.Global);
+}
+
+async function applyEnablementMode(): Promise<void> {
+  const enabled = isExtensionEnabled();
+  await setEnablementContext(enabled);
+  if (!enabled) {
+    await stopBackend({ shutdownDaemon: true });
+    docStates.clear();
+    loadedSidecarSignatures.clear();
+    recentClosedStatesByTextHash.clear();
+    recentClosedHashByDocKey.clear();
+    for (const editor of vscode.window.visibleTextEditors) {
+      clearAllDecorations(editor);
+    }
+    statusBar.hide();
+    lastStatusMessage = 'Binoculars disabled.';
+    controlsProvider?.refresh();
+    return;
+  }
+
+  for (const doc of vscode.workspace.textDocuments) {
+    maybeLoadStateSidecar(doc, 'activate');
+    maybeRestoreStateFromRecentClosed(doc, 'activate');
+  }
+  for (const editor of vscode.window.visibleTextEditors) {
+    const state = docStates.get(editor.document.uri.toString());
+    if (state) {
+      applyDecorations(editor, state);
+    } else {
+      clearAllDecorations(editor);
+    }
+  }
+  statusBar.show();
+  if (vscode.window.activeTextEditor) {
+    updateStatusForEditor(vscode.window.activeTextEditor);
+  } else {
+    updateStatus('Binoculars Ready. Select Analyze Chunk to begin.');
+  }
+  controlsProvider?.refresh();
+}
+
+async function restartBackend(): Promise<void> {
+  if (!isExtensionEnabled()) {
+    await stopBackend({ shutdownDaemon: true });
+    return;
+  }
+  await stopBackend({ shutdownDaemon: true });
   await ensureBackend();
   updateStatus('Binoculars backend restarted.');
 }
 
 async function ensureBackend(): Promise<BackendClient> {
+  if (!isExtensionEnabled()) {
+    throw new Error('Binoculars is disabled. Run "Binoculars: Enable" to re-enable.');
+  }
   if (!backend) {
     backend = new BackendClient(output);
   }
@@ -794,10 +931,8 @@ async function ensureBackend(): Promise<BackendClient> {
     throw new Error('Backend client unavailable.');
   }
 
-  if (!backendStarted) {
-    await backend.start(pythonPath, bridgeScriptPath);
-    backendStarted = true;
-  }
+  await backend.start(pythonPath, bridgeScriptPath);
+  backendStarted = true;
 
   await backend.initialize(
     configPath,
@@ -1855,6 +1990,9 @@ function applyPriorDecorations(editor: vscode.TextEditor, state: DocumentState):
 
 function applyDecorations(editor: vscode.TextEditor, state: DocumentState): void {
   clearAllDecorations(editor);
+  if (!isExtensionEnabled()) {
+    return;
+  }
 
   const cfg = vscode.workspace.getConfiguration('binoculars');
   const enableColorize = isTextOverlayColorizationEnabled();
@@ -2167,15 +2305,50 @@ function hoverForPosition(document: vscode.TextDocument, position: vscode.Positi
 }
 
 function updateStatusForEditor(editor: vscode.TextEditor): void {
+  if (!isExtensionEnabled()) {
+    return;
+  }
   const key = editor.document.uri.toString();
   const state = docStates.get(key);
   if (!state || state.chunks.length === 0) {
-    updateStatus('Ready. Run Binoculars: Analyze Chunk.');
+    updateStatus('Binoculars Ready. Select Analyze Chunk to begin.');
     return;
   }
   const text = editor.document.getText();
-  const chunk = getActiveChunk(editor, text, state);
-  if (!chunk || !chunk.metrics) {
+  const orderedChunks = [...state.chunks].sort((a, b) => a.charStart - b.charStart);
+  const cursorOffset = offsetAt(text, editor.selection.active);
+  const covered = computeContiguousCoverage(orderedChunks, text.length);
+  const hasMore = covered < text.length;
+  const scoredIntervals = mergeIntervals(
+    orderedChunks
+      .map((chunk) => ({
+        start: Math.max(0, Math.min(text.length, chunk.charStart)),
+        end: Math.max(0, Math.min(text.length, chunk.analyzedCharEnd)),
+      }))
+      .filter((interval) => interval.end > interval.start),
+  );
+  const inAnalyzedCoverage = scoredIntervals.some((interval) => cursorOffset >= interval.start && cursorOffset < interval.end);
+  const cursorChunk = inAnalyzedCoverage
+    ? orderedChunks.find((chunk) => cursorOffset >= chunk.charStart && cursorOffset < chunk.analyzedCharEnd)
+    : undefined;
+
+  if (!inAnalyzedCoverage || !cursorChunk) {
+    const unscoredIntervals = invertIntervals(scoredIntervals, text.length);
+    const unscoredAtCursor =
+      unscoredIntervals.find((interval) => cursorOffset >= interval.start && cursorOffset < interval.end) ??
+      (cursorOffset >= text.length ? unscoredIntervals[unscoredIntervals.length - 1] : undefined) ??
+      unscoredIntervals.find((interval) => interval.start > cursorOffset) ??
+      unscoredIntervals[0];
+    const startLine = lineNumberFromOffset(text, unscoredAtCursor?.start ?? cursorOffset);
+    if (hasMore) {
+      updateStatus(`Text starting from line ${startLine} has not been analyzed. Select Analyze Next Chunk to continue.`);
+    } else {
+      updateStatus(`Text starting from line ${startLine} has not been analyzed. Select Analyze Chunk to refresh coverage.`);
+    }
+    return;
+  }
+
+  if (!cursorChunk.metrics) {
     updateStatus('Binoculars analyzed chunk available.');
     return;
   }
@@ -2184,17 +2357,24 @@ function updateStatusForEditor(editor: vscode.TextEditor): void {
     typeof state.priorChunkB === 'number' && Number.isFinite(state.priorChunkB)
       ? ` | Prior B ${formatStatusMetric(state.priorChunkB)}`
       : '';
-  const covered = Math.max(0, state.nextChunkStart);
-  const hasMore = covered < text.length;
-  const moreSuffix = hasMore ? ` | Analyze Next available (${covered}/${text.length})` : '';
-  updateStatus(
-    `B ${formatStatusMetric(chunk.metrics.binoculars_score)}${priorBSuffix} | Obs ${formatStatusMetric(chunk.metrics.observer_logPPL)} | Cross ${formatStatusMetric(chunk.metrics.cross_logXPPL)}${staleSuffix}${moreSuffix}`,
-  );
+  const moreSuffix = hasMore ? ` | Analyze Next available (line ${lineNumberFromOffset(text, covered)})` : '';
+  const metricCore = `B: ${formatStatusMetric(cursorChunk.metrics.binoculars_score)}${priorBSuffix} | Obs: ${formatStatusMetric(cursorChunk.metrics.observer_logPPL)} | Cross: ${formatStatusMetric(cursorChunk.metrics.cross_logXPPL)}${staleSuffix}${moreSuffix}`;
+  if (orderedChunks.length > 1) {
+    const chunkIndex = Math.max(1, orderedChunks.indexOf(cursorChunk) + 1);
+    updateStatus(`Binoculars (chunk ${chunkIndex}): ${metricCore}`);
+    return;
+  }
+  updateStatus(metricCore);
 }
 
 function updateStatus(message: string): void {
   lastStatusMessage = message;
-  statusBar.text = `$(telescope) Binoculars: ${message}`;
+  if (!isExtensionEnabled()) {
+    controlsProvider?.refresh();
+    return;
+  }
+  const text = message.startsWith('Binoculars ') ? message : `Binoculars: ${message}`;
+  statusBar.text = `$(telescope) ${text}`;
   controlsProvider?.refresh();
 }
 
@@ -2227,6 +2407,11 @@ function formatApprox(approxB?: number, deltaB?: number): string {
   }
   const d = typeof deltaB === 'number' && Number.isFinite(deltaB) ? ` (${formatSignedMetric(deltaB)})` : '';
   return `approx B ${approxB.toFixed(DISPLAY_DECIMALS)}${d}`;
+}
+
+function lineNumberFromOffset(text: string, offset: number): number {
+  const clamped = Math.max(0, Math.min(text.length, Math.trunc(offset)));
+  return positionAt(text, clamped).line + 1;
 }
 
 function escapeHtml(text: string): string {
