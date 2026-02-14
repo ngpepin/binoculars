@@ -25,11 +25,13 @@ This repository also includes a native VS Code extension in `vscode-extension/` 
 Current extension capabilities:
 
 - Analyze current chunk and analyze next chunk.
+- Analyze all remaining chunks in sequence (`Analyze All`) with confirmation.
 - Rewrite current selection/line with ranked options.
 - LOW/HIGH text overlays plus per-line contribution gutter bars.
 - One-click `Clear Priors` plus prior contributor faint backgrounds (major contributors only) after re-analysis.
 - `Toggle Colorization` to hide/show text overlays without losing analysis state.
 - Chunk-aware status bar metrics, including `Prior B` when available.
+- Debounced live `Est. B` forecast in status while manually editing analyzed text.
 - Sidecar persistence in `*.json` next to markdown files for restoring analysis state.
 
 Detailed extension guide:
@@ -419,6 +421,42 @@ Rewrite suggestions can be accessed as follows:
 - The popup displays the approximate B impact for each option (exact B requires `Analyze`). Options are sorted by expected B increase, with more human-like choices first.
 - Select an option using the mouse or keyboard (`1`/`2`/`3`), or `Quit`. The selected rewrite is inserted as an edit (yellow), and prior backgrounds are preserved according to previous line status.
 - The B score is not automatically recalculated; the status marks it as stale until the next `Analyze`.
+
+### How Estimate Values Are Calculated
+
+Two different estimate paths exist in the VS Code workflow:
+
+Model usage note:
+- Both estimate paths use real local model inference (not static heuristics).
+
+1. Rewrite option estimates (in rewrite popup):
+- For each candidate rewrite, Binoculars builds a local scoring window around the rewritten span.
+- It computes observer `logPPL` locally for:
+  - the original local window,
+  - and each rewritten local window.
+- It converts local observer change into a document-level observer delta by transition-count normalization.
+- It then approximates:
+  - `approx_observer_logPPL = base_doc_observer_logPPL + delta_doc_observer`
+  - `approx_B = approx_observer_logPPL / base_doc_cross_logXPPL`
+- `delta_B = approx_B - base_doc_B`.
+- Candidates are ranked descending by `delta_B` (then `approx_B`), so options expected to increase B most are listed first.
+
+Important limitation:
+- The cross term (`logXPPL`) is held fixed to the current baseline during rewrite estimation.
+- Therefore popup values are fast approximations for ranking, not exact post-rewrite scores.
+
+2. Live edit forecast while typing (`Est. B` in status):
+- When text changes in an analyzed document, the chunk is marked stale and a debounced forecast job is scheduled (about 900ms).
+- The estimator identifies the active analyzed chunk at the cursor.
+- It computes observer-only logPPL from the active chunk start on the edited text.
+- It converts that to `Est. B` by dividing by the current chunk baseline `cross_logXPPL` (held fixed until full Analyze).
+- Returned estimate is shown as:
+  - `Est. B ... (approx)`.
+- To improve responsiveness, the daemon keeps an observer model instance warm for a short idle window and auto-unloads it after inactivity.
+
+Important limitation:
+- This live estimate is also an approximation in workflow terms: it is a forecast over the active chunk context during editing and does not replace a full explicit `Analyze` checkpoint.
+- `Analyze` / `Analyze Next` / `Analyze All` remain the source of truth for persisted exact chunk metrics and coverage state.
 
 Delete and undo operations are tracked:
 - Deleting a selected block with `Delete` or `Backspace` is recorded as a single undoable action.

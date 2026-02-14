@@ -17,6 +17,7 @@
     "onCommand:binoculars.disable",
     "onCommand:binoculars.analyze",
     "onCommand:binoculars.analyzeNext",
+    "onCommand:binoculars.analyzeAll",
     "onCommand:binoculars.rewriteSelection",
     "onCommand:binoculars.rewriteSelectionOrLine",
     "onCommand:binoculars.recommendRewrite",
@@ -62,6 +63,10 @@
         "title": "Binoculars: Analyze Next Chunk"
       },
       {
+        "command": "binoculars.analyzeAll",
+        "title": "Binoculars: Analyze All"
+      },
+      {
         "command": "binoculars.rewriteSelection",
         "title": "Binoculars: Rewrite Selection"
       },
@@ -95,7 +100,7 @@
       {
         "command": "binoculars.analyzeNext",
         "key": "ctrl+alt+n",
-        "when": "editorTextFocus && config.binoculars.enabled"
+        "when": "editorTextFocus && config.binoculars.enabled && binoculars.hasNextChunk"
       },
       {
         "command": "binoculars.rewriteSelectionOrLine",
@@ -127,28 +132,33 @@
         },
         {
           "command": "binoculars.analyzeNext",
-          "when": "view == binoculars.controlsView && config.binoculars.enabled",
+          "when": "view == binoculars.controlsView && config.binoculars.enabled && binoculars.hasNextChunk",
           "group": "navigation@2"
+        },
+        {
+          "command": "binoculars.analyzeAll",
+          "when": "view == binoculars.controlsView && config.binoculars.enabled && binoculars.hasNextChunk",
+          "group": "navigation@3"
         },
         {
           "command": "binoculars.rewriteSelectionOrLine",
           "when": "view == binoculars.controlsView && config.binoculars.enabled",
-          "group": "navigation@3"
+          "group": "navigation@4"
         },
         {
           "command": "binoculars.clearPriors",
           "when": "view == binoculars.controlsView && config.binoculars.enabled",
-          "group": "navigation@4"
+          "group": "navigation@5"
         },
         {
           "command": "binoculars.toggleColorization",
           "when": "view == binoculars.controlsView && config.binoculars.enabled",
-          "group": "navigation@5"
+          "group": "navigation@6"
         },
         {
           "command": "binoculars.restartBackend",
           "when": "view == binoculars.controlsView && config.binoculars.enabled",
-          "group": "navigation@6"
+          "group": "navigation@7"
         }
       ],
       "editor/context": [
@@ -169,23 +179,28 @@
         },
         {
           "command": "binoculars.analyzeNext",
-          "when": "editorTextFocus && config.binoculars.enabled",
+          "when": "editorTextFocus && config.binoculars.enabled && binoculars.hasNextChunk",
           "group": "2_binoculars@2"
+        },
+        {
+          "command": "binoculars.analyzeAll",
+          "when": "editorTextFocus && config.binoculars.enabled && binoculars.hasNextChunk",
+          "group": "2_binoculars@3"
         },
         {
           "command": "binoculars.rewriteSelectionOrLine",
           "when": "editorTextFocus && config.binoculars.enabled",
-          "group": "2_binoculars@3"
+          "group": "2_binoculars@4"
         },
         {
           "command": "binoculars.clearPriors",
           "when": "editorTextFocus && config.binoculars.enabled",
-          "group": "2_binoculars@4"
+          "group": "2_binoculars@5"
         },
         {
           "command": "binoculars.toggleColorization",
           "when": "editorTextFocus && config.binoculars.enabled",
-          "group": "2_binoculars@5"
+          "group": "2_binoculars@6"
         }
       ],
       "commandPalette": [
@@ -195,7 +210,11 @@
         },
         {
           "command": "binoculars.analyzeNext",
-          "when": "config.binoculars.enabled"
+          "when": "config.binoculars.enabled && binoculars.hasNextChunk"
+        },
+        {
+          "command": "binoculars.analyzeAll",
+          "when": "config.binoculars.enabled && binoculars.hasNextChunk"
         },
         {
           "command": "binoculars.rewriteSelection",

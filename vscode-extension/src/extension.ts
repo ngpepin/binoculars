@@ -19,6 +19,12 @@ interface DocumentState {
   priorLowRanges: EditedRange[];
   priorHighRanges: EditedRange[];
   priorChunkB?: number;
+  forecastEstimate?: {
+    chunkStart: number;
+    docVersion: number;
+    b: number;
+  };
+  forecastPending?: boolean;
 }
 
 interface RenderPalette {
@@ -54,11 +60,14 @@ interface RecentClosedStateCandidate {
 }
 
 const DISPLAY_DECIMALS = 5;
+const LIVE_ESTIMATE_DEBOUNCE_MS = 900;
 
 const docStates = new Map<string, DocumentState>();
 const loadedSidecarSignatures = new Map<string, string>();
 const recentClosedStatesByTextHash = new Map<string, RecentClosedStateCandidate>();
 const recentClosedHashByDocKey = new Map<string, string>();
+const liveEstimateTimers = new Map<string, NodeJS.Timeout>();
+const liveEstimateEpochs = new Map<string, number>();
 const RECENT_CLOSED_STATE_TTL_MS = 6 * 60 * 60 * 1000;
 let backend: BackendClient | undefined;
 let backendStarted = false;
@@ -69,6 +78,7 @@ let controlsProvider: BinocularsControlsProvider | undefined;
 let renderPalette: RenderPalette;
 let extensionCtx: vscode.ExtensionContext;
 let runtimeColorizationEnabled = true;
+let foregroundBusyOperationCount = 0;
 
 function isExtensionEnabled(): boolean {
   const cfg = vscode.workspace.getConfiguration('binoculars');
@@ -77,6 +87,138 @@ function isExtensionEnabled(): boolean {
 
 async function setEnablementContext(enabled: boolean): Promise<void> {
   await vscode.commands.executeCommand('setContext', 'binoculars:isEnabled', enabled);
+}
+
+function hasNextChunkAvailable(editor: vscode.TextEditor | undefined): boolean {
+  if (!editor || !isExtensionEnabled()) {
+    return false;
+  }
+  const textLen = editor.document.getText().length;
+  if (textLen <= 0) {
+    return false;
+  }
+  const state = docStates.get(editor.document.uri.toString());
+  if (!state || state.chunks.length === 0) {
+    return true;
+  }
+  const covered = Math.max(0, state.nextChunkStart);
+  return covered < textLen;
+}
+
+async function refreshAnalyzeNextContext(editor?: vscode.TextEditor): Promise<void> {
+  const active = editor ?? vscode.window.activeTextEditor;
+  await vscode.commands.executeCommand('setContext', 'binoculars.hasNextChunk', hasNextChunkAvailable(active));
+}
+
+function activeEditorForDocKey(key: string): vscode.TextEditor | undefined {
+  const active = vscode.window.activeTextEditor;
+  if (active && active.document.uri.toString() === key) {
+    return active;
+  }
+  return vscode.window.visibleTextEditors.find((editor) => editor.document.uri.toString() === key);
+}
+
+function clearLiveEstimateTimer(key: string): void {
+  const t = liveEstimateTimers.get(key);
+  if (t) {
+    clearTimeout(t);
+    liveEstimateTimers.delete(key);
+  }
+}
+
+function scheduleLiveEstimate(key: string): void {
+  if (!isExtensionEnabled() || foregroundBusyOperationCount > 0) {
+    return;
+  }
+  const editor = activeEditorForDocKey(key);
+  const state = docStates.get(key);
+  if (!editor || !state || !state.stale || state.chunks.length === 0) {
+    return;
+  }
+
+  clearLiveEstimateTimer(key);
+  const nextEpoch = (liveEstimateEpochs.get(key) ?? 0) + 1;
+  liveEstimateEpochs.set(key, nextEpoch);
+  state.forecastPending = true;
+  state.forecastEstimate = undefined;
+  updateStatusForEditor(editor);
+  const timer = setTimeout(() => {
+    void computeLiveEstimate(key, nextEpoch);
+  }, LIVE_ESTIMATE_DEBOUNCE_MS);
+  liveEstimateTimers.set(key, timer);
+}
+
+async function computeLiveEstimate(key: string, epoch: number): Promise<void> {
+  if (!isExtensionEnabled() || foregroundBusyOperationCount > 0) {
+    return;
+  }
+  if (liveEstimateEpochs.get(key) !== epoch) {
+    return;
+  }
+  clearLiveEstimateTimer(key);
+  const editor = activeEditorForDocKey(key);
+  const state = docStates.get(key);
+  if (!editor || !state || !state.stale || state.chunks.length === 0) {
+    return;
+  }
+  const fullText = editor.document.getText();
+  const cursorOffset = offsetAt(fullText, editor.selection.active);
+  const activeChunk = getActiveChunk(editor, fullText, state);
+  if (!activeChunk || cursorOffset < activeChunk.charStart || cursorOffset >= activeChunk.analyzedCharEnd) {
+    state.forecastPending = false;
+    updateStatusForEditor(editor);
+    return;
+  }
+
+  const chunkStart = Math.max(0, activeChunk.charStart);
+  const baseCross = Number(activeChunk.metrics?.cross_logXPPL ?? NaN);
+  if (!Number.isFinite(baseCross) || baseCross === 0) {
+    state.forecastPending = false;
+    state.forecastEstimate = undefined;
+    updateStatusForEditor(editor);
+    return;
+  }
+  const version = editor.document.version;
+  try {
+    const client = await ensureBackend();
+    const result = await client.estimateLiveB(fullText, inputLabel(editor.document), chunkStart, baseCross);
+    if (liveEstimateEpochs.get(key) !== epoch) {
+      return;
+    }
+    const liveState = docStates.get(key);
+    const liveEditor = activeEditorForDocKey(key);
+    if (!liveState || !liveEditor) {
+      return;
+    }
+    if (liveEditor.document.version !== version) {
+      return;
+    }
+    const estimatedB = Number(result.approx_b ?? NaN);
+    liveState.forecastPending = false;
+    if (Number.isFinite(estimatedB)) {
+      liveState.forecastEstimate = {
+        chunkStart,
+        docVersion: version,
+        b: estimatedB,
+      };
+    } else {
+      liveState.forecastEstimate = undefined;
+    }
+    updateStatusForEditor(liveEditor);
+  } catch {
+    if (liveEstimateEpochs.get(key) !== epoch) {
+      return;
+    }
+    const liveState = docStates.get(key);
+    const liveEditor = activeEditorForDocKey(key);
+    if (liveState) {
+      liveState.forecastPending = false;
+      liveState.forecastEstimate = undefined;
+    }
+    if (liveEditor) {
+      updateStatusForEditor(liveEditor);
+    }
+  }
 }
 
 function ensureEnabledOrNotify(): boolean {
@@ -200,24 +342,13 @@ class BinocularsControlsProvider implements vscode.TreeDataProvider<BinocularsCo
     const key = editor?.document.uri.toString() ?? '';
     const state = key ? docStates.get(key) : undefined;
     const chunkCount = state?.chunks.length ?? 0;
-    const nextAvailable = (() => {
-      if (!editor || !state) {
-        return false;
-      }
-      const covered = Math.max(0, state.nextChunkStart);
-      return covered < editor.document.getText().length;
-    })();
+    const nextAvailable = hasNextChunkAvailable(editor);
 
     const items: BinocularsControlItem[] = [
       new BinocularsControlItem('Analyze Chunk', {
         commandId: 'binoculars.analyze',
         icon: new vscode.ThemeIcon('run'),
         description: 'Ctrl+Alt+B',
-      }),
-      new BinocularsControlItem('Analyze Next Chunk', {
-        commandId: 'binoculars.analyzeNext',
-        icon: new vscode.ThemeIcon('debug-step-over'),
-        description: nextAvailable ? 'available' : 'n/a',
       }),
       new BinocularsControlItem('Rewrite Selection', {
         commandId: 'binoculars.rewriteSelectionOrLine',
@@ -252,6 +383,22 @@ class BinocularsControlsProvider implements vscode.TreeDataProvider<BinocularsCo
         icon: new vscode.ThemeIcon('list-unordered'),
       }),
     ];
+    if (nextAvailable) {
+      items.splice(
+        1,
+        0,
+        new BinocularsControlItem('Analyze Next Chunk', {
+          commandId: 'binoculars.analyzeNext',
+          icon: new vscode.ThemeIcon('debug-step-over'),
+          description: 'available',
+        }),
+        new BinocularsControlItem('Analyze All', {
+          commandId: 'binoculars.analyzeAll',
+          icon: new vscode.ThemeIcon('debug-continue'),
+          description: 'may take a while',
+        }),
+      );
+    }
     return Promise.resolve(items);
   }
 }
@@ -325,6 +472,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('binoculars.disable', () => void disableExtension()),
     vscode.commands.registerCommand('binoculars.analyze', () => void runAnalyze()),
     vscode.commands.registerCommand('binoculars.analyzeNext', () => void runAnalyzeNext()),
+    vscode.commands.registerCommand('binoculars.analyzeAll', () => void runAnalyzeAll()),
     vscode.commands.registerCommand('binoculars.rewriteSelection', () => void runRewriteSelection()),
     vscode.commands.registerCommand('binoculars.rewriteSelectionOrLine', () => void runRewriteSelectionOrLine()),
     vscode.commands.registerCommand('binoculars.recommendRewrite', () => void runRewriteSelectionOrLine()),
@@ -369,6 +517,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.window.onDidChangeTextEditorSelection((evt) => {
       if (isExtensionEnabled()) {
+        void refreshAnalyzeNextContext(evt.textEditor);
         updateStatusForEditor(evt.textEditor);
       }
     }),
@@ -376,6 +525,7 @@ export function activate(context: vscode.ExtensionContext): void {
       if (editor) {
         if (!isExtensionEnabled()) {
           clearAllDecorations(editor);
+          void refreshAnalyzeNextContext(editor);
           return;
         }
         maybeLoadStateSidecar(editor.document, 'activate');
@@ -386,8 +536,10 @@ export function activate(context: vscode.ExtensionContext): void {
         } else {
           clearAllDecorations(editor);
         }
+        void refreshAnalyzeNextContext(editor);
         updateStatusForEditor(editor);
       } else {
+        void refreshAnalyzeNextContext(undefined);
         if (isExtensionEnabled()) {
           updateStatus('Binoculars Ready. Select Analyze Chunk to begin.');
         }
@@ -406,8 +558,11 @@ export function activate(context: vscode.ExtensionContext): void {
       if (state && state.chunks.length > 0) {
         rememberClosedStateCandidate(doc, state);
       }
+      clearLiveEstimateTimer(key);
+      liveEstimateEpochs.delete(key);
       docStates.delete(key);
       loadedSidecarSignatures.delete(key);
+      void refreshAnalyzeNextContext(undefined);
       controlsProvider?.refresh();
     }),
     vscode.workspace.onDidSaveTextDocument((doc) => {
@@ -433,6 +588,8 @@ export function activate(context: vscode.ExtensionContext): void {
       const state = docStates.get(key);
       if (state && evt.contentChanges.length > 0) {
         state.stale = true;
+        state.forecastEstimate = undefined;
+        state.forecastPending = state.chunks.length > 0;
         shiftChunkStateForContentChanges(state, evt.contentChanges, evt.document.getText().length);
         state.editedRanges = applyContentChangesToEditedRanges(state.editedRanges, evt.contentChanges);
         state.rewriteRanges = applyContentChangesToRewriteRanges(state.rewriteRanges, evt.contentChanges);
@@ -452,6 +609,12 @@ export function activate(context: vscode.ExtensionContext): void {
         }
         controlsProvider?.refresh();
       }
+      const active = vscode.window.activeTextEditor;
+      if (active && active.document.uri.toString() === key) {
+        scheduleLiveEstimate(key);
+        void refreshAnalyzeNextContext(active);
+        updateStatusForEditor(active);
+      }
     }),
   );
 
@@ -470,6 +633,8 @@ async function runAnalyze(): Promise<void> {
   if (!editor) {
     return;
   }
+  const key = editor.document.uri.toString();
+  clearLiveEstimateTimer(key);
   const text = editor.document.getText();
   updateStatus('Analyzing chunk...');
 
@@ -478,7 +643,7 @@ async function runAnalyze(): Promise<void> {
       const client = await ensureBackend();
       return await client.analyzeDocument(text, inputLabel(editor.document));
     });
-    const previous = docStates.get(editor.document.uri.toString());
+    const previous = docStates.get(key);
     const incoming = toChunkState(result);
     const topKRaw = vscode.workspace.getConfiguration('binoculars').get<number>('topK', 5);
     const topK = Math.max(1, Math.trunc(Number.isFinite(topKRaw) ? topKRaw : 5));
@@ -492,10 +657,13 @@ async function runAnalyze(): Promise<void> {
       priorLowRanges: mergeEditedRanges([...(previous?.priorLowRanges ?? []), ...(priorRanges?.low ?? [])]),
       priorHighRanges: mergeEditedRanges([...(previous?.priorHighRanges ?? []), ...(priorRanges?.high ?? [])]),
       priorChunkB: priorChunkScoreForIncoming(previous, incoming),
+      forecastEstimate: undefined,
+      forecastPending: false,
     };
-    docStates.set(editor.document.uri.toString(), state);
+    docStates.set(key, state);
     rememberClosedStateCandidate(editor.document, state);
     applyDecorations(editor, state);
+    void refreshAnalyzeNextContext(editor);
     updateStatusForEditor(editor);
   } catch (err) {
     showError(`Analyze failed: ${(err as Error).message}`);
@@ -512,6 +680,7 @@ async function runAnalyzeNext(): Promise<void> {
   }
 
   const key = editor.document.uri.toString();
+  clearLiveEstimateTimer(key);
   const existing = docStates.get(key);
   if (!existing) {
     await runAnalyze();
@@ -547,13 +716,124 @@ async function runAnalyzeNext(): Promise<void> {
     mergeChunk(existing, incoming);
     existing.nextChunkStart = result.next_chunk_start ?? result.chunk.analyzed_char_end;
     existing.stale = false;
+    existing.forecastEstimate = undefined;
+    existing.forecastPending = false;
     existing.editedRanges = [];
     existing.rewriteRanges = [];
     rememberClosedStateCandidate(editor.document, existing);
     applyDecorations(editor, existing);
+    void refreshAnalyzeNextContext(editor);
     updateStatusForEditor(editor);
   } catch (err) {
     showError(`Analyze Next failed: ${(err as Error).message}`);
+  }
+}
+
+async function runAnalyzeAll(): Promise<void> {
+  if (!ensureEnabledOrNotify()) {
+    return;
+  }
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    return;
+  }
+
+  const key = editor.document.uri.toString();
+  clearLiveEstimateTimer(key);
+  const docText = editor.document.getText();
+  const current = docStates.get(key);
+  const start = Math.max(0, current?.nextChunkStart ?? 0);
+  if (docText.length <= 0 || start >= docText.length) {
+    updateStatus('All text already covered by analyzed chunks.');
+    void refreshAnalyzeNextContext(editor);
+    return;
+  }
+
+  const proceed = await vscode.window.showWarningMessage(
+    'Analyze All may take a while on long documents. Are you sure?',
+    { modal: true },
+    'Yes',
+    'No',
+  );
+  if (proceed !== 'Yes') {
+    updateStatus('Analyze All canceled.');
+    return;
+  }
+
+  const initialVersion = editor.document.version;
+  try {
+    await runWithBusyQuickPick('Binoculars: Analyze All', 'Analyzing all remaining chunks...', async () => {
+      const client = await ensureBackend();
+      let fullText = editor.document.getText();
+      if (editor.document.version !== initialVersion) {
+        throw new Error('Document changed while Analyze All was running. Re-run Analyze All on current text.');
+      }
+
+      let state = docStates.get(key);
+      if (!state || state.chunks.length === 0) {
+        updateStatus('Analyze All in progress: analyzing initial chunk...');
+        const result = await client.analyzeDocument(fullText, inputLabel(editor.document));
+        const incoming = toChunkState(result);
+        const topKRaw = vscode.workspace.getConfiguration('binoculars').get<number>('topK', 5);
+        const topK = Math.max(1, Math.trunc(Number.isFinite(topKRaw) ? topKRaw : 5));
+        const priorRanges = state ? priorContributorRangesForIncoming(state, incoming, fullText.length, topK) : undefined;
+        state = {
+          chunks: [incoming],
+          nextChunkStart: result.next_chunk_start ?? result.chunk.analyzed_char_end,
+          stale: false,
+          editedRanges: [],
+          rewriteRanges: [],
+          priorLowRanges: mergeEditedRanges([...(state?.priorLowRanges ?? []), ...(priorRanges?.low ?? [])]),
+          priorHighRanges: mergeEditedRanges([...(state?.priorHighRanges ?? []), ...(priorRanges?.high ?? [])]),
+          priorChunkB: priorChunkScoreForIncoming(state, incoming),
+          forecastEstimate: undefined,
+          forecastPending: false,
+        };
+        docStates.set(key, state);
+        rememberClosedStateCandidate(editor.document, state);
+        applyDecorations(editor, state);
+      }
+
+      let safetyCounter = 0;
+      while (state && state.nextChunkStart < fullText.length) {
+        safetyCounter += 1;
+        if (safetyCounter > 512) {
+          throw new Error('Analyze All aborted due to unexpected excessive chunk iterations.');
+        }
+        if (editor.document.version !== initialVersion) {
+          throw new Error('Document changed while Analyze All was running. Re-run Analyze All on current text.');
+        }
+
+        const loopStart = Math.max(0, state.nextChunkStart);
+        const startLine = lineNumberFromOffset(fullText, loopStart);
+        updateStatus(`Analyze All in progress: analyzing from line ${startLine}...`);
+        const result = await client.analyzeNextChunk(fullText, inputLabel(editor.document), loopStart);
+        const incoming = toChunkState(result);
+        const topKRaw = vscode.workspace.getConfiguration('binoculars').get<number>('topK', 5);
+        const topK = Math.max(1, Math.trunc(Number.isFinite(topKRaw) ? topKRaw : 5));
+        const priorRanges = priorContributorRangesForIncoming(state, incoming, fullText.length, topK);
+        state.priorLowRanges = mergeEditedRanges([...(state.priorLowRanges ?? []), ...priorRanges.low]);
+        state.priorHighRanges = mergeEditedRanges([...(state.priorHighRanges ?? []), ...priorRanges.high]);
+        state.priorChunkB = priorChunkScoreForIncoming(state, incoming);
+        mergeChunk(state, incoming);
+        const prevNext = loopStart;
+        state.nextChunkStart = result.next_chunk_start ?? result.chunk.analyzed_char_end;
+        state.stale = false;
+        state.forecastEstimate = undefined;
+        state.forecastPending = false;
+        state.editedRanges = [];
+        state.rewriteRanges = [];
+        rememberClosedStateCandidate(editor.document, state);
+        applyDecorations(editor, state);
+        if (state.nextChunkStart <= prevNext) {
+          throw new Error('Analyze All made no forward progress. Try Analyze Chunk again.');
+        }
+      }
+    });
+    void refreshAnalyzeNextContext(editor);
+    updateStatusForEditor(editor);
+  } catch (err) {
+    showError(`Analyze All failed: ${(err as Error).message}`);
   }
 }
 
@@ -565,9 +845,11 @@ async function runWithBusyQuickPick<T>(title: string, placeholder: string, actio
   picker.enabled = false;
   picker.ignoreFocusOut = true;
   picker.show();
+  foregroundBusyOperationCount += 1;
   try {
     return await action();
   } finally {
+    foregroundBusyOperationCount = Math.max(0, foregroundBusyOperationCount - 1);
     picker.dispose();
   }
 }
@@ -863,8 +1145,13 @@ async function disableExtension(): Promise<void> {
 async function applyEnablementMode(): Promise<void> {
   const enabled = isExtensionEnabled();
   await setEnablementContext(enabled);
+  await refreshAnalyzeNextContext(undefined);
   if (!enabled) {
     await stopBackend({ shutdownDaemon: true });
+    for (const key of liveEstimateTimers.keys()) {
+      clearLiveEstimateTimer(key);
+    }
+    liveEstimateEpochs.clear();
     docStates.clear();
     loadedSidecarSignatures.clear();
     recentClosedStatesByTextHash.clear();
@@ -2306,8 +2593,10 @@ function hoverForPosition(document: vscode.TextDocument, position: vscode.Positi
 
 function updateStatusForEditor(editor: vscode.TextEditor): void {
   if (!isExtensionEnabled()) {
+    void refreshAnalyzeNextContext(editor);
     return;
   }
+  void refreshAnalyzeNextContext(editor);
   const key = editor.document.uri.toString();
   const state = docStates.get(key);
   if (!state || state.chunks.length === 0) {
@@ -2353,12 +2642,30 @@ function updateStatusForEditor(editor: vscode.TextEditor): void {
     return;
   }
   const staleSuffix = state.stale ? ' | stale (run Analyze)' : '';
+  const estimateSuffix = (() => {
+    if (!state.stale) {
+      return '';
+    }
+    const estimate = state.forecastEstimate;
+    if (
+      estimate &&
+      estimate.chunkStart === cursorChunk.charStart &&
+      estimate.docVersion === editor.document.version &&
+      Number.isFinite(estimate.b)
+    ) {
+      return ` | Est. B ${formatStatusMetric(estimate.b)} (approx)`;
+    }
+    if (state.forecastPending) {
+      return ' | Est. B estimating...';
+    }
+    return '';
+  })();
   const priorBSuffix =
     typeof state.priorChunkB === 'number' && Number.isFinite(state.priorChunkB)
       ? ` | Prior B ${formatStatusMetric(state.priorChunkB)}`
       : '';
   const moreSuffix = hasMore ? ` | Analyze Next available (line ${lineNumberFromOffset(text, covered)})` : '';
-  const metricCore = `B: ${formatStatusMetric(cursorChunk.metrics.binoculars_score)}${priorBSuffix} | Obs: ${formatStatusMetric(cursorChunk.metrics.observer_logPPL)} | Cross: ${formatStatusMetric(cursorChunk.metrics.cross_logXPPL)}${staleSuffix}${moreSuffix}`;
+  const metricCore = `B: ${formatStatusMetric(cursorChunk.metrics.binoculars_score)}${priorBSuffix}${estimateSuffix} | Obs: ${formatStatusMetric(cursorChunk.metrics.observer_logPPL)} | Cross: ${formatStatusMetric(cursorChunk.metrics.cross_logXPPL)}${staleSuffix}${moreSuffix}`;
   if (orderedChunks.length > 1) {
     const chunkIndex = Math.max(1, orderedChunks.indexOf(cursorChunk) + 1);
     updateStatus(`Binoculars (chunk ${chunkIndex}): ${metricCore}`);

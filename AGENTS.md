@@ -185,8 +185,11 @@ GUI identity details:
 
 VS Code extension behavior (current):
 - Commands:
+  - `Binoculars: Enable`
+  - `Binoculars: Disable`
   - `Binoculars: Analyze Chunk`
   - `Binoculars: Analyze Next Chunk`
+  - `Binoculars: Analyze All`
   - `Binoculars: Rewrite Selection`
   - `Binoculars: Clear Priors`
   - `Binoculars: Toggle Colorization`
@@ -205,6 +208,11 @@ VS Code extension behavior (current):
 - Persistence:
   - Sidecar save/load includes chunk state, edited ranges, rewrite ranges, and prior overlay ranges.
   - `priorChunkB` remains in-session and is intentionally not restored from persisted state.
+- Estimate behaviors:
+  - Rewrite popup options show approximate `approx_B` / `delta_B` using local observer logPPL rescoring + transition-normalized projection while holding baseline cross term fixed.
+  - Manual typing in stale analyzed text triggers debounced live forecast (`Est. B`) in status using observer-only chunk-start rescoring with baseline cross term held fixed.
+  - Daemon keeps an observer model warm for live-estimate responsiveness and unloads it automatically after idle timeout.
+  - Both estimate paths are directional guidance; explicit `Analyze`/`Analyze Next`/`Analyze All` remain authoritative for exact checkpoint metrics.
 
 ## 8) Lessons Learned / Gotchas
 

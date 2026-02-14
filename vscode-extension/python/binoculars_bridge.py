@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import socketserver
 import sys
 import tempfile
 import threading
+import time
 import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,8 +28,17 @@ if ROOT_DIR not in sys.path:
 
 from binoculars import (  # type: ignore
     analyze_text_document,
+    build_llama_instance,
+    close_llama,
+    compute_logppl_from_scores,
+    estimate_char_end_for_token_limit,
     estimate_rewrite_b_impact_options,
+    filter_llama_kwargs,
     generate_rewrite_candidates_for_span,
+    infer_n_ctx,
+    load_config,
+    maybe_truncate_tokens,
+    tokenize_with_vocab_only,
 )
 
 
@@ -43,6 +54,135 @@ class BridgeState:
     performer_model_path_override: str = ""
     rewrite_llm_config_path: str = ""
     _runtime_cfg_path: Optional[str] = None
+
+
+OBSERVER_IDLE_TIMEOUT_SEC = 35.0
+
+
+class ObserverWarmCache:
+    def __init__(self, idle_timeout_sec: float = OBSERVER_IDLE_TIMEOUT_SEC) -> None:
+        self.idle_timeout_sec = max(5.0, float(idle_timeout_sec))
+        self._lock = threading.Lock()
+        self._model: Any = None
+        self._signature: str = ""
+        self._n_ctx: int = 0
+        self._last_used: float = 0.0
+        self._in_use: int = 0
+
+    def close_if_idle(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if self._model is None:
+                return
+            if self._in_use > 0:
+                return
+            if (now - self._last_used) < self.idle_timeout_sec:
+                return
+            model = self._model
+            self._model = None
+            self._signature = ""
+            self._n_ctx = 0
+        try:
+            close_llama(model)
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        with self._lock:
+            model = self._model
+            self._model = None
+            self._signature = ""
+            self._n_ctx = 0
+        if model is None:
+            return
+        try:
+            close_llama(model)
+        except Exception:
+            pass
+
+    def score_slice(self, state: "BridgeState", full_text: str, start_char: int) -> Dict[str, Any]:
+        cfg_path = _runtime_cfg_path(state)
+        cfg, tcfg, _ccfg = load_config(cfg_path)
+        if state.text_max_tokens_override is not None:
+            tcfg.max_tokens = int(state.text_max_tokens_override)
+
+        observer_section = cfg["observer"]
+        obs_path = observer_section.get("model_path")
+        if not obs_path:
+            raise ValueError("observer.model_path is required.")
+
+        start = max(0, min(len(full_text), int(start_char)))
+        text = full_text[start:]
+        if not text:
+            return {
+                "observer_logPPL": float("nan"),
+                "transitions": 0,
+                "analyzed_char_end": start,
+                "truncated_by_limit": False,
+            }
+
+        tok_full = tokenize_with_vocab_only(obs_path, text.encode("utf-8", errors="replace"), tcfg)
+        tok = maybe_truncate_tokens(tok_full, tcfg.max_tokens)
+        if len(tok) < 2:
+            raise ValueError("Live estimate text is too short after tokenization.")
+        needed_ctx = int(len(tok))
+        n_ctx_obs = infer_n_ctx(observer_section, needed_ctx)
+        cfg_obj = dict(observer_section)
+        cfg_obj["model_path"] = obs_path
+        cfg_obj["logits_all"] = True
+        cfg_obj.setdefault("verbose", False)
+        sig_obj = filter_llama_kwargs(dict(cfg_obj))
+        sig_obj.pop("n_ctx", None)
+        signature = json.dumps(sig_obj, sort_keys=True, ensure_ascii=True, default=str)
+
+        with self._lock:
+            if self._model is None or self._signature != signature or self._n_ctx < n_ctx_obs:
+                old = self._model
+                self._model = None
+                self._signature = ""
+                self._n_ctx = 0
+                if old is not None:
+                    try:
+                        close_llama(old)
+                    except Exception:
+                        pass
+                build_cfg = dict(cfg_obj)
+                build_cfg["n_ctx"] = n_ctx_obs
+                build_cfg = filter_llama_kwargs(build_cfg)
+                self._model = build_llama_instance(build_cfg)
+                self._signature = signature
+                self._n_ctx = int(n_ctx_obs)
+            model = self._model
+            self._last_used = time.monotonic()
+            self._in_use += 1
+
+        assert model is not None
+        try:
+            model.reset()
+            model.eval(tok)
+            n_vocab_obs = model.n_vocab()
+            scores = model.scores[: len(tok), :n_vocab_obs]
+            logppl, _ = compute_logppl_from_scores(scores, tok)
+            truncated = len(tok_full) > len(tok)
+            analyzed_end_local = len(text)
+            if truncated:
+                analyzed_end_local = estimate_char_end_for_token_limit(
+                    text=text,
+                    model=model,
+                    tcfg=tcfg,
+                    token_limit=len(tok),
+                )
+            analyzed_end_abs = start + max(0, min(len(text), int(analyzed_end_local)))
+            return {
+                "observer_logPPL": float(logppl),
+                "transitions": int(len(tok) - 1),
+                "analyzed_char_end": int(analyzed_end_abs),
+                "truncated_by_limit": bool(truncated),
+            }
+        finally:
+            with self._lock:
+                self._in_use = max(0, self._in_use - 1)
+                self._last_used = time.monotonic()
 
 
 _ORDERED_LIST_RE = re.compile(r"^([ \t]{0,8})(\d{1,4})([.)])(?:[ \t]+)(.*)$")
@@ -294,7 +434,11 @@ def _analyze_slice(
     }
 
 
-def _handle_request(state: BridgeState, request: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+def _handle_request(
+    state: BridgeState,
+    request: Dict[str, Any],
+    observer_cache: Optional[ObserverWarmCache] = None,
+) -> Tuple[Dict[str, Any], bool]:
     request_id = request.get("id")
     method = str(request.get("method", "")).strip()
     params = request.get("params", {})
@@ -392,6 +536,41 @@ def _handle_request(state: BridgeState, request: Dict[str, Any]) -> Tuple[Dict[s
         result["next_chunk_start"] = state.next_chunk_start
         return {"id": request_id, "result": result}, False
 
+    if method == "estimate_live_b":
+        text = str(params.get("text", state.last_text))
+        input_label = str(params.get("input_label") or state.last_input_label or "<unsaved>")
+        start = int(params.get("start_char", 0))
+        base_cross = float(params.get("base_cross_logxppl", float("nan")))
+        state.last_text = text
+        state.last_input_label = input_label
+
+        if observer_cache is not None:
+            local = observer_cache.score_slice(state, text, start)
+        else:
+            temp_cache = ObserverWarmCache(idle_timeout_sec=5.0)
+            try:
+                local = temp_cache.score_slice(state, text, start)
+            finally:
+                temp_cache.close()
+
+        observer_logppl = float(local.get("observer_logPPL", float("nan")))
+        if math.isfinite(base_cross) and base_cross != 0.0 and math.isfinite(observer_logppl):
+            approx_b = float(observer_logppl / base_cross)
+        else:
+            approx_b = float("nan")
+        return {
+            "id": request_id,
+            "result": {
+                "ok": True,
+                "approx_b": approx_b,
+                "observer_logPPL": observer_logppl,
+                "transitions": int(local.get("transitions", 0)),
+                "analyzed_char_end": int(local.get("analyzed_char_end", max(0, min(len(text), int(start))))),
+                "truncated_by_limit": bool(local.get("truncated_by_limit", False)),
+                "observer_cache_idle_timeout_s": float(OBSERVER_IDLE_TIMEOUT_SEC),
+            },
+        }, False
+
     if method == "rewrite_span":
         text = str(params.get("text", ""))
         span_start = int(params.get("span_start", 0))
@@ -464,6 +643,29 @@ class _ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamS
     def __init__(self, server_address: str, request_handler_cls: type[socketserver.BaseRequestHandler]):
         super().__init__(server_address, request_handler_cls)
         self.request_lock = threading.Lock()
+        self.observer_cache = ObserverWarmCache()
+        self._janitor_stop = threading.Event()
+        self._janitor_thread = threading.Thread(target=self._janitor_loop, daemon=True)
+        self._janitor_thread.start()
+
+    def _janitor_loop(self) -> None:
+        while not self._janitor_stop.wait(1.0):
+            try:
+                self.observer_cache.close_if_idle()
+            except Exception:
+                pass
+
+    def server_close(self) -> None:
+        self._janitor_stop.set()
+        try:
+            self._janitor_thread.join(timeout=1.5)
+        except Exception:
+            pass
+        try:
+            self.observer_cache.close()
+        except Exception:
+            pass
+        super().server_close()
 
 
 class _DaemonRequestHandler(socketserver.StreamRequestHandler):
@@ -509,7 +711,11 @@ class _DaemonRequestHandler(socketserver.StreamRequestHandler):
 
             try:
                 with self.server.request_lock:  # type: ignore[attr-defined]
-                    response, should_exit = _handle_request(self.state, req)
+                    response, should_exit = _handle_request(
+                        self.state,
+                        req,
+                        observer_cache=getattr(self.server, "observer_cache", None),
+                    )
                 self._send(response)
                 if should_exit:
                     return

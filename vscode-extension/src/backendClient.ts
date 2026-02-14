@@ -76,6 +76,27 @@ export class BackendClient implements vscode.Disposable {
     });
   }
 
+  public estimateLiveB(
+    text: string,
+    inputLabel: string,
+    startChar: number,
+    baseCrossLogXppl: number,
+  ): Promise<{
+    ok: boolean;
+    approx_b: number;
+    observer_logPPL: number;
+    transitions: number;
+    analyzed_char_end: number;
+    truncated_by_limit: boolean;
+  }> {
+    return this.request('estimate_live_b', {
+      text,
+      input_label: inputLabel,
+      start_char: startChar,
+      base_cross_logxppl: baseCrossLogXppl,
+    });
+  }
+
   public rewriteSpan(
     text: string,
     spanStart: number,
