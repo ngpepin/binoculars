@@ -54,7 +54,33 @@ def _preserve_ordered_list_markers(original_text: str, rewrite_text: str) -> Tup
 
     original_lines = original.split("\n")
     rewrite_lines = rewrite.split("\n")
-    if len(original_lines) < 2 or not rewrite_lines:
+    if not rewrite_lines:
+        return rewrite, 0
+
+    # Single-line rewrite case: keep ordered-list marker when model drops it.
+    if len(original_lines) == 1:
+        m = _ORDERED_LIST_RE.match(original_lines[0])
+        if not m:
+            return rewrite, 0
+        first_rw_idx = None
+        for i, ln in enumerate(rewrite_lines):
+            if ln.strip():
+                first_rw_idx = i
+                break
+        if first_rw_idx is None:
+            return rewrite, 0
+        rw_line = rewrite_lines[first_rw_idx]
+        if _ORDERED_LIST_RE.match(rw_line) or _UNORDERED_LIST_RE.match(rw_line):
+            return rewrite, 0
+        indent, num, delim, _tail = m.groups()
+        rewrite_lines[first_rw_idx] = f"{indent}{num}{delim} {rw_line.lstrip()}"
+        fixed = "\n".join(rewrite_lines)
+        trailing_newlines = len(rewrite) - len(rewrite.rstrip("\n"))
+        if trailing_newlines > 0:
+            fixed = fixed.rstrip("\n") + ("\n" * trailing_newlines)
+        return fixed, 1
+
+    if len(original_lines) < 2:
         return rewrite, 0
 
     original_marker_idx = [i for i, ln in enumerate(original_lines) if _ORDERED_LIST_RE.match(ln)]
@@ -385,7 +411,7 @@ def _handle_request(state: BridgeState, request: Dict[str, Any]) -> Tuple[Dict[s
         start = max(0, min(len(text), min(span_start, span_end)))
         end = max(0, min(len(text), max(span_start, span_end)))
         original_span = text[start:end]
-        if "\n" in original_span and rewrites:
+        if rewrites:
             repaired: List[str] = []
             repaired_markers = 0
             for cand in rewrites:

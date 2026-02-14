@@ -19,6 +19,7 @@
     "onCommand:binoculars.rewriteSelectionOrLine",
     "onCommand:binoculars.recommendRewrite",
     "onCommand:binoculars.clearPriors",
+    "onCommand:binoculars.toggleColorization",
     "onLanguage:markdown",
     "onLanguage:plaintext"
   ],
@@ -65,6 +66,10 @@
       {
         "command": "binoculars.clearPriors",
         "title": "Binoculars: Clear Priors"
+      },
+      {
+        "command": "binoculars.toggleColorization",
+        "title": "Binoculars: Toggle Colorization"
       },
       {
         "command": "binoculars.restartBackend",
@@ -116,9 +121,14 @@
           "group": "navigation@4"
         },
         {
-          "command": "binoculars.restartBackend",
+          "command": "binoculars.toggleColorization",
           "when": "view == binoculars.controlsView",
           "group": "navigation@5"
+        },
+        {
+          "command": "binoculars.restartBackend",
+          "when": "view == binoculars.controlsView",
+          "group": "navigation@6"
         }
       ],
       "editor/context": [
@@ -141,6 +151,11 @@
           "command": "binoculars.clearPriors",
           "when": "editorTextFocus",
           "group": "2_binoculars@4"
+        },
+        {
+          "command": "binoculars.toggleColorization",
+          "when": "editorTextFocus",
+          "group": "2_binoculars@5"
         }
       ],
       "commandPalette": [
