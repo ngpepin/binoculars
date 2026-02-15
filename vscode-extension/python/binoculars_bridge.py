@@ -473,6 +473,11 @@ def _handle_request(
             state.top_k = max(1, int(top_k))
         tmax = params.get("text_max_tokens_override")
         state.text_max_tokens_override = None if tmax is None else int(tmax)
+        if observer_cache is not None:
+            try:
+                observer_cache.close()
+            except Exception:
+                pass
         runtime_cfg = _runtime_cfg_path(state)
         return {
             "id": request_id,
@@ -510,6 +515,18 @@ def _handle_request(
 
     if state.cfg_path is None:
         return _err(request_id, "Bridge not initialized. Call initialize first.", "not_initialized"), False
+
+    # Release warm observer cache before heavy operations that may load other large models.
+    if observer_cache is not None and method in {
+        "analyze_document",
+        "analyze_chunk",
+        "analyze_next_chunk",
+        "rewrite_span",
+    }:
+        try:
+            observer_cache.close()
+        except Exception:
+            pass
 
     if method == "analyze_document":
         text = str(params.get("text", ""))
