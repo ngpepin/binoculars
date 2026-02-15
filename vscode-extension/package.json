@@ -137,7 +137,7 @@
         },
         {
           "command": "binoculars.analyzeAll",
-          "when": "view == binoculars.controlsView && config.binoculars.enabled && binoculars.hasNextChunk",
+          "when": "view == binoculars.controlsView && config.binoculars.enabled && binoculars.canAnalyzeAll",
           "group": "navigation@3"
         },
         {
@@ -147,7 +147,7 @@
         },
         {
           "command": "binoculars.clearPriors",
-          "when": "view == binoculars.controlsView && config.binoculars.enabled",
+          "when": "view == binoculars.controlsView && config.binoculars.enabled && binoculars.hasPriors",
           "group": "navigation@5"
         },
         {
@@ -184,7 +184,7 @@
         },
         {
           "command": "binoculars.analyzeAll",
-          "when": "editorTextFocus && config.binoculars.enabled && binoculars.hasNextChunk",
+          "when": "editorTextFocus && config.binoculars.enabled && binoculars.canAnalyzeAll",
           "group": "2_binoculars@3"
         },
         {
@@ -194,7 +194,7 @@
         },
         {
           "command": "binoculars.clearPriors",
-          "when": "editorTextFocus && config.binoculars.enabled",
+          "when": "editorTextFocus && config.binoculars.enabled && binoculars.hasPriors",
           "group": "2_binoculars@5"
         },
         {
@@ -214,7 +214,7 @@
         },
         {
           "command": "binoculars.analyzeAll",
-          "when": "config.binoculars.enabled && binoculars.hasNextChunk"
+          "when": "config.binoculars.enabled && binoculars.canAnalyzeAll"
         },
         {
           "command": "binoculars.rewriteSelection",
@@ -230,7 +230,7 @@
         },
         {
           "command": "binoculars.clearPriors",
-          "when": "config.binoculars.enabled"
+          "when": "config.binoculars.enabled && binoculars.hasPriors"
         },
         {
           "command": "binoculars.toggleColorization",

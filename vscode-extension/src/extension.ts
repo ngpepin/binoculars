@@ -41,6 +41,8 @@ interface RenderPalette {
 interface HoverDecision {
   hover: vscode.Hover;
   isMinorContributor: boolean;
+  segmentStart: number;
+  segmentEnd: number;
 }
 
 interface PersistedSidecarPayload {
@@ -62,8 +64,7 @@ interface RecentClosedStateCandidate {
 const DISPLAY_DECIMALS = 5;
 const LIVE_ESTIMATE_DEBOUNCE_MS = 900;
 const HOVER_TYPING_SUPPRESS_MS = 1300;
-const HOVER_DELAY_MAJOR_MS = 1700;
-const HOVER_DELAY_MINOR_MS = 1900;
+const HOVER_SAME_SEGMENT_SUPPRESS_MS = 900;
 
 const docStates = new Map<string, DocumentState>();
 const loadedSidecarSignatures = new Map<string, string>();
@@ -73,6 +74,7 @@ const liveEstimateTimers = new Map<string, NodeJS.Timeout>();
 const liveEstimateEpochs = new Map<string, number>();
 const liveEstimateRecoverAttempts = new Map<string, number>();
 const recentTypingActivity = new Map<string, { atMs: number; start: number; end: number }>();
+const hoverSeenSegments = new Map<string, { start: number; end: number; lastSeenMs: number }>();
 const RECENT_CLOSED_STATE_TTL_MS = 6 * 60 * 60 * 1000;
 let backend: BackendClient | undefined;
 let backendStarted = false;
@@ -104,15 +106,53 @@ function hasNextChunkAvailable(editor: vscode.TextEditor | undefined): boolean {
   }
   const state = docStates.get(editor.document.uri.toString());
   if (!state || state.chunks.length === 0) {
-    return true;
+    return false;
   }
   const covered = Math.max(0, state.nextChunkStart);
   return covered < textLen;
 }
 
+function hasAnalysisForEditor(editor: vscode.TextEditor | undefined): boolean {
+  if (!editor || !isExtensionEnabled()) {
+    return false;
+  }
+  const state = docStates.get(editor.document.uri.toString());
+  return Boolean(state && state.chunks.length > 0);
+}
+
+function canAnalyzeAll(editor: vscode.TextEditor | undefined): boolean {
+  if (!editor || !isExtensionEnabled()) {
+    return false;
+  }
+  const textLen = editor.document.getText().length;
+  if (textLen <= 0) {
+    return false;
+  }
+  const state = docStates.get(editor.document.uri.toString());
+  if (!state || state.chunks.length === 0) {
+    return false;
+  }
+  const covered = Math.max(0, state.nextChunkStart);
+  return covered < textLen;
+}
+
+function hasPriorsForEditor(editor: vscode.TextEditor | undefined): boolean {
+  if (!editor || !isExtensionEnabled()) {
+    return false;
+  }
+  const state = docStates.get(editor.document.uri.toString());
+  if (!state) {
+    return false;
+  }
+  return (state.priorLowRanges?.length ?? 0) > 0 || (state.priorHighRanges?.length ?? 0) > 0;
+}
+
 async function refreshAnalyzeNextContext(editor?: vscode.TextEditor): Promise<void> {
   const active = editor ?? vscode.window.activeTextEditor;
   await vscode.commands.executeCommand('setContext', 'binoculars.hasNextChunk', hasNextChunkAvailable(active));
+  await vscode.commands.executeCommand('setContext', 'binoculars.hasAnalysis', hasAnalysisForEditor(active));
+  await vscode.commands.executeCommand('setContext', 'binoculars.canAnalyzeAll', canAnalyzeAll(active));
+  await vscode.commands.executeCommand('setContext', 'binoculars.hasPriors', hasPriorsForEditor(active));
 }
 
 function activeEditorForDocKey(key: string): vscode.TextEditor | undefined {
@@ -559,37 +599,39 @@ export function activate(context: vscode.ExtensionContext): void {
         if (!isExtensionEnabled()) {
           return undefined;
         }
+        const docKey = document.uri.toString();
         const docText = document.getText();
         const charOffset = offsetAt(docText, position);
         if (shouldSuppressHoverDuringTyping(document, charOffset)) {
           return undefined;
         }
+        const lastSeen = hoverSeenSegments.get(docKey);
+        if (lastSeen) {
+          if (charOffset >= lastSeen.start && charOffset < lastSeen.end) {
+            const now = Date.now();
+            if (now - lastSeen.lastSeenMs <= HOVER_SAME_SEGMENT_SUPPRESS_MS) {
+              hoverSeenSegments.set(docKey, { ...lastSeen, lastSeenMs: now });
+              return undefined;
+            }
+          } else {
+            hoverSeenSegments.delete(docKey);
+          }
+        }
         const decision = hoverForPosition(document, position);
         if (!decision) {
           return undefined;
         }
-        const delayMs = decision.isMinorContributor ? HOVER_DELAY_MINOR_MS : HOVER_DELAY_MAJOR_MS;
-        return new Promise<vscode.Hover | undefined>((resolve) => {
-          let settled = false;
-          const settle = (value: vscode.Hover | undefined) => {
-            if (settled) {
-              return;
-            }
-            settled = true;
-            resolve(value);
-          };
-          const timer = setTimeout(() => {
-            if (token.isCancellationRequested) {
-              settle(undefined);
-              return;
-            }
-            settle(decision.hover);
-          }, delayMs);
-          token.onCancellationRequested(() => {
-            clearTimeout(timer);
-            settle(undefined);
+        if (token.isCancellationRequested) {
+          return undefined;
+        }
+        if (decision.segmentEnd > decision.segmentStart) {
+          hoverSeenSegments.set(docKey, {
+            start: decision.segmentStart,
+            end: decision.segmentEnd,
+            lastSeenMs: Date.now(),
           });
-        });
+        }
+        return decision.hover;
       },
     }),
     vscode.window.onDidChangeTextEditorSelection((evt) => {
@@ -639,6 +681,7 @@ export function activate(context: vscode.ExtensionContext): void {
       liveEstimateEpochs.delete(key);
       liveEstimateRecoverAttempts.delete(key);
       recentTypingActivity.delete(key);
+      hoverSeenSegments.delete(key);
       docStates.delete(key);
       loadedSidecarSignatures.delete(key);
       void refreshAnalyzeNextContext(undefined);
@@ -666,6 +709,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const key = evt.document.uri.toString();
       if (evt.contentChanges.length > 0) {
         noteTypingActivity(key, evt.contentChanges, evt.document.getText().length);
+        hoverSeenSegments.delete(key);
       }
       const state = docStates.get(key);
       if (state && evt.contentChanges.length > 0) {
@@ -2638,7 +2682,12 @@ function hoverForPosition(document: vscode.TextDocument, position: vscode.Positi
     const range = new vscode.Range(positionAt(text, rewriteRange.start), positionAt(text, rewriteRange.end));
     const md = new vscode.MarkdownString('Segment rewritten - Select Analyze to determine new score.');
     md.isTrusted = false;
-    return { hover: new vscode.Hover(md, range), isMinorContributor };
+    return {
+      hover: new vscode.Hover(md, range),
+      isMinorContributor,
+      segmentStart: rewriteRange.start,
+      segmentEnd: rewriteRange.end,
+    };
   }
   const manuallyEditedRange = smallestContainingRange(state.editedRanges, charOffset);
   if (!bestMatch) {
@@ -2648,7 +2697,12 @@ function hoverForPosition(document: vscode.TextDocument, position: vscode.Positi
         '*Note: some text has been manually changed which may impact score - select Analyze again to obtain accurate statistics.*',
       );
       md.isTrusted = false;
-      return { hover: new vscode.Hover(md, range), isMinorContributor: false };
+      return {
+        hover: new vscode.Hover(md, range),
+        isMinorContributor: false,
+        segmentStart: manuallyEditedRange.start,
+        segmentEnd: manuallyEditedRange.end,
+      };
     }
     return undefined;
   }
@@ -2684,7 +2738,12 @@ function hoverForPosition(document: vscode.TextDocument, position: vscode.Positi
     positionAt(text, hoverStart),
     positionAt(text, hoverEnd > hoverStart ? hoverEnd : rowEnd),
   );
-  return { hover: new vscode.Hover(md, range), isMinorContributor };
+  return {
+    hover: new vscode.Hover(md, range),
+    isMinorContributor,
+    segmentStart: rowStart,
+    segmentEnd: rowEnd,
+  };
 }
 
 function updateStatusForEditor(editor: vscode.TextEditor): void {
