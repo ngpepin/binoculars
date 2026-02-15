@@ -62,8 +62,8 @@ interface RecentClosedStateCandidate {
 const DISPLAY_DECIMALS = 5;
 const LIVE_ESTIMATE_DEBOUNCE_MS = 900;
 const HOVER_TYPING_SUPPRESS_MS = 1300;
-const HOVER_DELAY_MAJOR_MS = 1150;
-const HOVER_DELAY_MINOR_MS = 1400;
+const HOVER_DELAY_MAJOR_MS = 1700;
+const HOVER_DELAY_MINOR_MS = 1900;
 
 const docStates = new Map<string, DocumentState>();
 const loadedSidecarSignatures = new Map<string, string>();
@@ -71,6 +71,7 @@ const recentClosedStatesByTextHash = new Map<string, RecentClosedStateCandidate>
 const recentClosedHashByDocKey = new Map<string, string>();
 const liveEstimateTimers = new Map<string, NodeJS.Timeout>();
 const liveEstimateEpochs = new Map<string, number>();
+const liveEstimateRecoverAttempts = new Map<string, number>();
 const recentTypingActivity = new Map<string, { atMs: number; start: number; end: number }>();
 const RECENT_CLOSED_STATE_TTL_MS = 6 * 60 * 60 * 1000;
 let backend: BackendClient | undefined;
@@ -238,7 +239,14 @@ async function computeLiveEstimate(key: string, epoch: number): Promise<void> {
     if (liveEditor.document.version !== version) {
       return;
     }
-    const estimatedB = Number(result.approx_b ?? NaN);
+    const approxB = Number(result.approx_b ?? NaN);
+    const observerLogPpl = Number((result as { observer_logPPL?: number }).observer_logPPL ?? NaN);
+    const estimatedB =
+      Number.isFinite(approxB)
+        ? approxB
+        : Number.isFinite(observerLogPpl) && Number.isFinite(baseCross) && baseCross !== 0
+          ? observerLogPpl / baseCross
+          : NaN;
     liveState.forecastPending = false;
     if (Number.isFinite(estimatedB)) {
       liveState.forecastEstimate = {
@@ -246,8 +254,18 @@ async function computeLiveEstimate(key: string, epoch: number): Promise<void> {
         docVersion: version,
         b: estimatedB,
       };
+      liveEstimateRecoverAttempts.delete(key);
     } else {
-      liveState.forecastEstimate = undefined;
+      const attempt = liveEstimateRecoverAttempts.get(key) ?? 0;
+      output.appendLine(
+        `[estimate] non-finite estimate (attempt=${attempt}) approx_b=${String(result.approx_b)} observer_logPPL=${String((result as { observer_logPPL?: number }).observer_logPPL)} baseCross=${String(baseCross)}`,
+      );
+      if (attempt < 1) {
+        liveEstimateRecoverAttempts.set(key, attempt + 1);
+        await stopBackend({ shutdownDaemon: true });
+        scheduleLiveEstimate(key);
+        return;
+      }
     }
     updateStatusForEditor(liveEditor);
   } catch (err) {
@@ -258,6 +276,17 @@ async function computeLiveEstimate(key: string, epoch: number): Promise<void> {
     const liveEditor = activeEditorForDocKey(key);
     if (liveState) {
       liveState.forecastPending = false;
+    }
+    const attempt = liveEstimateRecoverAttempts.get(key) ?? 0;
+    if (attempt < 1) {
+      liveEstimateRecoverAttempts.set(key, attempt + 1);
+      try {
+        await stopBackend({ shutdownDaemon: true });
+      } catch {
+        // ignore restart path failures and surface original error below
+      }
+      scheduleLiveEstimate(key);
+      return;
     }
     if (liveEditor) {
       updateStatusForEditor(liveEditor);
@@ -608,6 +637,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       clearLiveEstimateTimer(key);
       liveEstimateEpochs.delete(key);
+      liveEstimateRecoverAttempts.delete(key);
       recentTypingActivity.delete(key);
       docStates.delete(key);
       loadedSidecarSignatures.delete(key);
@@ -640,6 +670,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const state = docStates.get(key);
       if (state && evt.contentChanges.length > 0) {
         state.stale = true;
+        state.priorChunkB = undefined;
         state.forecastPending = state.chunks.length > 0;
         shiftChunkStateForContentChanges(state, evt.contentChanges, evt.document.getText().length);
         state.editedRanges = applyContentChangesToEditedRanges(state.editedRanges, evt.contentChanges);
@@ -1033,6 +1064,7 @@ async function runRewriteForSpan(
     const next = docStates.get(stateKey);
     if (next) {
       next.stale = true;
+      next.priorChunkB = undefined;
       next.editedRanges = mergeEditedRanges([
         ...next.editedRanges,
         {
@@ -2722,8 +2754,8 @@ function updateStatusForEditor(editor: vscode.TextEditor): void {
     }
     return {
       text: state.forecastPending
-        ? `${formatSignedMetric(estimate.b)} (approx, updating...)`
-        : `${formatSignedMetric(estimate.b)} (approx)`,
+        ? `${formatSignedMetric(estimate.b)} (updating...)`
+        : `${formatSignedMetric(estimate.b)}`,
       value: Number(estimate.b),
     };
   })();
@@ -2731,13 +2763,22 @@ function updateStatusForEditor(editor: vscode.TextEditor): void {
     typeof estimateState.value === 'number' && Number.isFinite(estimateState.value) && Number.isFinite(exactB)
       ? estimateState.value - exactB
       : undefined;
-  const shouldShowEstimate =
+  const hasNonZeroNumericEstimate =
     typeof estimateDiffValue === 'number' && Number.isFinite(estimateDiffValue)
       ? estimateDiffValue !== 0
       : false;
-  const estimateSuffix = shouldShowEstimate
-    ? ` | B Est.: ${estimateState.text} | B Diff. Est.: ${formatSignedMetric(estimateDiffValue ?? 0)}`
-    : '';
+  const estimateSuffix = (() => {
+    if (hasNonZeroNumericEstimate) {
+      return ` | B Est.: ${estimateState.text} | B Diff. Est.: ${formatSignedMetric(estimateDiffValue ?? 0)}`;
+    }
+    if (state.stale && state.forecastPending) {
+      return ' | B Est.: estimating... | B Diff. Est.: estimating...';
+    }
+    if (state.stale) {
+      return ' | B Est.: n/a | B Diff. Est.: n/a';
+    }
+    return '';
+  })();
   const priorBSuffix =
     typeof state.priorChunkB === 'number' && Number.isFinite(state.priorChunkB)
       ? ` | Prior B ${formatSignedMetric(state.priorChunkB)}`

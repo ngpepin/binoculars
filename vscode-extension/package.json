@@ -123,7 +123,7 @@
         {
           "command": "binoculars.disable",
           "when": "view == binoculars.controlsView && config.binoculars.enabled",
-          "group": "navigation@0"
+          "group": "navigation@8"
         },
         {
           "command": "binoculars.analyze",
@@ -170,7 +170,7 @@
         {
           "command": "binoculars.disable",
           "when": "editorTextFocus && config.binoculars.enabled",
-          "group": "2_binoculars@0"
+          "group": "2_binoculars@7"
         },
         {
           "command": "binoculars.analyze",

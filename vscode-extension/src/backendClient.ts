@@ -186,16 +186,39 @@ export class BackendClient implements vscode.Disposable {
 
     const connected = await this.tryConnect(socketPath, 1200);
     if (!connected) {
+      // Best effort: if a stale socket file exists, remove it before spawning.
+      try {
+        if (fs.existsSync(socketPath)) {
+          fs.unlinkSync(socketPath);
+        }
+      } catch {
+        // ignore; fallback path below retries and will surface a clear error
+      }
+
       this.spawnDaemonProcess(pythonPath, bridgeScriptPath, socketPath);
       const ready = await this.waitForDaemon(socketPath, 12000);
       if (!ready) {
         this.startPromise = undefined;
         throw new Error(`Timed out waiting for Binoculars daemon socket at ${socketPath}`);
       }
-      const retryConnected = await this.tryConnect(socketPath, 1500);
+
+      const retryConnected = await this.waitForConnect(socketPath, 12000, 1200);
       if (!retryConnected) {
-        this.startPromise = undefined;
-        throw new Error(`Unable to connect to Binoculars daemon at ${socketPath}`);
+        // One more recovery attempt: clean socket and respawn.
+        try {
+          if (fs.existsSync(socketPath)) {
+            fs.unlinkSync(socketPath);
+          }
+        } catch {
+          // ignore
+        }
+        this.spawnDaemonProcess(pythonPath, bridgeScriptPath, socketPath);
+        const readyAgain = await this.waitForDaemon(socketPath, 12000);
+        const retryConnectedAgain = readyAgain ? await this.waitForConnect(socketPath, 12000, 1200) : false;
+        if (!retryConnectedAgain) {
+          this.startPromise = undefined;
+          throw new Error(`Unable to connect to Binoculars daemon at ${socketPath}`);
+        }
       }
     }
 
@@ -233,6 +256,18 @@ export class BackendClient implements vscode.Disposable {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     return fs.existsSync(socketPath);
+  }
+
+  private async waitForConnect(socketPath: string, totalTimeoutMs: number, perAttemptMs: number): Promise<boolean> {
+    const deadline = Date.now() + totalTimeoutMs;
+    while (Date.now() < deadline) {
+      const ok = await this.tryConnect(socketPath, perAttemptMs);
+      if (ok) {
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    return this.tryConnect(socketPath, perAttemptMs);
   }
 
   private async tryConnect(socketPath: string, timeoutMs: number): Promise<boolean> {

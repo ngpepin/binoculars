@@ -56,7 +56,7 @@ class BridgeState:
     _runtime_cfg_path: Optional[str] = None
 
 
-OBSERVER_IDLE_TIMEOUT_SEC = 35.0
+OBSERVER_IDLE_TIMEOUT_SEC = 300.0
 
 
 class ObserverWarmCache:
