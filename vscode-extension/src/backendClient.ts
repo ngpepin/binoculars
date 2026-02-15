@@ -80,6 +80,7 @@ export class BackendClient implements vscode.Disposable {
     text: string,
     inputLabel: string,
     startChar: number,
+    endChar: number,
     baseCrossLogXppl: number,
   ): Promise<{
     ok: boolean;
@@ -95,6 +96,7 @@ export class BackendClient implements vscode.Disposable {
         text,
         input_label: inputLabel,
         start_char: startChar,
+        end_char: endChar,
         base_cross_logxppl: baseCrossLogXppl,
       },
       600000,

@@ -100,7 +100,7 @@ class ObserverWarmCache:
         except Exception:
             pass
 
-    def score_slice(self, state: "BridgeState", full_text: str, start_char: int) -> Dict[str, Any]:
+    def score_slice(self, state: "BridgeState", full_text: str, start_char: int, end_char: Optional[int] = None) -> Dict[str, Any]:
         cfg_path = _runtime_cfg_path(state)
         cfg, tcfg, _ccfg = load_config(cfg_path)
         if state.text_max_tokens_override is not None:
@@ -111,8 +111,10 @@ class ObserverWarmCache:
         if not obs_path:
             raise ValueError("observer.model_path is required.")
 
-        start = max(0, min(len(full_text), int(start_char)))
-        text = full_text[start:]
+        text_len = len(full_text)
+        start = max(0, min(text_len, int(start_char)))
+        end = text_len if end_char is None else max(start, min(text_len, int(end_char)))
+        text = full_text[start:end]
         if not text:
             return {
                 "observer_logPPL": float("nan"),
@@ -550,16 +552,17 @@ def _handle_request(
         text = str(params.get("text", state.last_text))
         input_label = str(params.get("input_label") or state.last_input_label or "<unsaved>")
         start = int(params.get("start_char", 0))
+        end = int(params.get("end_char", len(text)))
         base_cross = float(params.get("base_cross_logxppl", float("nan")))
         state.last_text = text
         state.last_input_label = input_label
 
         if observer_cache is not None:
-            local = observer_cache.score_slice(state, text, start)
+            local = observer_cache.score_slice(state, text, start, end)
         else:
             temp_cache = ObserverWarmCache(idle_timeout_sec=5.0)
             try:
-                local = temp_cache.score_slice(state, text, start)
+                local = temp_cache.score_slice(state, text, start, end)
             finally:
                 temp_cache.close()
 

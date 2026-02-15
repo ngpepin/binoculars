@@ -61,6 +61,9 @@ interface RecentClosedStateCandidate {
 
 const DISPLAY_DECIMALS = 5;
 const LIVE_ESTIMATE_DEBOUNCE_MS = 900;
+const HOVER_TYPING_SUPPRESS_MS = 1300;
+const HOVER_DELAY_MAJOR_MS = 1150;
+const HOVER_DELAY_MINOR_MS = 1400;
 
 const docStates = new Map<string, DocumentState>();
 const loadedSidecarSignatures = new Map<string, string>();
@@ -68,6 +71,7 @@ const recentClosedStatesByTextHash = new Map<string, RecentClosedStateCandidate>
 const recentClosedHashByDocKey = new Map<string, string>();
 const liveEstimateTimers = new Map<string, NodeJS.Timeout>();
 const liveEstimateEpochs = new Map<string, number>();
+const recentTypingActivity = new Map<string, { atMs: number; start: number; end: number }>();
 const RECENT_CLOSED_STATE_TTL_MS = 6 * 60 * 60 * 1000;
 let backend: BackendClient | undefined;
 let backendStarted = false;
@@ -118,6 +122,43 @@ function activeEditorForDocKey(key: string): vscode.TextEditor | undefined {
   return vscode.window.visibleTextEditors.find((editor) => editor.document.uri.toString() === key);
 }
 
+function noteTypingActivity(docKey: string, changes: readonly vscode.TextDocumentContentChangeEvent[], docLen: number): void {
+  if (changes.length === 0) {
+    return;
+  }
+  let start = Number.MAX_SAFE_INTEGER;
+  let end = 0;
+  for (const ch of changes) {
+    const s = Math.max(0, Math.min(docLen, Number(ch.rangeOffset ?? 0)));
+    const e = Math.max(s, Math.min(docLen, s + String(ch.text ?? '').length));
+    start = Math.min(start, s);
+    end = Math.max(end, e);
+  }
+  if (!Number.isFinite(start) || start === Number.MAX_SAFE_INTEGER) {
+    return;
+  }
+  recentTypingActivity.set(docKey, {
+    atMs: Date.now(),
+    start,
+    end: Math.max(start, end),
+  });
+}
+
+function shouldSuppressHoverDuringTyping(document: vscode.TextDocument, charOffset: number): boolean {
+  const key = document.uri.toString();
+  const activity = recentTypingActivity.get(key);
+  if (!activity) {
+    return false;
+  }
+  const ageMs = Date.now() - activity.atMs;
+  if (ageMs > HOVER_TYPING_SUPPRESS_MS) {
+    recentTypingActivity.delete(key);
+    return false;
+  }
+  const padding = 120;
+  return charOffset >= Math.max(0, activity.start - padding) && charOffset <= activity.end + padding;
+}
+
 function clearLiveEstimateTimer(key: string): void {
   const t = liveEstimateTimers.get(key);
   if (t) {
@@ -162,7 +203,11 @@ async function computeLiveEstimate(key: string, epoch: number): Promise<void> {
   }
   const fullText = editor.document.getText();
   const cursorOffset = offsetAt(fullText, editor.selection.active);
-  const activeChunk = getActiveChunk(editor, fullText, state);
+  const orderedChunks = [...state.chunks].sort((a, b) => a.charStart - b.charStart);
+  const cursorChunk = orderedChunks.find(
+    (chunk) => cursorOffset >= chunk.charStart && cursorOffset < chunk.analyzedCharEnd,
+  );
+  const activeChunk = cursorChunk ?? getActiveChunk(editor, fullText, state);
   if (!activeChunk || cursorOffset < activeChunk.charStart || cursorOffset >= activeChunk.analyzedCharEnd) {
     state.forecastPending = false;
     updateStatusForEditor(editor);
@@ -170,6 +215,7 @@ async function computeLiveEstimate(key: string, epoch: number): Promise<void> {
   }
 
   const chunkStart = Math.max(0, activeChunk.charStart);
+  const chunkEnd = Math.max(chunkStart, Math.min(fullText.length, activeChunk.analyzedCharEnd));
   const baseCross = Number(activeChunk.metrics?.cross_logXPPL ?? NaN);
   if (!Number.isFinite(baseCross) || baseCross === 0) {
     state.forecastPending = false;
@@ -180,7 +226,7 @@ async function computeLiveEstimate(key: string, epoch: number): Promise<void> {
   const version = editor.document.version;
   try {
     const client = await ensureBackend();
-    const result = await client.estimateLiveB(fullText, inputLabel(editor.document), chunkStart, baseCross);
+    const result = await client.estimateLiveB(fullText, inputLabel(editor.document), chunkStart, chunkEnd, baseCross);
     if (liveEstimateEpochs.get(key) !== epoch) {
       return;
     }
@@ -204,7 +250,7 @@ async function computeLiveEstimate(key: string, epoch: number): Promise<void> {
       liveState.forecastEstimate = undefined;
     }
     updateStatusForEditor(liveEditor);
-  } catch {
+  } catch (err) {
     if (liveEstimateEpochs.get(key) !== epoch) {
       return;
     }
@@ -216,6 +262,7 @@ async function computeLiveEstimate(key: string, epoch: number): Promise<void> {
     if (liveEditor) {
       updateStatusForEditor(liveEditor);
     }
+    output.appendLine(`[estimate] live estimate failed: ${(err as Error).message}`);
   }
 }
 
@@ -483,13 +530,16 @@ export function activate(context: vscode.ExtensionContext): void {
         if (!isExtensionEnabled()) {
           return undefined;
         }
+        const docText = document.getText();
+        const charOffset = offsetAt(docText, position);
+        if (shouldSuppressHoverDuringTyping(document, charOffset)) {
+          return undefined;
+        }
         const decision = hoverForPosition(document, position);
         if (!decision) {
           return undefined;
         }
-        if (!decision.isMinorContributor) {
-          return decision.hover;
-        }
+        const delayMs = decision.isMinorContributor ? HOVER_DELAY_MINOR_MS : HOVER_DELAY_MAJOR_MS;
         return new Promise<vscode.Hover | undefined>((resolve) => {
           let settled = false;
           const settle = (value: vscode.Hover | undefined) => {
@@ -505,7 +555,7 @@ export function activate(context: vscode.ExtensionContext): void {
               return;
             }
             settle(decision.hover);
-          }, 1000);
+          }, delayMs);
           token.onCancellationRequested(() => {
             clearTimeout(timer);
             settle(undefined);
@@ -558,6 +608,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       clearLiveEstimateTimer(key);
       liveEstimateEpochs.delete(key);
+      recentTypingActivity.delete(key);
       docStates.delete(key);
       loadedSidecarSignatures.delete(key);
       void refreshAnalyzeNextContext(undefined);
@@ -583,6 +634,9 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
       const key = evt.document.uri.toString();
+      if (evt.contentChanges.length > 0) {
+        noteTypingActivity(key, evt.contentChanges, evt.document.getText().length);
+      }
       const state = docStates.get(key);
       if (state && evt.contentChanges.length > 0) {
         state.stale = true;
@@ -2679,7 +2733,7 @@ function updateStatusForEditor(editor: vscode.TextEditor): void {
       : undefined;
   const shouldShowEstimate =
     typeof estimateDiffValue === 'number' && Number.isFinite(estimateDiffValue)
-      ? Number(estimateDiffValue.toFixed(DISPLAY_DECIMALS)) !== 0
+      ? estimateDiffValue !== 0
       : false;
   const estimateSuffix = shouldShowEstimate
     ? ` | B Est.: ${estimateState.text} | B Diff. Est.: ${formatSignedMetric(estimateDiffValue ?? 0)}`
