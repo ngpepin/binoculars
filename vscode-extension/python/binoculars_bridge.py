@@ -8,6 +8,7 @@ Each request must include: {"id": ..., "method": "...", "params": {...}}
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -44,6 +45,8 @@ from binoculars import (  # type: ignore
 
 @dataclass
 class BridgeState:
+    """Mutable per-connection state used to process bridge requests."""
+
     cfg_path: Optional[str] = None
     top_k: int = 5
     text_max_tokens_override: Optional[int] = None
@@ -60,6 +63,8 @@ OBSERVER_IDLE_TIMEOUT_SEC = 300.0
 
 
 class ObserverWarmCache:
+    """Keeps an observer model warm for low-latency live estimate requests."""
+
     def __init__(self, idle_timeout_sec: float = OBSERVER_IDLE_TIMEOUT_SEC) -> None:
         self.idle_timeout_sec = max(5.0, float(idle_timeout_sec))
         self._lock = threading.Lock()
@@ -192,6 +197,8 @@ _UNORDERED_LIST_RE = re.compile(r"^[ \t]{0,8}(?:[-+*]|(?:\[[ xX]\]))(?:[ \t]+)")
 
 
 def _preserve_ordered_list_markers(original_text: str, rewrite_text: str) -> Tuple[str, int]:
+    """Re-apply ordered-list numbering when a rewrite accidentally drops markers."""
+
     original = str(original_text or "")
     rewrite = str(rewrite_text or "")
     if not original or not rewrite:
@@ -295,6 +302,8 @@ def _preserve_ordered_list_markers(original_text: str, rewrite_text: str) -> Tup
 
 
 def _cleanup_runtime_cfg(state: BridgeState) -> None:
+    """Delete temporary runtime config file, if one is active."""
+
     runtime = state._runtime_cfg_path
     if not runtime:
         return
@@ -307,6 +316,8 @@ def _cleanup_runtime_cfg(state: BridgeState) -> None:
 
 
 def _runtime_cfg_path(state: BridgeState) -> str:
+    """Return effective config path, materializing temp overrides when needed."""
+
     base_cfg = str(state.cfg_path or "").strip()
     if not base_cfg:
         raise ValueError("cfg_path is required.")
@@ -343,11 +354,15 @@ def _runtime_cfg_path(state: BridgeState) -> str:
 
 
 def _send(msg: Dict[str, Any]) -> None:
+    """Emit one JSON message to stdout (single-line protocol frame)."""
+
     sys.stdout.write(json.dumps(_json_safe(msg), ensure_ascii=True) + "\n")
     sys.stdout.flush()
 
 
 def _json_safe(value: Any) -> Any:
+    """Normalize values so JSON serialization never emits NaN/Inf."""
+
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, dict):
@@ -358,6 +373,8 @@ def _json_safe(value: Any) -> Any:
 
 
 def _err(request_id: Any, message: str, code: str = "bridge_error", details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Build a structured error payload for bridge responses."""
+
     return {
         "id": request_id,
         "error": {
@@ -369,6 +386,8 @@ def _err(request_id: Any, message: str, code: str = "bridge_error", details: Opt
 
 
 def _shift_profile(profile: Optional[Dict[str, Any]], base_offset: int) -> Optional[Dict[str, Any]]:
+    """Shift local profile char offsets back into full-document coordinates."""
+
     if profile is None:
         return None
     out = dict(profile)
@@ -385,6 +404,8 @@ def _shift_profile(profile: Optional[Dict[str, Any]], base_offset: int) -> Optio
 
 
 def _extract_metrics(analysis: Dict[str, Any]) -> Dict[str, float]:
+    """Extract chunk metrics from analyze output into a compact flat dict."""
+
     return {
         "binoculars_score": float(analysis.get("binoculars", {}).get("score", float("nan"))),
         "observer_logPPL": float(analysis.get("observer", {}).get("logPPL", float("nan"))),
@@ -401,6 +422,8 @@ def _analyze_slice(
     slice_start: int,
     slice_end: int,
 ) -> Dict[str, Any]:
+    """Run analysis on a bounded text slice and package chunk-oriented response."""
+
     bounded_start = max(0, min(len(full_text), int(slice_start)))
     bounded_end = max(bounded_start, min(len(full_text), int(slice_end)))
     slice_text = full_text[bounded_start:bounded_end]
@@ -451,6 +474,8 @@ def _handle_request(
     request: Dict[str, Any],
     observer_cache: Optional[ObserverWarmCache] = None,
 ) -> Tuple[Dict[str, Any], bool]:
+    """Dispatch one request and return (response, should_close_connection)."""
+
     request_id = request.get("id")
     method = str(request.get("method", "")).strip()
     params = request.get("params", {})
@@ -639,18 +664,34 @@ def _handle_request(
         scored: List[Dict[str, Any]] = []
         base_metrics = params.get("base_metrics")
         if isinstance(base_metrics, dict):
-            scored = estimate_rewrite_b_impact_options(
-                cfg_path=_runtime_cfg_path(state),
-                full_text=text,
-                span_start=span_start,
-                span_end=span_end,
-                rewrites=rewrites,
-                base_doc_b=float(base_metrics.get("binoculars_score", 0.0)),
-                base_doc_observer_logppl=float(base_metrics.get("observer_logPPL", 0.0)),
-                base_doc_cross_logxppl=float(base_metrics.get("cross_logXPPL", 0.0)),
-                base_doc_transitions=int(base_metrics.get("transitions", 1)),
-                text_max_tokens_override=state.text_max_tokens_override,
-            )
+            if observer_cache is not None:
+                try:
+                    observer_cache.close()
+                except Exception:
+                    pass
+            gc.collect()
+
+            try:
+                scored = estimate_rewrite_b_impact_options(
+                    cfg_path=_runtime_cfg_path(state),
+                    full_text=text,
+                    span_start=span_start,
+                    span_end=span_end,
+                    rewrites=rewrites,
+                    base_doc_b=float(base_metrics.get("binoculars_score", 0.0)),
+                    base_doc_observer_logppl=float(base_metrics.get("observer_logPPL", 0.0)),
+                    base_doc_cross_logxppl=float(base_metrics.get("cross_logXPPL", 0.0)),
+                    base_doc_transitions=int(base_metrics.get("transitions", 1)),
+                    text_max_tokens_override=state.text_max_tokens_override,
+                )
+            except Exception as exc:
+                # Keep rewrite UX functional even when local impact scoring cannot
+                # allocate observer model resources in this moment.
+                status_messages.append(
+                    "Impact scoring unavailable right now; returning text-only rewrite options."
+                )
+                status_messages.append(f"Impact scoring error: {type(exc).__name__}: {exc}")
+                scored = []
 
         return {
             "id": request_id,
@@ -667,6 +708,8 @@ def _handle_request(
 
 
 class _ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    """Threaded Unix socket server with shared observer-cache janitor loop."""
+
     daemon_threads = True
     allow_reuse_address = True
 
@@ -699,6 +742,8 @@ class _ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamS
 
 
 class _DaemonRequestHandler(socketserver.StreamRequestHandler):
+    """Socket request handler implementing line-delimited JSON bridge protocol."""
+
     def setup(self) -> None:
         super().setup()
         self.state = BridgeState()
@@ -770,6 +815,8 @@ class _DaemonRequestHandler(socketserver.StreamRequestHandler):
 
 
 def daemon_main(socket_path: str) -> int:
+    """Run the shared Unix-socket daemon until shutdown is requested."""
+
     if not socket_path:
         raise ValueError("socket_path is required in daemon mode.")
 
@@ -801,6 +848,8 @@ def daemon_main(socket_path: str) -> int:
 
 
 def main() -> int:
+    """Run bridge in stdin/stdout mode for direct process embedding."""
+
     state = BridgeState()
     _send({"event": "ready", "payload": {"root_dir": ROOT_DIR}})
 

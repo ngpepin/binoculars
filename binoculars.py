@@ -97,6 +97,8 @@ _WORDNET_READY: Optional[bool] = None
 
 
 def should_suppress_llama_context_log(text: str) -> bool:
+    """Should suppress llama context log."""
+
     msg = (text or "").strip()
     if not msg:
         return False
@@ -104,6 +106,8 @@ def should_suppress_llama_context_log(text: str) -> bool:
 
 
 def _is_synonym_word_char(ch: str) -> bool:
+    """Internal helper: Is synonym word char."""
+
     return bool(ch) and (ch.isalpha() or ch in {"'", "’", "-"})
 
 
@@ -144,6 +148,8 @@ def extract_click_word_span(text: str, char_pos: int) -> Optional[Tuple[int, int
 
 
 def _normalize_synonym_candidate(word: str) -> Optional[str]:
+    """Internal helper: Normalize synonym candidate."""
+
     w = str(word or "").strip().replace("’", "'").lower()
     if not w:
         return None
@@ -164,6 +170,8 @@ def dedupe_synonym_candidates(
     candidates: List[str],
     max_items: int = SYNONYM_OPTION_COUNT,
 ) -> List[str]:
+    """Dedupe synonym candidates."""
+
     base = _normalize_synonym_candidate(base_word)
     out: List[str] = []
     seen: Set[str] = set()
@@ -183,6 +191,8 @@ def dedupe_synonym_candidates(
 
 
 def apply_word_case_from_template(template: str, candidate: str) -> str:
+    """Apply word case from template."""
+
     src = str(template or "")
     dst = str(candidate or "")
     if not dst:
@@ -197,14 +207,20 @@ def apply_word_case_from_template(template: str, candidate: str) -> str:
 
 
 def _is_ascii_alpha_word(word: str) -> bool:
+    """Internal helper: Is ascii alpha word."""
+
     return bool(re.fullmatch(r"[a-z]+", str(word or "")))
 
 
 def _is_vowel(ch: str) -> bool:
+    """Internal helper: Is vowel."""
+
     return ch in {"a", "e", "i", "o", "u"}
 
 
 def _looks_cvc_ending(word: str) -> bool:
+    """Internal helper: Looks cvc ending."""
+
     w = str(word or "")
     if len(w) < 3:
         return False
@@ -220,6 +236,8 @@ def _looks_cvc_ending(word: str) -> bool:
 
 
 def detect_inflection_pattern(word: str) -> str:
+    """Detect inflection pattern."""
+
     w = _normalize_synonym_candidate(word)
     if not w:
         return "base"
@@ -245,6 +263,8 @@ def detect_inflection_pattern(word: str) -> str:
 
 
 def inflect_candidate_to_pattern(base_candidate: str, pattern: str) -> str:
+    """Inflect candidate to pattern."""
+
     w = _normalize_synonym_candidate(base_candidate)
     if not w:
         return ""
@@ -312,6 +332,8 @@ def inflect_candidate_to_pattern(base_candidate: str, pattern: str) -> str:
 
 
 def _get_wordnet_module() -> Optional[Any]:
+    """Internal helper: Get wordnet module."""
+
     global _WORDNET_MODULE, _WORDNET_READY
     if _WORDNET_READY is False:
         return None
@@ -328,6 +350,8 @@ def _get_wordnet_module() -> Optional[Any]:
 
 
 def _lookup_synonyms_wordnet(word: str) -> List[str]:
+    """Internal helper: Lookup synonyms wordnet."""
+
     wn = _get_wordnet_module()
     if wn is None:
         return []
@@ -345,6 +369,8 @@ def _lookup_synonyms_wordnet(word: str) -> List[str]:
 
 
 def _lookup_synonyms_datamuse(word: str, timeout_s: float = 1.2) -> List[str]:
+    """Internal helper: Lookup synonyms datamuse."""
+
     encoded = urllib.parse.quote_plus(str(word or "").strip())
     if not encoded:
         return []
@@ -376,6 +402,8 @@ def _lookup_synonyms_datamuse(word: str, timeout_s: float = 1.2) -> List[str]:
 
 
 def lookup_synonyms_fast(word: str, max_items: int = SYNONYM_OPTION_COUNT) -> List[str]:
+    """Lookup synonyms fast."""
+
     base = _normalize_synonym_candidate(word)
     if not base:
         return []
@@ -391,6 +419,8 @@ def lookup_synonyms_fast(word: str, max_items: int = SYNONYM_OPTION_COUNT) -> Li
 
 
 def _emit_llama_log_text(text: str) -> None:
+    """Internal helper: Emit llama log text."""
+
     if not text:
         return
     if should_suppress_llama_context_log(text):
@@ -403,6 +433,8 @@ def _emit_llama_log_text(text: str) -> None:
 
 
 def _llama_log_callback(level: int, text: bytes, user_data: ctypes.c_void_p) -> None:
+    """Internal helper: Llama log callback."""
+
     del user_data
     if not text:
         return
@@ -420,6 +452,8 @@ def _llama_log_callback(level: int, text: bytes, user_data: ctypes.c_void_p) -> 
 
 
 def configure_llama_log_filtering() -> None:
+    """Configure llama log filtering."""
+
     global _LLAMA_LOG_CALLBACK, _LLAMA_LOG_CONFIGURED
     if _LLAMA_LOG_CONFIGURED:
         return
@@ -442,6 +476,8 @@ def configure_llama_log_filtering() -> None:
 
 
 def load_english_words() -> Set[str]:
+    """Load english words."""
+
     global _ENGLISH_WORDS_CACHE
     if _ENGLISH_WORDS_CACHE is not None:
         return _ENGLISH_WORDS_CACHE
@@ -473,6 +509,8 @@ def load_english_words() -> Set[str]:
 
 
 def _word_candidates(word: str) -> Set[str]:
+    """Internal helper: Word candidates."""
+
     w = word.replace("’", "'").lower()
     out: Set[str] = {w}
     if w.endswith("'s") and len(w) > 2:
@@ -485,6 +523,8 @@ def _word_candidates(word: str) -> Set[str]:
 
 
 def is_word_spelled_correctly(word: str, dictionary: Set[str]) -> bool:
+    """Is word spelled correctly."""
+
     if not word:
         return True
     if any(ch.isdigit() for ch in word):
@@ -510,6 +550,8 @@ def is_word_spelled_correctly(word: str, dictionary: Set[str]) -> bool:
 
 
 def find_misspelled_spans(text: str, dictionary: Set[str]) -> List[Tuple[int, int]]:
+    """Find misspelled spans."""
+
     spans: List[Tuple[int, int]] = []
     if not dictionary:
         return spans
@@ -556,10 +598,14 @@ def logsumexp_1d(x: np.ndarray) -> float:
 
 
 def ensure_dir(path: str) -> None:
+    """Ensure dir."""
+
     os.makedirs(path, exist_ok=True)
 
 
 def read_text(path: Optional[str]) -> str:
+    """Read text."""
+
     if path is None or path == "-":
         return sys.stdin.read()
     with open(path, "r", encoding="utf-8") as f:
@@ -567,6 +613,8 @@ def read_text(path: Optional[str]) -> str:
 
 
 def json_dump(obj: Any) -> str:
+    """Json dump."""
+
     return json.dumps(obj, indent=2, ensure_ascii=False)
 
 
@@ -606,6 +654,8 @@ def filter_llama_kwargs(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 @dataclass
 class TextConfig:
+    """TextConfig."""
+
     add_bos: bool = True
     special_tokens: bool = False
     # If set, allow truncation to this many tokens (0 means no truncation).
@@ -614,6 +664,8 @@ class TextConfig:
 
 @dataclass
 class CacheConfig:
+    """CacheConfig."""
+
     dir: str = ""
     dtype: str = "float32"     # float32 or float16
     keep: bool = False         # keep cache files for debugging
@@ -621,6 +673,8 @@ class CacheConfig:
 
 @dataclass
 class RewriteLLMConfig:
+    """RewriteLLMConfig."""
+
     endpoint_url: str
     model: str
     api_key: str = ""
@@ -639,11 +693,15 @@ class RewriteLLMConfig:
 
 
 def default_master_config_path() -> str:
+    """Default master config path."""
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(script_dir, "config.binoculars.json")
 
 
 def default_rewrite_llm_config_path() -> str:
+    """Default rewrite llm config path."""
+
     env_path = str(os.environ.get("BINOCULARS_REWRITE_LLM_CONFIG_PATH", "")).strip()
     if env_path:
         return env_path
@@ -652,6 +710,8 @@ def default_rewrite_llm_config_path() -> str:
 
 
 def _as_string_map(obj: Any) -> Dict[str, str]:
+    """Internal helper: As string map."""
+
     if not isinstance(obj, dict):
         return {}
     out: Dict[str, str] = {}
@@ -664,12 +724,16 @@ def _as_string_map(obj: Any) -> Dict[str, str]:
 
 
 def _as_object_map(obj: Any) -> Dict[str, Any]:
+    """Internal helper: As object map."""
+
     if not isinstance(obj, dict):
         return {}
     return dict(obj)
 
 
 def _build_chat_completions_url(endpoint_url: str, request_path: str) -> str:
+    """Internal helper: Build chat completions url."""
+
     base = str(endpoint_url).strip()
     if not base:
         return ""
@@ -685,6 +749,8 @@ def _build_chat_completions_url(endpoint_url: str, request_path: str) -> str:
 def load_optional_rewrite_llm_config(
     path: Optional[str] = None,
 ) -> Tuple[Optional[RewriteLLMConfig], Optional[str]]:
+    """Load optional rewrite llm config."""
+
     cfg_path = str(path or default_rewrite_llm_config_path()).strip()
     if not cfg_path:
         return None, None
@@ -797,6 +863,8 @@ def _post_json_request(
     headers: Dict[str, str],
     timeout_s: float,
 ) -> Dict[str, Any]:
+    """Internal helper: Post json request."""
+
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url=url, data=data, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=max(1.0, float(timeout_s))) as resp:
@@ -814,6 +882,8 @@ def _generate_rewrites_via_openai_compatible(
     user_prompt: str,
     option_count: int,
 ) -> List[str]:
+    """Internal helper: Generate rewrites via openai compatible."""
+
     n_opts = max(1, int(option_count))
     url = _build_chat_completions_url(llm_cfg.endpoint_url, llm_cfg.request_path)
     if not url:
@@ -870,6 +940,8 @@ def _generate_rewrites_via_openai_compatible(
 
 
 def load_master_config_detailed(path: str) -> Tuple[str, Dict[str, Dict[str, Any]]]:
+    """Load master config detailed."""
+
     with open(path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
@@ -931,12 +1003,16 @@ def load_master_config_detailed(path: str) -> Tuple[str, Dict[str, Dict[str, Any
 
 
 def load_master_config(path: str) -> Tuple[str, Dict[str, str]]:
+    """Load master config."""
+
     default_label, profiles_detailed = load_master_config_detailed(path)
     profiles: Dict[str, str] = {label: str(entry["path"]) for label, entry in profiles_detailed.items()}
     return default_label, profiles
 
 
 def resolve_profile_config_path(master_cfg_path: str, profile_label: Optional[str]) -> Tuple[str, str]:
+    """Resolve profile config path."""
+
     label, cfg_path, _max_tokens_override = resolve_profile_config(master_cfg_path, profile_label)
     return label, cfg_path
 
@@ -945,6 +1021,8 @@ def resolve_profile_config(
     master_cfg_path: str,
     profile_label: Optional[str],
 ) -> Tuple[str, str, Optional[int]]:
+    """Resolve profile config."""
+
     if not os.path.isfile(master_cfg_path):
         raise ValueError(f"Master config file not found: {master_cfg_path}")
 
@@ -975,6 +1053,8 @@ def resolve_profile_config(
 
 
 def load_config(path: str) -> Tuple[Dict[str, Any], TextConfig, CacheConfig]:
+    """Load config."""
+
     with open(path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
@@ -1003,11 +1083,15 @@ def load_config(path: str) -> Tuple[Dict[str, Any], TextConfig, CacheConfig]:
 
 
 def build_llama_instance(model_cfg: Dict[str, Any]) -> Llama:
+    """Build llama instance."""
+
     configure_llama_log_filtering()
     return Llama(**model_cfg)
 
 
 def close_llama(model: Optional[Llama]) -> None:
+    """Close llama."""
+
     if model is None:
         return
     try:
@@ -1038,6 +1122,8 @@ def tokenize_with_vocab_only(model_path: str, text_bytes: bytes, tcfg: TextConfi
 
 
 def maybe_truncate_tokens(tokens: List[int], max_tokens: int) -> List[int]:
+    """Maybe truncate tokens."""
+
     if max_tokens and max_tokens > 0 and len(tokens) > max_tokens:
         # Keep the first max_tokens tokens (simple truncation).
         return tokens[:max_tokens]
@@ -1138,6 +1224,8 @@ def save_logits_memmap(path: str, arr: np.ndarray, dtype: np.dtype) -> None:
 
 
 def load_logits_memmap(path: str, shape: Tuple[int, int], dtype: np.dtype) -> np.memmap:
+    """Load logits memmap."""
+
     return np.memmap(path, dtype=dtype, mode="r", shape=shape)
 
 
@@ -1210,6 +1298,8 @@ def split_markdown_paragraph_spans(text: str) -> List[Tuple[int, int]]:
 
 
 def build_excerpt(text: str, start: int, end: int, max_chars: int = 140) -> str:
+    """Build excerpt."""
+
     excerpt = " ".join(text[start:end].split())
     if len(excerpt) <= max_chars:
         return excerpt
@@ -1414,6 +1504,8 @@ def build_heatmap_markdown(
     xppl: float,
     binoculars_score: float,
 ) -> str:
+    """Build heatmap markdown."""
+
     return build_heatmap_output_markdown(
         text=text,
         source_label=source_label,
@@ -1434,6 +1526,8 @@ def _prepare_heatmap_annotations(
     top_k: int,
     observer_logppl: float,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[int, Dict[str, Any]], List[Dict[str, Any]]]:
+    """Internal helper: Prepare heatmap annotations."""
+
     rows = list(rows)
     k = max(1, int(top_k))
     low_rows = sorted(rows, key=lambda r: r["logPPL"])[:k]
@@ -1488,6 +1582,8 @@ def build_heatmap_output_markdown(
     xppl: float,
     binoculars_score: float,
 ) -> str:
+    """Build heatmap output markdown."""
+
     rows = list(paragraph_profile.get("rows", []))
     if not rows:
         return (
@@ -1568,6 +1664,8 @@ def build_heatmap_output_markdown(
 
 def _normalize_markdown_hardbreaks(text: str) -> str:
     # Normalize markdown hard-break markers expressed as trailing backslashes.
+    """Internal helper: Normalize markdown hardbreaks."""
+
     t = text.replace("\r\n", "\n").replace("\r", "\n")
     t = re.sub(r"\\[ \t]*\n", "\n", t)
     t = re.sub(r"\\[ \t]*$", "", t)
@@ -1578,6 +1676,8 @@ def _normalize_markdown_hardbreaks(text: str) -> str:
 
 def _normalize_console_text(text: str) -> str:
     # Console output should not show markdown hard-break markers as literal backslashes.
+    """Internal helper: Normalize console text."""
+
     t = _normalize_markdown_hardbreaks(text)
     return t
 
@@ -1586,10 +1686,14 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _visible_len(s: str) -> int:
+    """Internal helper: Visible len."""
+
     return len(ANSI_RE.sub("", s))
 
 
 def _wrap_ansi_line(line: str, width: int) -> List[str]:
+    """Internal helper: Wrap ansi line."""
+
     if width <= 0 or _visible_len(line) <= width:
         return [line]
 
@@ -1615,6 +1719,8 @@ def _wrap_ansi_line(line: str, width: int) -> List[str]:
 
 
 def _wrap_console_text(text: str, width: int) -> str:
+    """Internal helper: Wrap console text."""
+
     out_lines: List[str] = []
     for raw_line in text.split("\n"):
         if raw_line.strip() == "":
@@ -1628,12 +1734,16 @@ def _wrap_console_text(text: str, width: int) -> str:
 
 
 def _console_target_width() -> int:
+    """Internal helper: Console target width."""
+
     cols = shutil.get_terminal_size(fallback=(120, 24)).columns
     target = int(cols * 0.85)
     return max(72, target)
 
 
 def _truncate_cell(value: str, max_len: int) -> str:
+    """Internal helper: Truncate cell."""
+
     if max_len <= 1:
         return value[:max_len]
     if len(value) <= max_len:
@@ -1642,6 +1752,8 @@ def _truncate_cell(value: str, max_len: int) -> str:
 
 
 def _draw_console_table(headers: List[str], rows: List[List[str]], max_width: Optional[int] = None) -> str:
+    """Internal helper: Draw console table."""
+
     widths: List[int] = []
     for idx, h in enumerate(headers):
         max_cell = len(h)
@@ -1694,6 +1806,8 @@ def _draw_console_table(headers: List[str], rows: List[List[str]], max_width: Op
 
 
 def _wrap_line(line: str, width: int) -> List[str]:
+    """Internal helper: Wrap line."""
+
     if len(line) <= width:
         return [line]
     words = re.findall(r"\S+\s*", line)
@@ -1716,6 +1830,8 @@ def _wrap_line(line: str, width: int) -> List[str]:
 
 
 def _format_summary_lines(lines: List[str], width: int) -> List[str]:
+    """Internal helper: Format summary lines."""
+
     out: List[str] = []
     for line in lines:
         wrapped = _wrap_line(line, width)
@@ -1731,6 +1847,8 @@ def _build_console_text_body(
     green: str,
     reset: str,
 ) -> str:
+    """Internal helper: Build console text body."""
+
     text_parts: List[str] = []
     pos = 0
     for row in sorted(rows, key=lambda r: r["char_start"]):
@@ -1752,6 +1870,8 @@ def _build_console_text_body(
 
 
 def _build_console_table_rows(endnotes: List[Dict[str, Any]]) -> List[List[str]]:
+    """Internal helper: Build console table rows."""
+
     table_rows: List[List[str]] = []
     for info in endnotes:
         pct = info["pct_contribution"]
@@ -1771,6 +1891,8 @@ def _build_console_table_rows(endnotes: List[Dict[str, Any]]) -> List[List[str]]
 
 
 def _build_console_table(max_width: int, endnotes: List[Dict[str, Any]]) -> str:
+    """Internal helper: Build console table."""
+
     headers = [
         "Idx",
         "Lbl",
@@ -1796,6 +1918,8 @@ def _build_summary_block(
     high_count: int,
     width: int,
 ) -> List[str]:
+    """Internal helper: Build summary block."""
+
     lines = [
         f"- Observer logPPL: {observer_logppl:.6f} (PPL {observer_ppl:.3f})",
         f"- Performer logPPL: {performer_logppl:.6f} (PPL {performer_ppl:.3f})",
@@ -1821,6 +1945,8 @@ def build_heatmap_output_console(
     binoculars_score: float,
     force_color: Optional[bool] = None,
 ) -> str:
+    """Build heatmap output console."""
+
     rows = list(paragraph_profile.get("rows", []))
     if not rows:
         return (
@@ -1889,6 +2015,8 @@ def build_heatmap_output_console(
 
 
 def infer_heatmap_output_path(input_path: Optional[str]) -> str:
+    """Infer heatmap output path."""
+
     if input_path and input_path != "-":
         src_dir = os.path.dirname(input_path) or "."
         stem = os.path.splitext(os.path.basename(input_path))[0]
@@ -1897,6 +2025,8 @@ def infer_heatmap_output_path(input_path: Optional[str]) -> str:
 
 
 def backup_existing_file(path: str) -> Optional[str]:
+    """Backup existing file."""
+
     if not os.path.exists(path):
         return None
 
@@ -1924,6 +2054,8 @@ def analyze_text_document(
     need_paragraph_profile: bool,
     text_max_tokens_override: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Analyze text document."""
+
     cfg, tcfg, ccfg = load_config(cfg_path)
     if text_max_tokens_override is not None:
         if int(text_max_tokens_override) < 0:
@@ -2136,6 +2268,8 @@ def analyze_text_document(
 
 
 def _extract_completion_text(response: Any) -> str:
+    """Internal helper: Extract completion text."""
+
     if not isinstance(response, dict):
         return ""
     choices = response.get("choices")
@@ -2156,6 +2290,8 @@ def _extract_completion_text(response: Any) -> str:
 
 
 def _normalize_generated_rewrite(text: str) -> str:
+    """Internal helper: Normalize generated rewrite."""
+
     s = str(text or "").strip()
     if not s:
         return ""
@@ -2174,6 +2310,8 @@ def _normalize_generated_rewrite(text: str) -> str:
 
 
 def _semantic_text_key(text: str) -> str:
+    """Internal helper: Semantic text key."""
+
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
@@ -2182,6 +2320,8 @@ def _score_observer_logppl_batch(
     texts: List[str],
     text_max_tokens_override: Optional[int] = None,
 ) -> List[Dict[str, float]]:
+    """Internal helper: Score observer logppl batch."""
+
     if not texts:
         return []
 
@@ -2214,10 +2354,48 @@ def _score_observer_logppl_batch(
     obs_cfg.setdefault("verbose", False)
     obs_cfg = filter_llama_kwargs(obs_cfg)
 
+    build_attempts: List[Dict[str, Any]] = []
+    build_attempts.append(dict(obs_cfg))
+
+    # Retry with a smaller batch footprint first.
+    low_batch_cfg = dict(obs_cfg)
+    try:
+        existing_batch = int(low_batch_cfg.get("n_batch", 0) or 0)
+    except Exception:
+        existing_batch = 0
+    low_batch_cfg["n_batch"] = min(existing_batch, 256) if existing_batch > 0 else 256
+    try:
+        existing_ubatch = int(low_batch_cfg.get("n_ubatch", 0) or 0)
+    except Exception:
+        existing_ubatch = 0
+    low_batch_cfg["n_ubatch"] = min(existing_ubatch, 128) if existing_ubatch > 0 else 128
+    if low_batch_cfg != obs_cfg:
+        build_attempts.append(low_batch_cfg)
+
+    # Last resort: force CPU placement for rewrite-impact estimates.
+    cpu_fallback_cfg = dict(low_batch_cfg)
+    if int(cpu_fallback_cfg.get("n_gpu_layers", 0) or 0) != 0:
+        cpu_fallback_cfg["n_gpu_layers"] = 0
+        build_attempts.append(cpu_fallback_cfg)
+
     obs = None
+    last_build_exc: Optional[Exception] = None
     out: List[Dict[str, float]] = []
     try:
-        obs = build_llama_instance(obs_cfg)
+        for cfg_try in build_attempts:
+            try:
+                obs = build_llama_instance(cfg_try)
+                break
+            except Exception as exc:
+                last_build_exc = exc
+                obs = None
+                gc.collect()
+
+        if obs is None:
+            if last_build_exc is not None:
+                raise last_build_exc
+            raise ValueError("Unable to load observer model for local rewrite scoring.")
+
         n_vocab_obs = obs.n_vocab()
         for toks in tokens_per_text:
             obs.reset()
@@ -2248,6 +2426,8 @@ def _choose_rewrite_window_bounds(
     pad_chars: int = 120,
     max_window_chars: int = 2600,
 ) -> Tuple[int, int]:
+    """Internal helper: Choose rewrite window bounds."""
+
     n = len(text)
     start = max(0, min(n, int(span_start)))
     end = max(start, min(n, int(span_end)))
@@ -2285,6 +2465,8 @@ def _choose_rewrite_window_bounds(
 
 
 def _clip_text_middle(text: str, max_chars: int) -> str:
+    """Internal helper: Clip text middle."""
+
     s = str(text or "")
     cap = max(80, int(max_chars))
     if len(s) <= cap:
@@ -2299,6 +2481,8 @@ def _paragraph_index_for_span(
     start: int,
     end: int,
 ) -> Optional[int]:
+    """Internal helper: Paragraph index for span."""
+
     for i, (s, e) in enumerate(spans):
         if end > s and start < e:
             return i
@@ -2311,6 +2495,8 @@ def _build_rewrite_prompts(
     span_end: int,
     llm_cfg: Optional[RewriteLLMConfig],
 ) -> Tuple[str, str, str]:
+    """Internal helper: Build rewrite prompts."""
+
     start = max(0, min(len(full_text), int(span_start)))
     end = max(start, min(len(full_text), int(span_end)))
     target = full_text[start:end]
@@ -2407,6 +2593,8 @@ def _generate_rewrites_via_internal_performer(
     option_count: int,
     status_callback: Optional[Callable[[str], None]] = None,
 ) -> List[str]:
+    """Internal helper: Generate rewrites via internal performer."""
+
     n_opts = max(1, int(option_count))
     cfg, _tcfg, _ccfg = load_config(cfg_path)
     performer_section = cfg["performer"]
@@ -2512,6 +2700,8 @@ def generate_rewrite_candidates_for_span(
     option_count: int = 3,
     status_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[List[str], str, Optional[str]]:
+    """Generate rewrite candidates for span."""
+
     n_opts = max(1, int(option_count))
     start = max(0, min(len(full_text), int(span_start)))
     end = max(start, min(len(full_text), int(span_end)))
@@ -2578,6 +2768,8 @@ def estimate_rewrite_b_impact_options(
     base_doc_transitions: int,
     text_max_tokens_override: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
+    """Estimate rewrite b impact options."""
+
     if not rewrites:
         return []
 
@@ -2658,6 +2850,8 @@ def launch_gui(
     top_k: int,
     text_max_tokens_override: Optional[int] = None,
 ) -> int:
+    """Launch gui."""
+
     try:
         import tkinter as tk
         import tkinter.font as tkfont
@@ -7015,6 +7209,8 @@ def run(
     heatmap: bool,
     text_max_tokens_override: Optional[int] = None,
 ) -> int:
+    """Run."""
+
     text = read_text(input_path)
     result, paragraph_profile = analyze_text_document(
         cfg_path=cfg_path,
@@ -7103,6 +7299,8 @@ def run(
 
 
 def main() -> int:
+    """Main."""
+
     ap = argparse.ArgumentParser(
         description="Binoculars-style scoring for markdown text using two llama.cpp models loaded sequentially.",
         usage=(

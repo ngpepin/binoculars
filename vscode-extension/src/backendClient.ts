@@ -7,6 +7,10 @@ import * as readline from 'node:readline';
 import * as vscode from 'vscode';
 import { AnalyzeResult, BridgeRequest, BridgeResponse, RewriteResult } from './types';
 
+/**
+ * Manages a single persistent JSON-RPC-like socket connection to the
+ * Binoculars Python daemon and exposes typed helper methods for extension code.
+ */
 export class BackendClient implements vscode.Disposable {
   private socket: net.Socket | undefined;
   private rl: readline.Interface | undefined;
@@ -23,6 +27,7 @@ export class BackendClient implements vscode.Disposable {
     this.output = output;
   }
 
+  /** Ensure daemon process + socket connection are available. */
   public async start(pythonPath: string, bridgeScriptPath: string): Promise<void> {
     if (this.socket && !this.socket.destroyed) {
       return;
@@ -34,6 +39,7 @@ export class BackendClient implements vscode.Disposable {
     return this.startPromise;
   }
 
+  /** Push runtime configuration into the daemon state. */
   public async initialize(
     cfgPath: string,
     topK: number,
@@ -52,6 +58,7 @@ export class BackendClient implements vscode.Disposable {
     });
   }
 
+  /** Analyze a full document in one call. */
   public analyzeDocument(text: string, inputLabel: string): Promise<AnalyzeResult> {
     return this.request<AnalyzeResult>('analyze_document', {
       text,
@@ -59,6 +66,7 @@ export class BackendClient implements vscode.Disposable {
     });
   }
 
+  /** Analyze a specific character span (chunk). */
   public analyzeChunk(text: string, inputLabel: string, startChar: number, endChar: number): Promise<AnalyzeResult> {
     return this.request<AnalyzeResult>('analyze_chunk', {
       text,
@@ -68,6 +76,7 @@ export class BackendClient implements vscode.Disposable {
     });
   }
 
+  /** Analyze the next available chunk from daemon-maintained chunk cursor. */
   public analyzeNextChunk(text: string, inputLabel: string, startChar?: number): Promise<AnalyzeResult> {
     return this.request<AnalyzeResult>('analyze_next_chunk', {
       text,
@@ -76,6 +85,7 @@ export class BackendClient implements vscode.Disposable {
     });
   }
 
+  /** Request observer-only live B estimate for stale edited text. */
   public estimateLiveB(
     text: string,
     inputLabel: string,
@@ -103,6 +113,7 @@ export class BackendClient implements vscode.Disposable {
     );
   }
 
+  /** Request rewrite candidates (and optional approximate scoring) for a span. */
   public rewriteSpan(
     text: string,
     spanStart: number,
@@ -119,6 +130,7 @@ export class BackendClient implements vscode.Disposable {
     });
   }
 
+  /** Stop current socket session (daemon may keep running). */
   public async shutdown(): Promise<void> {
     if (!this.socket || this.socket.destroyed) {
       this.cleanupConnectionState();
@@ -134,6 +146,7 @@ export class BackendClient implements vscode.Disposable {
     this.cleanupConnectionState();
   }
 
+  /** Ask the shared daemon process to terminate. */
   public async shutdownDaemon(): Promise<void> {
     if (this.socket && !this.socket.destroyed) {
       try {
@@ -176,10 +189,12 @@ export class BackendClient implements vscode.Disposable {
     }).catch(() => undefined);
   }
 
+  /** VS Code disposable contract. */
   public dispose(): void {
     void this.shutdown();
   }
 
+  /** Boot/connect flow with stale socket cleanup and retry spawn strategy. */
   private async startInternal(pythonPath: string, bridgeScriptPath: string): Promise<void> {
     const socketPath = BackendClient.defaultSocketPath();
     this.socketPath = socketPath;
@@ -225,11 +240,13 @@ export class BackendClient implements vscode.Disposable {
     await this.waitForReady();
   }
 
+  /** Stable per-user UNIX domain socket path for the shared daemon. */
   private static defaultSocketPath(): string {
     const uid = typeof process.getuid === 'function' ? String(process.getuid()) : String(process.env.USER ?? 'user');
     return path.join(os.tmpdir(), `binoculars-vscode-${uid}.sock`);
   }
 
+  /** Spawn detached Python daemon process bound to the configured socket path. */
   private spawnDaemonProcess(pythonPath: string, bridgeScriptPath: string, socketPath: string): void {
     try {
       const socketDir = path.dirname(socketPath);
@@ -247,6 +264,7 @@ export class BackendClient implements vscode.Disposable {
     child.unref();
   }
 
+  /** Poll for daemon socket file creation. */
   private async waitForDaemon(socketPath: string, timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -258,6 +276,7 @@ export class BackendClient implements vscode.Disposable {
     return fs.existsSync(socketPath);
   }
 
+  /** Repeatedly attempt socket connection until timeout. */
   private async waitForConnect(socketPath: string, totalTimeoutMs: number, perAttemptMs: number): Promise<boolean> {
     const deadline = Date.now() + totalTimeoutMs;
     while (Date.now() < deadline) {
@@ -270,6 +289,7 @@ export class BackendClient implements vscode.Disposable {
     return this.tryConnect(socketPath, perAttemptMs);
   }
 
+  /** Attempt a single connection and attach line/event handlers on success. */
   private async tryConnect(socketPath: string, timeoutMs: number): Promise<boolean> {
     this.cleanupConnectionState();
     this.readySeen = false;
@@ -304,6 +324,7 @@ export class BackendClient implements vscode.Disposable {
     });
   }
 
+  /** Wire socket + line reader and map process events to extension diagnostics. */
   private attachSocket(sock: net.Socket): void {
     this.socket = sock;
     this.rl = readline.createInterface({ input: sock });
@@ -320,6 +341,7 @@ export class BackendClient implements vscode.Disposable {
     });
   }
 
+  /** Parse one daemon line, dispatch ready/event/result/error to request waiters. */
   private onLine(line: string): void {
     const trimmed = line.trim();
     if (!trimmed) {
@@ -367,6 +389,7 @@ export class BackendClient implements vscode.Disposable {
     pending.resolve(msg.result);
   }
 
+  /** Wait for the daemon `ready` event before allowing request traffic. */
   private waitForReady(timeoutMs = 10000): Promise<void> {
     if (this.readySeen) {
       return Promise.resolve();
@@ -384,6 +407,7 @@ export class BackendClient implements vscode.Disposable {
     });
   }
 
+  /** Send a request and resolve/reject by matching response id. */
   private request<T = unknown>(method: string, params: Record<string, unknown>, timeoutMs = 180000): Promise<T> {
     if (!this.socket || this.socket.destroyed) {
       return Promise.reject(new Error('Binoculars daemon is not connected.'));
@@ -409,6 +433,7 @@ export class BackendClient implements vscode.Disposable {
     });
   }
 
+  /** Reset connection/session state fields after close/error. */
   private cleanupConnectionState(): void {
     this.rl?.close();
     this.rl = undefined;
@@ -419,6 +444,7 @@ export class BackendClient implements vscode.Disposable {
     this.readySeen = false;
   }
 
+  /** Reject all in-flight requests during connection failure/teardown. */
   private cleanupPending(err: Error): void {
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);

@@ -65,6 +65,7 @@ const DISPLAY_DECIMALS = 5;
 const LIVE_ESTIMATE_DEBOUNCE_MS = 900;
 const HOVER_TYPING_SUPPRESS_MS = 1300;
 const HOVER_SAME_SEGMENT_SUPPRESS_MS = 900;
+const HOVER_CONTRIBUTOR_DELAY_MS = 1500;
 
 const docStates = new Map<string, DocumentState>();
 const loadedSidecarSignatures = new Map<string, string>();
@@ -75,6 +76,10 @@ const liveEstimateEpochs = new Map<string, number>();
 const liveEstimateRecoverAttempts = new Map<string, number>();
 const recentTypingActivity = new Map<string, { atMs: number; start: number; end: number }>();
 const hoverSeenSegments = new Map<string, { start: number; end: number; lastSeenMs: number }>();
+const hoverDelayGates = new Map<
+  string,
+  { start: number; end: number; anchorOffset: number; readyAtMs: number; timer?: NodeJS.Timeout }
+>();
 const RECENT_CLOSED_STATE_TTL_MS = 6 * 60 * 60 * 1000;
 let backend: BackendClient | undefined;
 let backendStarted = false;
@@ -87,15 +92,19 @@ let extensionCtx: vscode.ExtensionContext;
 let runtimeColorizationEnabled = true;
 let foregroundBusyOperationCount = 0;
 
+// Is Extension Enabled.
 function isExtensionEnabled(): boolean {
+  // Global enablement switch shared by menus, status, and bridge operations.
   const cfg = vscode.workspace.getConfiguration('binoculars');
   return cfg.get<boolean>('enabled', true);
 }
 
+// Set Enablement Context.
 async function setEnablementContext(enabled: boolean): Promise<void> {
   await vscode.commands.executeCommand('setContext', 'binoculars:isEnabled', enabled);
 }
 
+// Has Next Chunk Available.
 function hasNextChunkAvailable(editor: vscode.TextEditor | undefined): boolean {
   if (!editor || !isExtensionEnabled()) {
     return false;
@@ -112,6 +121,7 @@ function hasNextChunkAvailable(editor: vscode.TextEditor | undefined): boolean {
   return covered < textLen;
 }
 
+// Has Analysis For Editor.
 function hasAnalysisForEditor(editor: vscode.TextEditor | undefined): boolean {
   if (!editor || !isExtensionEnabled()) {
     return false;
@@ -120,6 +130,7 @@ function hasAnalysisForEditor(editor: vscode.TextEditor | undefined): boolean {
   return Boolean(state && state.chunks.length > 0);
 }
 
+// Can Analyze All.
 function canAnalyzeAll(editor: vscode.TextEditor | undefined): boolean {
   if (!editor || !isExtensionEnabled()) {
     return false;
@@ -136,6 +147,7 @@ function canAnalyzeAll(editor: vscode.TextEditor | undefined): boolean {
   return covered < textLen;
 }
 
+// Has Priors For Editor.
 function hasPriorsForEditor(editor: vscode.TextEditor | undefined): boolean {
   if (!editor || !isExtensionEnabled()) {
     return false;
@@ -147,7 +159,9 @@ function hasPriorsForEditor(editor: vscode.TextEditor | undefined): boolean {
   return (state.priorLowRanges?.length ?? 0) > 0 || (state.priorHighRanges?.length ?? 0) > 0;
 }
 
+// Refresh Analyze Next Context.
 async function refreshAnalyzeNextContext(editor?: vscode.TextEditor): Promise<void> {
+  // Keep command/menu contexts aligned with the active editor state.
   const active = editor ?? vscode.window.activeTextEditor;
   await vscode.commands.executeCommand('setContext', 'binoculars.hasNextChunk', hasNextChunkAvailable(active));
   await vscode.commands.executeCommand('setContext', 'binoculars.hasAnalysis', hasAnalysisForEditor(active));
@@ -155,6 +169,7 @@ async function refreshAnalyzeNextContext(editor?: vscode.TextEditor): Promise<vo
   await vscode.commands.executeCommand('setContext', 'binoculars.hasPriors', hasPriorsForEditor(active));
 }
 
+// Active Editor For Doc Key.
 function activeEditorForDocKey(key: string): vscode.TextEditor | undefined {
   const active = vscode.window.activeTextEditor;
   if (active && active.document.uri.toString() === key) {
@@ -163,7 +178,9 @@ function activeEditorForDocKey(key: string): vscode.TextEditor | undefined {
   return vscode.window.visibleTextEditors.find((editor) => editor.document.uri.toString() === key);
 }
 
+// Note Typing Activity.
 function noteTypingActivity(docKey: string, changes: readonly vscode.TextDocumentContentChangeEvent[], docLen: number): void {
+  // Record most recent edit span to suppress hover popups while the user types.
   if (changes.length === 0) {
     return;
   }
@@ -185,7 +202,9 @@ function noteTypingActivity(docKey: string, changes: readonly vscode.TextDocumen
   });
 }
 
+// Should Suppress Hover During Typing.
 function shouldSuppressHoverDuringTyping(document: vscode.TextDocument, charOffset: number): boolean {
+  // Suppress hover near fresh edits for a short window to reduce UI interference.
   const key = document.uri.toString();
   const activity = recentTypingActivity.get(key);
   if (!activity) {
@@ -200,6 +219,77 @@ function shouldSuppressHoverDuringTyping(document: vscode.TextDocument, charOffs
   return charOffset >= Math.max(0, activity.start - padding) && charOffset <= activity.end + padding;
 }
 
+function clearHoverDelayGate(docKey: string): void {
+  const gate = hoverDelayGates.get(docKey);
+  if (gate?.timer) {
+    clearTimeout(gate.timer);
+  }
+  hoverDelayGates.delete(docKey);
+}
+
+function scheduleHoverGateReveal(docKey: string, start: number, end: number, anchorOffset: number, delayMs: number): void {
+  const timer = setTimeout(() => {
+    const active = vscode.window.activeTextEditor;
+    if (!active || active.document.uri.toString() !== docKey) {
+      return;
+    }
+    const text = active.document.getText();
+    const normalizedStart = Math.max(0, Math.min(text.length, start));
+    const normalizedEnd = Math.max(normalizedStart, Math.min(text.length, end));
+    if (normalizedEnd <= normalizedStart) {
+      return;
+    }
+    const clampedAnchor = Math.max(normalizedStart, Math.min(normalizedEnd - 1, anchorOffset));
+    if (shouldSuppressHoverDuringTyping(active.document, clampedAnchor)) {
+      return;
+    }
+    const cursorOffset = offsetAt(text, active.selection.active);
+    const cursorInsideSegment = cursorOffset >= normalizedStart && cursorOffset < normalizedEnd;
+    const anchorPos = positionAt(text, clampedAnchor);
+    const targetSelection = new vscode.Selection(anchorPos, anchorPos);
+
+    let shouldRestoreSelection = false;
+    let priorSelections: vscode.Selection[] | undefined;
+    if (!cursorInsideSegment && active.selections.length === 1 && active.selection.isEmpty) {
+      const lineVisible = active.visibleRanges.some((range) => anchorPos.line >= range.start.line && anchorPos.line <= range.end.line);
+      if (!lineVisible) {
+        return;
+      }
+      priorSelections = active.selections.map((sel) => new vscode.Selection(sel.start, sel.end));
+      if (!active.selection.isEqual(targetSelection)) {
+        active.selections = [targetSelection];
+        shouldRestoreSelection = true;
+      }
+    }
+
+    const restoreIfNeeded = (): void => {
+      if (!shouldRestoreSelection || !priorSelections) {
+        return;
+      }
+      const latestEditor = vscode.window.activeTextEditor;
+      if (!latestEditor || latestEditor.document.uri.toString() !== docKey) {
+        return;
+      }
+      // Only restore if the temporary target selection is still active.
+      if (latestEditor.selections.length === 1 && latestEditor.selection.isEqual(targetSelection)) {
+        latestEditor.selections = priorSelections;
+      }
+    };
+    void vscode.commands.executeCommand('editor.action.showHover').then(
+      () => restoreIfNeeded(),
+      () => restoreIfNeeded(),
+    );
+  }, Math.max(0, delayMs));
+  hoverDelayGates.set(docKey, {
+    start,
+    end,
+    anchorOffset,
+    readyAtMs: Date.now() + Math.max(0, delayMs),
+    timer,
+  });
+}
+
+// Clear Live Estimate Timer.
 function clearLiveEstimateTimer(key: string): void {
   const t = liveEstimateTimers.get(key);
   if (t) {
@@ -208,7 +298,9 @@ function clearLiveEstimateTimer(key: string): void {
   }
 }
 
+// Schedule Live Estimate.
 function scheduleLiveEstimate(key: string): void {
+  // Debounce live estimate requests; only stale analyzed docs are eligible.
   if (!isExtensionEnabled() || foregroundBusyOperationCount > 0) {
     return;
   }
@@ -229,7 +321,9 @@ function scheduleLiveEstimate(key: string): void {
   liveEstimateTimers.set(key, timer);
 }
 
+// Compute Live Estimate.
 async function computeLiveEstimate(key: string, epoch: number): Promise<void> {
+  // Observer-only directional forecast used for stale chunk status updates.
   if (!isExtensionEnabled() || foregroundBusyOperationCount > 0) {
     return;
   }
@@ -335,6 +429,7 @@ async function computeLiveEstimate(key: string, epoch: number): Promise<void> {
   }
 }
 
+// Ensure Enabled Or Notify.
 function ensureEnabledOrNotify(): boolean {
   if (isExtensionEnabled()) {
     return true;
@@ -343,6 +438,7 @@ function ensureEnabledOrNotify(): boolean {
   return false;
 }
 
+// Resolve Render Palette.
 function resolveRenderPalette(): RenderPalette {
   // Dark-first palette. Light-mode palette remains intentionally conservative
   // until dedicated light-theme tuning is implemented.
@@ -406,6 +502,7 @@ const editedDecoration = vscode.window.createTextEditorDecorationType({
   borderRadius: '2px',
 });
 
+// Binoculars Control Item.
 class BinocularsControlItem extends vscode.TreeItem {
   constructor(
     label: string,
@@ -430,6 +527,7 @@ class BinocularsControlItem extends vscode.TreeItem {
   }
 }
 
+// Binoculars Controls Provider.
 class BinocularsControlsProvider implements vscode.TreeDataProvider<BinocularsControlItem> {
   private readonly emitter = new vscode.EventEmitter<BinocularsControlItem | undefined>();
   readonly onDidChangeTreeData = this.emitter.event;
@@ -517,6 +615,7 @@ class BinocularsControlsProvider implements vscode.TreeDataProvider<BinocularsCo
   }
 }
 
+// Gutter Palette.
 class GutterPalette implements vscode.Disposable {
   private readonly redBars: vscode.TextEditorDecorationType[] = [];
   private readonly greenBars: vscode.TextEditorDecorationType[] = [];
@@ -561,7 +660,9 @@ class GutterPalette implements vscode.Disposable {
 
 let gutterPalette: GutterPalette;
 
+// Activate.
 export function activate(context: vscode.ExtensionContext): void {
+  // Register extension commands, providers, listeners, and UI artifacts.
   extensionCtx = context;
   output = vscode.window.createOutputChannel('Binoculars');
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
@@ -603,6 +704,7 @@ export function activate(context: vscode.ExtensionContext): void {
         const docText = document.getText();
         const charOffset = offsetAt(docText, position);
         if (shouldSuppressHoverDuringTyping(document, charOffset)) {
+          clearHoverDelayGate(docKey);
           return undefined;
         }
         const lastSeen = hoverSeenSegments.get(docKey);
@@ -610,7 +712,6 @@ export function activate(context: vscode.ExtensionContext): void {
           if (charOffset >= lastSeen.start && charOffset < lastSeen.end) {
             const now = Date.now();
             if (now - lastSeen.lastSeenMs <= HOVER_SAME_SEGMENT_SUPPRESS_MS) {
-              hoverSeenSegments.set(docKey, { ...lastSeen, lastSeenMs: now });
               return undefined;
             }
           } else {
@@ -619,10 +720,31 @@ export function activate(context: vscode.ExtensionContext): void {
         }
         const decision = hoverForPosition(document, position);
         if (!decision) {
+          clearHoverDelayGate(docKey);
           return undefined;
         }
         if (token.isCancellationRequested) {
           return undefined;
+        }
+        if (decision.segmentEnd > decision.segmentStart && HOVER_CONTRIBUTOR_DELAY_MS > 0) {
+          const gate = hoverDelayGates.get(docKey);
+          const now = Date.now();
+          const sameSegmentGate = gate && gate.start === decision.segmentStart && gate.end === decision.segmentEnd;
+          if (!sameSegmentGate) {
+            clearHoverDelayGate(docKey);
+            scheduleHoverGateReveal(
+              docKey,
+              decision.segmentStart,
+              decision.segmentEnd,
+              charOffset,
+              HOVER_CONTRIBUTOR_DELAY_MS,
+            );
+            return undefined;
+          }
+          if (now < gate.readyAtMs) {
+            return undefined;
+          }
+          clearHoverDelayGate(docKey);
         }
         if (decision.segmentEnd > decision.segmentStart) {
           hoverSeenSegments.set(docKey, {
@@ -682,6 +804,7 @@ export function activate(context: vscode.ExtensionContext): void {
       liveEstimateRecoverAttempts.delete(key);
       recentTypingActivity.delete(key);
       hoverSeenSegments.delete(key);
+      clearHoverDelayGate(key);
       docStates.delete(key);
       loadedSidecarSignatures.delete(key);
       void refreshAnalyzeNextContext(undefined);
@@ -710,6 +833,7 @@ export function activate(context: vscode.ExtensionContext): void {
       if (evt.contentChanges.length > 0) {
         noteTypingActivity(key, evt.contentChanges, evt.document.getText().length);
         hoverSeenSegments.delete(key);
+        clearHoverDelayGate(key);
       }
       const state = docStates.get(key);
       if (state && evt.contentChanges.length > 0) {
@@ -747,11 +871,15 @@ export function activate(context: vscode.ExtensionContext): void {
   void applyEnablementMode();
 }
 
+// Deactivate.
 export async function deactivate(): Promise<void> {
+  // Release backend resources when extension unloads.
   await stopBackend();
 }
 
+// Run Analyze.
 async function runAnalyze(): Promise<void> {
+  // Analyze the active chunk (or first chunk) and refresh all decorations/metrics.
   if (!ensureEnabledOrNotify()) {
     return;
   }
@@ -762,33 +890,73 @@ async function runAnalyze(): Promise<void> {
   const key = editor.document.uri.toString();
   clearLiveEstimateTimer(key);
   const text = editor.document.getText();
-  updateStatus('Analyzing chunk...');
+  let previous = docStates.get(key);
+  if (!previous) {
+    maybeLoadStateSidecar(editor.document, 'activate');
+    maybeRestoreStateFromRecentClosed(editor.document, 'activate');
+    previous = docStates.get(key);
+  }
+  const activeChunk = previous && previous.chunks.length > 0 ? getActiveChunk(editor, text, previous) : undefined;
+  const analyzeStart = Math.max(0, Math.min(text.length, activeChunk?.charStart ?? 0));
+  const startLine = lineNumberFromOffset(text, analyzeStart);
+  if (previous && previous.chunks.length > 0) {
+    const coverage = computeContiguousCoverage(previous.chunks, text.length);
+    output.appendLine(
+      `[analyze] active-chunk start line=${startLine} offset=${analyzeStart} chunks=${previous.chunks.length} coverage=${coverage}/${text.length}`,
+    );
+  } else {
+    output.appendLine('[analyze] no prior chunk state found; running initial Analyze from line 1.');
+  }
+  updateStatus(`Analyzing chunk from line ${startLine}...`);
 
   try {
-    const result = await runWithBusyQuickPick('Binoculars: Analyze Chunk', 'Analyzing current chunk...', async () => {
+    const result = await runWithBusyQuickPick(
+      'Binoculars: Analyze Chunk',
+      `Analyzing chunk from line ${startLine}...`,
+      async () => {
       const client = await ensureBackend();
-      return await client.analyzeDocument(text, inputLabel(editor.document));
-    });
-    const previous = docStates.get(key);
+        if (previous && previous.chunks.length > 0) {
+          return await client.analyzeChunk(text, inputLabel(editor.document), analyzeStart, text.length);
+        }
+        return await client.analyzeDocument(text, inputLabel(editor.document));
+      },
+    );
     const incoming = toChunkState(result);
     const topKRaw = vscode.workspace.getConfiguration('binoculars').get<number>('topK', 5);
     const topK = Math.max(1, Math.trunc(Number.isFinite(topKRaw) ? topKRaw : 5));
     const priorRanges = previous ? priorContributorRangesForIncoming(previous, incoming, text.length, topK) : undefined;
-    const state: DocumentState = {
-      chunks: [incoming],
-      nextChunkStart: result.next_chunk_start ?? result.chunk.analyzed_char_end,
-      stale: false,
-      editedRanges: [],
-      rewriteRanges: [],
-      priorLowRanges: mergeEditedRanges([...(previous?.priorLowRanges ?? []), ...(priorRanges?.low ?? [])]),
-      priorHighRanges: mergeEditedRanges([...(previous?.priorHighRanges ?? []), ...(priorRanges?.high ?? [])]),
-      priorChunkB: priorChunkScoreForIncoming(previous, incoming),
-      forecastEstimate: undefined,
-      forecastPending: false,
-    };
+    let state: DocumentState;
+    if (previous && previous.chunks.length > 0) {
+      previous.priorLowRanges = mergeEditedRanges([...(previous.priorLowRanges ?? []), ...(priorRanges?.low ?? [])]);
+      previous.priorHighRanges = mergeEditedRanges([...(previous.priorHighRanges ?? []), ...(priorRanges?.high ?? [])]);
+      previous.priorChunkB = priorChunkScoreForIncoming(previous, incoming);
+      mergeChunk(previous, incoming);
+      // Recompute contiguous analyzed coverage after in-place chunk replacement.
+      previous.nextChunkStart = computeContiguousCoverage(previous.chunks, text.length);
+      previous.stale = false;
+      previous.forecastEstimate = undefined;
+      previous.forecastPending = false;
+      previous.editedRanges = [];
+      previous.rewriteRanges = [];
+      state = previous;
+    } else {
+      state = {
+        chunks: [incoming],
+        nextChunkStart: result.next_chunk_start ?? result.chunk.analyzed_char_end,
+        stale: false,
+        editedRanges: [],
+        rewriteRanges: [],
+        priorLowRanges: mergeEditedRanges([...(previous?.priorLowRanges ?? []), ...(priorRanges?.low ?? [])]),
+        priorHighRanges: mergeEditedRanges([...(previous?.priorHighRanges ?? []), ...(priorRanges?.high ?? [])]),
+        priorChunkB: priorChunkScoreForIncoming(previous, incoming),
+        forecastEstimate: undefined,
+        forecastPending: false,
+      };
+    }
     docStates.set(key, state);
     rememberClosedStateCandidate(editor.document, state);
     applyDecorations(editor, state);
+    autoSaveStateSidecar(editor.document);
     void refreshAnalyzeNextContext(editor);
     updateStatusForEditor(editor);
   } catch (err) {
@@ -796,7 +964,9 @@ async function runAnalyze(): Promise<void> {
   }
 }
 
+// Run Analyze Next.
 async function runAnalyzeNext(): Promise<void> {
+  // Analyze the next contiguous unscored chunk after current analyzed coverage.
   if (!ensureEnabledOrNotify()) {
     return;
   }
@@ -848,6 +1018,7 @@ async function runAnalyzeNext(): Promise<void> {
     existing.rewriteRanges = [];
     rememberClosedStateCandidate(editor.document, existing);
     applyDecorations(editor, existing);
+    autoSaveStateSidecar(editor.document);
     void refreshAnalyzeNextContext(editor);
     updateStatusForEditor(editor);
   } catch (err) {
@@ -855,7 +1026,9 @@ async function runAnalyzeNext(): Promise<void> {
   }
 }
 
+// Run Analyze All.
 async function runAnalyzeAll(): Promise<void> {
+  // Sequentially analyze remaining chunks until full-document coverage is reached.
   if (!ensureEnabledOrNotify()) {
     return;
   }
@@ -956,6 +1129,7 @@ async function runAnalyzeAll(): Promise<void> {
         }
       }
     });
+    autoSaveStateSidecar(editor.document);
     void refreshAnalyzeNextContext(editor);
     updateStatusForEditor(editor);
   } catch (err) {
@@ -964,6 +1138,7 @@ async function runAnalyzeAll(): Promise<void> {
 }
 
 async function runWithBusyQuickPick<T>(title: string, placeholder: string, action: () => Promise<T>): Promise<T> {
+  // Shared light-weight busy UI for bridge operations.
   const picker = vscode.window.createQuickPick<vscode.QuickPickItem>();
   picker.title = title;
   picker.placeholder = placeholder;
@@ -980,6 +1155,7 @@ async function runWithBusyQuickPick<T>(title: string, placeholder: string, actio
   }
 }
 
+// Run Rewrite Selection.
 async function runRewriteSelection(): Promise<void> {
   if (!ensureEnabledOrNotify()) {
     return;
@@ -1006,6 +1182,7 @@ async function runRewriteSelection(): Promise<void> {
   await runRewriteForSpan(editor, key, state, text, span.start, span.end);
 }
 
+// Run Rewrite Selection Or Line.
 async function runRewriteSelectionOrLine(): Promise<void> {
   if (!ensureEnabledOrNotify()) {
     return;
@@ -1032,6 +1209,7 @@ async function runRewriteSelectionOrLine(): Promise<void> {
   await runRewriteForSpan(editor, key, state, text, span.start, span.end);
 }
 
+// Run Rewrite For Span.
 async function runRewriteForSpan(
   editor: vscode.TextEditor,
   stateKey: string,
@@ -1040,6 +1218,7 @@ async function runRewriteForSpan(
   start: number,
   end: number,
 ): Promise<void> {
+  // Request rewrite options, let user choose, then apply tracked replacement edit.
   const activeChunk = getActiveChunk(editor, fullText, state);
   const baseMetrics = activeChunk?.metrics;
   const client = await ensureBackend();
@@ -1074,6 +1253,15 @@ async function runRewriteForSpan(
         : undefined,
       3,
     );
+    const statusMessages = Array.isArray(result.status_messages) ? result.status_messages : [];
+    for (const msg of statusMessages) {
+      if (typeof msg === 'string' && msg.trim()) {
+        output.appendLine(`[rewrite] ${msg}`);
+      }
+    }
+    if (statusMessages.some((msg) => typeof msg === 'string' && msg.toLowerCase().includes('impact scoring unavailable'))) {
+      void vscode.window.setStatusBarMessage('Binoculars rewrite options ready (impact estimate unavailable).', 3500);
+    }
     const options = (result.rewrites || []).slice(0, 3);
     if (options.length === 0) {
       showError('No rewrite options returned.');
@@ -1151,6 +1339,7 @@ async function runRewriteForSpan(
   }
 }
 
+// Pick Rewrite Option With Webview.
 async function pickRewriteOptionWithWebview(source: string, options: RewriteOption[]): Promise<RewriteOption | undefined> {
   const picks = options.slice(0, 3);
   if (picks.length === 0) {
@@ -1198,6 +1387,7 @@ async function pickRewriteOptionWithWebview(source: string, options: RewriteOpti
   });
 }
 
+// Clear Priors.
 function clearPriors(): void {
   if (!ensureEnabledOrNotify()) {
     return;
@@ -1217,7 +1407,9 @@ function clearPriors(): void {
   updateStatus('Cleared prior highlights.');
 }
 
+// Toggle Colorization.
 function toggleColorization(): void {
+  // Toggle text overlays at runtime without discarding analyzed state.
   if (!ensureEnabledOrNotify()) {
     return;
   }
@@ -1239,6 +1431,7 @@ function toggleColorization(): void {
   void vscode.window.setStatusBarMessage(`Binoculars colorization ${mode}.`, 2500);
 }
 
+// Is Text Overlay Colorization Enabled.
 function isTextOverlayColorizationEnabled(): boolean {
   if (!isExtensionEnabled()) {
     return false;
@@ -1248,7 +1441,9 @@ function isTextOverlayColorizationEnabled(): boolean {
   return configured && runtimeColorizationEnabled;
 }
 
+// Stop Backend.
 async function stopBackend(opts?: { shutdownDaemon?: boolean }): Promise<void> {
+  // Tear down active client, with optional shared-daemon shutdown.
   const shutdownDaemon = opts?.shutdownDaemon === true;
   if (shutdownDaemon) {
     try {
@@ -1272,17 +1467,21 @@ async function stopBackend(opts?: { shutdownDaemon?: boolean }): Promise<void> {
   backendStarted = false;
 }
 
+// Enable Extension.
 async function enableExtension(): Promise<void> {
   const cfg = vscode.workspace.getConfiguration('binoculars');
   await cfg.update('enabled', true, vscode.ConfigurationTarget.Global);
 }
 
+// Disable Extension.
 async function disableExtension(): Promise<void> {
   const cfg = vscode.workspace.getConfiguration('binoculars');
   await cfg.update('enabled', false, vscode.ConfigurationTarget.Global);
 }
 
+// Apply Enablement Mode.
 async function applyEnablementMode(): Promise<void> {
+  // Enforce enabled/disabled mode across backend, contexts, state, and visuals.
   const enabled = isExtensionEnabled();
   await setEnablementContext(enabled);
   await refreshAnalyzeNextContext(undefined);
@@ -1326,7 +1525,9 @@ async function applyEnablementMode(): Promise<void> {
   controlsProvider?.refresh();
 }
 
+// Restart Backend.
 async function restartBackend(): Promise<void> {
+  // Explicit full backend recycle command used by users during troubleshooting.
   if (!isExtensionEnabled()) {
     await stopBackend({ shutdownDaemon: true });
     return;
@@ -1336,7 +1537,9 @@ async function restartBackend(): Promise<void> {
   updateStatus('Binoculars backend restarted.');
 }
 
+// Ensure Backend.
 async function ensureBackend(): Promise<BackendClient> {
+  // Start daemon if needed and (re)apply effective runtime configuration.
   if (!isExtensionEnabled()) {
     throw new Error('Binoculars is disabled. Run "Binoculars: Enable" to re-enable.');
   }
@@ -1372,6 +1575,7 @@ async function ensureBackend(): Promise<BackendClient> {
   return backend;
 }
 
+// Resolve Rewrite Llm Config Path.
 function resolveRewriteLlmConfigPath(cfg: vscode.WorkspaceConfiguration): string {
   const enabled = cfg.get<boolean>('externalLlm.enabled', true);
   const configuredPath = resolvePathSetting(cfg.get<string>('externalLlm.configPath', ''));
@@ -1431,6 +1635,7 @@ function resolveRewriteLlmConfigPath(cfg: vscode.WorkspaceConfiguration): string
   }
 }
 
+// Resolve Path Setting.
 function resolvePathSetting(raw: string): string {
   const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (!raw) {
@@ -1442,6 +1647,7 @@ function resolvePathSetting(raw: string): string {
   return path.isAbsolute(raw) ? raw : ws ? path.join(ws, raw) : raw;
 }
 
+// Is Markdown Sidecar Eligible.
 function isMarkdownSidecarEligible(doc: vscode.TextDocument): boolean {
   if (doc.uri.scheme !== 'file') {
     return false;
@@ -1449,16 +1655,19 @@ function isMarkdownSidecarEligible(doc: vscode.TextDocument): boolean {
   return path.extname(doc.uri.fsPath).toLowerCase() === '.md';
 }
 
+// Sidecar State Path For Document.
 function sidecarStatePathForDocument(docPath: string): string {
   const abs = path.resolve(docPath);
   const parsed = path.parse(abs);
   return path.join(parsed.dir, `${parsed.name}.json`);
 }
 
+// Sha256 Hex.
 function sha256Hex(value: string): string {
   return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
+// Clone Document State.
 function cloneDocumentState(state: DocumentState): DocumentState {
   return {
     nextChunkStart: state.nextChunkStart,
@@ -1493,6 +1702,7 @@ function cloneDocumentState(state: DocumentState): DocumentState {
   };
 }
 
+// Prune Recent Closed State Candidates.
 function pruneRecentClosedStateCandidates(nowMs = Date.now()): void {
   for (const [textHash, candidate] of recentClosedStatesByTextHash.entries()) {
     if (nowMs - candidate.savedAtMs > RECENT_CLOSED_STATE_TTL_MS) {
@@ -1505,6 +1715,7 @@ function pruneRecentClosedStateCandidates(nowMs = Date.now()): void {
   }
 }
 
+// Remember Closed State Candidate.
 function rememberClosedStateCandidate(doc: vscode.TextDocument, state: DocumentState): void {
   if (!isMarkdownSidecarEligible(doc)) {
     return;
@@ -1527,6 +1738,7 @@ function rememberClosedStateCandidate(doc: vscode.TextDocument, state: DocumentS
   recentClosedHashByDocKey.set(docKey, textHash);
 }
 
+// State From Recent Closed Candidate.
 function stateFromRecentClosedCandidate(doc: vscode.TextDocument): DocumentState | undefined {
   if (!isMarkdownSidecarEligible(doc)) {
     return undefined;
@@ -1540,6 +1752,7 @@ function stateFromRecentClosedCandidate(doc: vscode.TextDocument): DocumentState
   return cloneDocumentState(candidate.state);
 }
 
+// State From Open Twin Document.
 function stateFromOpenTwinDocument(doc: vscode.TextDocument): DocumentState | undefined {
   if (!isMarkdownSidecarEligible(doc)) {
     return undefined;
@@ -1566,6 +1779,7 @@ function stateFromOpenTwinDocument(doc: vscode.TextDocument): DocumentState | un
   return undefined;
 }
 
+// Maybe Restore State From Recent Closed.
 function maybeRestoreStateFromRecentClosed(doc: vscode.TextDocument, reason: 'open' | 'activate' | 'save'): boolean {
   if (!isMarkdownSidecarEligible(doc)) {
     return false;
@@ -1591,6 +1805,7 @@ function maybeRestoreStateFromRecentClosed(doc: vscode.TextDocument, reason: 'op
   return true;
 }
 
+// Maybe Restore State From Open Twin.
 function maybeRestoreStateFromOpenTwin(doc: vscode.TextDocument, reason: 'save'): boolean {
   if (!isMarkdownSidecarEligible(doc)) {
     return false;
@@ -1616,6 +1831,7 @@ function maybeRestoreStateFromOpenTwin(doc: vscode.TextDocument, reason: 'save')
   return true;
 }
 
+// As Record.
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return undefined;
@@ -1623,11 +1839,13 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value as Record<string, unknown>;
 }
 
+// As Finite Number.
 function asFiniteNumber(value: unknown): number | undefined {
   const n = Number(value);
   return Number.isFinite(n) ? n : undefined;
 }
 
+// As Clamped Int.
 function asClampedInt(value: unknown, min: number, max: number): number | undefined {
   const n = asFiniteNumber(value);
   if (typeof n !== 'number') {
@@ -1636,6 +1854,7 @@ function asClampedInt(value: unknown, min: number, max: number): number | undefi
   return Math.max(min, Math.min(max, Math.trunc(n)));
 }
 
+// Parse Chunk Metrics.
 function parseChunkMetrics(raw: unknown): ChunkMetrics | undefined {
   const obj = asRecord(raw);
   if (!obj) {
@@ -1664,6 +1883,7 @@ function parseChunkMetrics(raw: unknown): ChunkMetrics | undefined {
   };
 }
 
+// Parse Paragraph Row.
 function parseParagraphRow(raw: unknown, textLen: number): ParagraphRow | undefined {
   const obj = asRecord(raw);
   if (!obj) {
@@ -1696,6 +1916,7 @@ function parseParagraphRow(raw: unknown, textLen: number): ParagraphRow | undefi
   return row;
 }
 
+// Parse Chunk State.
 function parseChunkState(raw: unknown, textLen: number): ChunkState | undefined {
   const obj = asRecord(raw);
   if (!obj) {
@@ -1721,6 +1942,7 @@ function parseChunkState(raw: unknown, textLen: number): ChunkState | undefined 
   };
 }
 
+// Compute Contiguous Coverage.
 function computeContiguousCoverage(chunks: ChunkState[], textLen: number): number {
   const merged = mergeIntervals(
     chunks
@@ -1740,6 +1962,7 @@ function computeContiguousCoverage(chunks: ChunkState[], textLen: number): numbe
   return Math.max(0, Math.min(textLen, contiguous));
 }
 
+// Document State From Persisted.
 function documentStateFromPersisted(rawState: Record<string, unknown>, textLen: number): DocumentState | undefined {
   const rawChunks = Array.isArray(rawState.analysis_chunks) ? rawState.analysis_chunks : [];
   const chunks = rawChunks
@@ -1805,6 +2028,7 @@ function documentStateFromPersisted(rawState: Record<string, unknown>, textLen: 
   };
 }
 
+// Serialize Chunk For Persisted State.
 function serializeChunkForPersistedState(chunk: ChunkState, index: number): Record<string, unknown> {
   return {
     id: index + 1,
@@ -1832,6 +2056,7 @@ function serializeChunkForPersistedState(chunk: ChunkState, index: number): Reco
   };
 }
 
+// Build Persisted Sidecar Payload.
 function buildPersistedSidecarPayload(
   docPath: string,
   textSnapshot: string,
@@ -1896,7 +2121,9 @@ function buildPersistedSidecarPayload(
   };
 }
 
+// Maybe Load State Sidecar.
 function maybeLoadStateSidecar(doc: vscode.TextDocument, reason: 'open' | 'activate'): void {
+  // Load sidecar state only when it matches document content hash.
   if (!isMarkdownSidecarEligible(doc)) {
     return;
   }
@@ -1972,7 +2199,9 @@ function maybeLoadStateSidecar(doc: vscode.TextDocument, reason: 'open' | 'activ
   }
 }
 
+// Auto Save State Sidecar.
 function autoSaveStateSidecar(doc: vscode.TextDocument): void {
+  // Persist current in-memory state to sidecar after document saves.
   if (!isMarkdownSidecarEligible(doc)) {
     return;
   }
@@ -1997,6 +2226,7 @@ function autoSaveStateSidecar(doc: vscode.TextDocument): void {
   }
 }
 
+// State From Matching Sidecar On Disk.
 function stateFromMatchingSidecarOnDisk(
   doc: vscode.TextDocument,
   textSnapshot: string,
@@ -2061,6 +2291,7 @@ function stateFromMatchingSidecarOnDisk(
   return bestState;
 }
 
+// To Chunk State.
 function toChunkState(result: AnalyzeResult): ChunkState {
   return {
     charStart: result.chunk.char_start,
@@ -2071,6 +2302,7 @@ function toChunkState(result: AnalyzeResult): ChunkState {
   };
 }
 
+// Merge Chunk.
 function mergeChunk(state: DocumentState, incoming: ChunkState): void {
   const kept = state.chunks.filter((c) => c.analyzedCharEnd <= incoming.charStart || c.charStart >= incoming.analyzedCharEnd);
   kept.push(incoming);
@@ -2078,6 +2310,7 @@ function mergeChunk(state: DocumentState, incoming: ChunkState): void {
   state.chunks = kept;
 }
 
+// Prior Chunk Score For Incoming.
 function priorChunkScoreForIncoming(state: DocumentState | undefined, incoming: ChunkState): number | undefined {
   if (!state || !state.chunks.length) {
     return undefined;
@@ -2100,6 +2333,7 @@ function priorChunkScoreForIncoming(state: DocumentState | undefined, incoming: 
   return bestScore;
 }
 
+// Prior Contributor Ranges For Incoming.
 function priorContributorRangesForIncoming(
   state: DocumentState,
   incoming: ChunkState,
@@ -2143,6 +2377,7 @@ function priorContributorRangesForIncoming(
   };
 }
 
+// Merge Edited Ranges.
 function mergeEditedRanges(ranges: EditedRange[]): EditedRange[] {
   if (ranges.length === 0) {
     return [];
@@ -2166,12 +2401,14 @@ function mergeEditedRanges(ranges: EditedRange[]): EditedRange[] {
   return out;
 }
 
+// Normalized Ranges Without Touch Merge.
 function normalizedRangesWithoutTouchMerge(ranges: EditedRange[]): EditedRange[] {
   return [...ranges]
     .filter((r) => Number.isFinite(r.start) && Number.isFinite(r.end) && r.end > r.start)
     .sort((a, b) => (a.start - b.start) || (a.end - b.end));
 }
 
+// Smallest Containing Range.
 function smallestContainingRange(ranges: EditedRange[], offset: number): EditedRange | undefined {
   const candidateOffset = Math.max(0, Math.trunc(offset));
   let best: EditedRange | undefined;
@@ -2189,6 +2426,7 @@ function smallestContainingRange(ranges: EditedRange[], offset: number): EditedR
   return best;
 }
 
+// Has Range Overlap.
 function hasRangeOverlap(ranges: EditedRange[], start: number, end: number): boolean {
   const boundedStart = Math.max(0, Math.trunc(start));
   const boundedEnd = Math.max(boundedStart, Math.trunc(end));
@@ -2205,6 +2443,7 @@ function hasRangeOverlap(ranges: EditedRange[], start: number, end: number): boo
   return false;
 }
 
+// Shift Edited Ranges For Splice.
 function shiftEditedRangesForSplice(ranges: EditedRange[], start: number, end: number, insertedLen: number): EditedRange[] {
   const removedLen = Math.max(0, end - start);
   const delta = insertedLen - removedLen;
@@ -2228,6 +2467,7 @@ function shiftEditedRangesForSplice(ranges: EditedRange[], start: number, end: n
   return mergeEditedRanges(out);
 }
 
+// Remap Offset For Splice.
 function remapOffsetForSplice(offset: number, start: number, end: number, insertedLen: number): number {
   const safeOffset = Math.max(0, offset);
   const safeStart = Math.max(0, start);
@@ -2242,6 +2482,7 @@ function remapOffsetForSplice(offset: number, start: number, end: number, insert
   return safeStart;
 }
 
+// Remap Span For Splice.
 function remapSpanForSplice(
   spanStart: number,
   spanEnd: number,
@@ -2257,6 +2498,7 @@ function remapSpanForSplice(
   return { start, end };
 }
 
+// Shift Chunk State For Content Changes.
 function shiftChunkStateForContentChanges(
   state: DocumentState,
   changes: readonly vscode.TextDocumentContentChangeEvent[],
@@ -2342,6 +2584,7 @@ function shiftChunkStateForContentChanges(
   state.nextChunkStart = Math.max(0, Math.min(textLength, nextChunkStart));
 }
 
+// Apply Content Changes To Ranges.
 function applyContentChangesToRanges(
   prevRanges: EditedRange[],
   changes: readonly vscode.TextDocumentContentChangeEvent[],
@@ -2369,6 +2612,7 @@ function applyContentChangesToRanges(
   return ranges;
 }
 
+// Apply Content Changes To Edited Ranges.
 function applyContentChangesToEditedRanges(
   prevRanges: EditedRange[],
   changes: readonly vscode.TextDocumentContentChangeEvent[],
@@ -2376,6 +2620,7 @@ function applyContentChangesToEditedRanges(
   return applyContentChangesToRanges(prevRanges, changes, true);
 }
 
+// Apply Content Changes To Rewrite Ranges.
 function applyContentChangesToRewriteRanges(
   prevRanges: EditedRange[],
   changes: readonly vscode.TextDocumentContentChangeEvent[],
@@ -2383,6 +2628,7 @@ function applyContentChangesToRewriteRanges(
   return applyContentChangesToRanges(prevRanges, changes, false);
 }
 
+// Apply Content Changes To Prior Ranges.
 function applyContentChangesToPriorRanges(
   prevRanges: EditedRange[],
   changes: readonly vscode.TextDocumentContentChangeEvent[],
@@ -2390,6 +2636,7 @@ function applyContentChangesToPriorRanges(
   return applyContentChangesToRanges(prevRanges, changes, false);
 }
 
+// Edited Ranges To Decoration Ranges.
 function editedRangesToDecorationRanges(docText: string, ranges: EditedRange[]): vscode.Range[] {
   const docLen = docText.length;
   return mergeEditedRanges(ranges)
@@ -2401,12 +2648,14 @@ function editedRangesToDecorationRanges(docText: string, ranges: EditedRange[]):
     .map((r) => new vscode.Range(positionAt(docText, r.start), positionAt(docText, r.end)));
 }
 
+// Apply Edited Decorations.
 function applyEditedDecorations(editor: vscode.TextEditor, state: DocumentState): void {
   const docText = editor.document.getText();
   const ranges = editedRangesToDecorationRanges(docText, state.editedRanges);
   editor.setDecorations(editedDecoration, ranges);
 }
 
+// Apply Prior Decorations.
 function applyPriorDecorations(editor: vscode.TextEditor, state: DocumentState): void {
   const docText = editor.document.getText();
   const low = editedRangesToDecorationRanges(docText, state.priorLowRanges);
@@ -2415,7 +2664,9 @@ function applyPriorDecorations(editor: vscode.TextEditor, state: DocumentState):
   editor.setDecorations(priorHighDecoration, high);
 }
 
+// Apply Decorations.
 function applyDecorations(editor: vscode.TextEditor, state: DocumentState): void {
+  // Render current+prior contributor visuals and optional contribution bars.
   clearAllDecorations(editor);
   if (!isExtensionEnabled()) {
     return;
@@ -2531,6 +2782,7 @@ function applyDecorations(editor: vscode.TextEditor, state: DocumentState): void
   }
 }
 
+// Clear All Decorations.
 function clearAllDecorations(editor: vscode.TextEditor): void {
   editor.setDecorations(lowDecoration, []);
   editor.setDecorations(highDecoration, []);
@@ -2546,26 +2798,43 @@ function clearAllDecorations(editor: vscode.TextEditor): void {
   }
 }
 
+// Get Active Chunk.
 function getActiveChunk(editor: vscode.TextEditor, text: string, state: DocumentState): ChunkState | undefined {
+  // Resolve active chunk using selection/cursor/visible-window priority.
   if (state.chunks.length === 0) {
     return undefined;
   }
 
   const offset = offsetAt(text, editor.selection.active);
-  let containing = state.chunks.find((c) => offset >= c.charStart && offset < c.analyzedCharEnd);
+  const containing = state.chunks.find((c) => offset >= c.charStart && offset < c.analyzedCharEnd);
   if (containing) {
     return containing;
   }
 
-  containing = state.chunks.find((c) => offset >= c.charStart && offset <= c.charEnd);
-  if (containing) {
-    return containing;
-  }
+  // Choose nearest analyzed interval boundary when cursor is in an unscored gap.
+  const distanceToChunk = (chunk: ChunkState): number => {
+    if (offset < chunk.charStart) {
+      return chunk.charStart - offset;
+    }
+    if (offset > chunk.analyzedCharEnd) {
+      return offset - chunk.analyzedCharEnd;
+    }
+    return 0;
+  };
 
-  const sorted = [...state.chunks].sort((a, b) => Math.abs(a.charStart - offset) - Math.abs(b.charStart - offset));
+  const sorted = [...state.chunks].sort((a, b) => {
+    const da = distanceToChunk(a);
+    const db = distanceToChunk(b);
+    if (da !== db) {
+      return da - db;
+    }
+    // Stable tie-break to keep behavior deterministic.
+    return a.charStart - b.charStart;
+  });
   return sorted[0];
 }
 
+// Resolve Rewrite Span.
 function resolveRewriteSpan(editor: vscode.TextEditor, state: DocumentState): { start: number; end: number } | undefined {
   const docText = editor.document.getText();
   const sel = editor.selection;
@@ -2590,6 +2859,7 @@ function resolveRewriteSpan(editor: vscode.TextEditor, state: DocumentState): { 
   return { start: row.char_start, end: row.char_end };
 }
 
+// Resolve Selection Or Line Span.
 function resolveSelectionOrLineSpan(editor: vscode.TextEditor): { start: number; end: number } | undefined {
   const docText = editor.document.getText();
   const sel = editor.selection;
@@ -2613,6 +2883,7 @@ function resolveSelectionOrLineSpan(editor: vscode.TextEditor): { start: number;
   return { start, end };
 }
 
+// Find Best Row Match.
 function findBestRowMatch(state: DocumentState, charOffset: number): { chunk: ChunkState; row: ParagraphRow } | undefined {
   let bestMatch:
     | {
@@ -2638,6 +2909,7 @@ function findBestRowMatch(state: DocumentState, charOffset: number): { chunk: Ch
   return bestMatch;
 }
 
+// Compute Major Contributor Rows.
 function computeMajorContributorRows(state: DocumentState, topK: number): Set<ParagraphRow> {
   const entries: Array<{ row: ParagraphRow; delta: number }> = [];
   for (const chunk of state.chunks) {
@@ -2664,7 +2936,9 @@ function computeMajorContributorRows(state: DocumentState, topK: number): Set<Pa
   return new Set([...lows, ...highs]);
 }
 
+// Hover For Position.
 function hoverForPosition(document: vscode.TextDocument, position: vscode.Position): HoverDecision | undefined {
+  // Return contextual hover diagnostics for rewritten/edited/contributor spans.
   const key = document.uri.toString();
   const state = docStates.get(key);
   if (!state || state.chunks.length === 0) {
@@ -2746,7 +3020,9 @@ function hoverForPosition(document: vscode.TextDocument, position: vscode.Positi
   };
 }
 
+// Update Status For Editor.
 function updateStatusForEditor(editor: vscode.TextEditor): void {
+  // Build status line from resolved active chunk, stale flags, and estimates.
   if (!isExtensionEnabled()) {
     void refreshAnalyzeNextContext(editor);
     return;
@@ -2852,6 +3128,7 @@ function updateStatusForEditor(editor: vscode.TextEditor): void {
   updateStatus(metricCore);
 }
 
+// Update Status.
 function updateStatus(message: string): void {
   lastStatusMessage = message;
   if (!isExtensionEnabled()) {
@@ -2863,15 +3140,18 @@ function updateStatus(message: string): void {
   controlsProvider?.refresh();
 }
 
+// Show Error.
 function showError(message: string): void {
   void vscode.window.showErrorMessage(message);
   updateStatus(message);
 }
 
+// Input Label.
 function inputLabel(doc: vscode.TextDocument): string {
   return doc.uri.scheme === 'file' ? doc.uri.fsPath : '<unsaved>';
 }
 
+// Format Status Metric.
 function formatStatusMetric(value: number): string {
   if (!Number.isFinite(value)) {
     return 'n/a';
@@ -2879,6 +3159,7 @@ function formatStatusMetric(value: number): string {
   return value.toFixed(DISPLAY_DECIMALS);
 }
 
+// Format Signed Metric.
 function formatSignedMetric(value: number): string {
   if (!Number.isFinite(value)) {
     return 'n/a';
@@ -2886,6 +3167,7 @@ function formatSignedMetric(value: number): string {
   return `${value >= 0 ? '+' : ''}${value.toFixed(DISPLAY_DECIMALS)}`;
 }
 
+// Format Approx.
 function formatApprox(approxB?: number, deltaB?: number): string {
   if (typeof approxB !== 'number' || Number.isNaN(approxB)) {
     return 'rewrite option';
@@ -2894,11 +3176,13 @@ function formatApprox(approxB?: number, deltaB?: number): string {
   return `approx B ${approxB.toFixed(DISPLAY_DECIMALS)}${d}`;
 }
 
+// Line Number From Offset.
 function lineNumberFromOffset(text: string, offset: number): number {
   const clamped = Math.max(0, Math.min(text.length, Math.trunc(offset)));
   return positionAt(text, clamped).line + 1;
 }
 
+// Escape Html.
 function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')
@@ -2908,10 +3192,12 @@ function escapeHtml(text: string): string {
     .replace(/'/g, '&#39;');
 }
 
+// Create Nonce.
 function createNonce(): string {
   return crypto.randomBytes(12).toString('base64');
 }
 
+// Render Rewrite Options Html.
 function renderRewriteOptionsHtml(webview: vscode.Webview, source: string, options: RewriteOption[]): string {
   const nonce = createNonce();
   const cardHtml = options
@@ -3065,6 +3351,7 @@ function renderRewriteOptionsHtml(webview: vscode.Webview, source: string, optio
 </html>`;
 }
 
+// Position At.
 function positionAt(text: string, offset: number): vscode.Position {
   const bounded = Math.max(0, Math.min(text.length, offset));
   const lines = text.slice(0, bounded).split('\n');
@@ -3073,6 +3360,7 @@ function positionAt(text: string, offset: number): vscode.Position {
   return new vscode.Position(line, ch);
 }
 
+// Offset At.
 function offsetAt(text: string, pos: vscode.Position): number {
   const lines = text.split('\n');
   let offset = 0;
@@ -3083,6 +3371,7 @@ function offsetAt(text: string, pos: vscode.Position): number {
   return Math.max(0, Math.min(text.length, offset + pos.character));
 }
 
+// Merge Intervals.
 function mergeIntervals(intervals: Array<{ start: number; end: number }>): Array<{ start: number; end: number }> {
   if (intervals.length === 0) {
     return [];
@@ -3101,6 +3390,7 @@ function mergeIntervals(intervals: Array<{ start: number; end: number }>): Array
   return merged;
 }
 
+// Invert Intervals.
 function invertIntervals(intervals: Array<{ start: number; end: number }>, totalLen: number): Array<{ start: number; end: number }> {
   const out: Array<{ start: number; end: number }> = [];
   let cursor = 0;

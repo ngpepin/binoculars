@@ -35,6 +35,8 @@ def load_binoculars_module():
 
 
 class TestRegressionV11X(unittest.TestCase):
+    """Regression tests that lock expected v1.1.x behavior and output contracts."""
+
     @classmethod
     def setUpClass(cls):
         cls.binoculars = load_binoculars_module()
