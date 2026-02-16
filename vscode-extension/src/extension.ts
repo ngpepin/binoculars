@@ -65,7 +65,9 @@ const DISPLAY_DECIMALS = 5;
 const LIVE_ESTIMATE_DEBOUNCE_MS = 900;
 const HOVER_TYPING_SUPPRESS_MS = 1300;
 const HOVER_SAME_SEGMENT_SUPPRESS_MS = 900;
-const HOVER_CONTRIBUTOR_DELAY_MS = 1150;
+const HOVER_CONTRIBUTOR_DELAY_MS = 1200;
+const GUTTER_CLICK_HOVER_DELAY_MS = 60;
+const ENABLE_TEXT_SEGMENT_HOVER = true;
 
 const docStates = new Map<string, DocumentState>();
 const loadedSidecarSignatures = new Map<string, string>();
@@ -227,58 +229,68 @@ function clearHoverDelayGate(docKey: string): void {
   hoverDelayGates.delete(docKey);
 }
 
+function showHoverAtDocumentOffset(
+  editor: vscode.TextEditor,
+  docKey: string,
+  anchorOffset: number,
+  segmentStart: number,
+  segmentEnd: number,
+): void {
+  const text = editor.document.getText();
+  const normalizedStart = Math.max(0, Math.min(text.length, segmentStart));
+  const normalizedEnd = Math.max(normalizedStart, Math.min(text.length, segmentEnd));
+  if (normalizedEnd <= normalizedStart) {
+    return;
+  }
+  const clampedAnchor = Math.max(normalizedStart, Math.min(normalizedEnd - 1, anchorOffset));
+  if (shouldSuppressHoverDuringTyping(editor.document, clampedAnchor)) {
+    return;
+  }
+  const cursorOffset = offsetAt(text, editor.selection.active);
+  const cursorInsideSegment = cursorOffset >= normalizedStart && cursorOffset < normalizedEnd;
+  const anchorPos = positionAt(text, clampedAnchor);
+  const targetSelection = new vscode.Selection(anchorPos, anchorPos);
+
+  let shouldRestoreSelection = false;
+  let priorSelections: vscode.Selection[] | undefined;
+  if (!cursorInsideSegment && editor.selections.length === 1 && editor.selection.isEmpty) {
+    const lineVisible = editor.visibleRanges.some((range) => anchorPos.line >= range.start.line && anchorPos.line <= range.end.line);
+    if (!lineVisible) {
+      return;
+    }
+    priorSelections = editor.selections.map((sel) => new vscode.Selection(sel.start, sel.end));
+    if (!editor.selection.isEqual(targetSelection)) {
+      editor.selections = [targetSelection];
+      shouldRestoreSelection = true;
+    }
+  }
+
+  const restoreIfNeeded = (): void => {
+    if (!shouldRestoreSelection || !priorSelections) {
+      return;
+    }
+    const latestEditor = vscode.window.activeTextEditor;
+    if (!latestEditor || latestEditor.document.uri.toString() !== docKey) {
+      return;
+    }
+    // Only restore if the temporary target selection is still active.
+    if (latestEditor.selections.length === 1 && latestEditor.selection.isEqual(targetSelection)) {
+      latestEditor.selections = priorSelections;
+    }
+  };
+  void vscode.commands.executeCommand('editor.action.showHover').then(
+    () => restoreIfNeeded(),
+    () => restoreIfNeeded(),
+  );
+}
+
 function scheduleHoverGateReveal(docKey: string, start: number, end: number, anchorOffset: number, delayMs: number): void {
   const timer = setTimeout(() => {
     const active = vscode.window.activeTextEditor;
     if (!active || active.document.uri.toString() !== docKey) {
       return;
     }
-    const text = active.document.getText();
-    const normalizedStart = Math.max(0, Math.min(text.length, start));
-    const normalizedEnd = Math.max(normalizedStart, Math.min(text.length, end));
-    if (normalizedEnd <= normalizedStart) {
-      return;
-    }
-    const clampedAnchor = Math.max(normalizedStart, Math.min(normalizedEnd - 1, anchorOffset));
-    if (shouldSuppressHoverDuringTyping(active.document, clampedAnchor)) {
-      return;
-    }
-    const cursorOffset = offsetAt(text, active.selection.active);
-    const cursorInsideSegment = cursorOffset >= normalizedStart && cursorOffset < normalizedEnd;
-    const anchorPos = positionAt(text, clampedAnchor);
-    const targetSelection = new vscode.Selection(anchorPos, anchorPos);
-
-    let shouldRestoreSelection = false;
-    let priorSelections: vscode.Selection[] | undefined;
-    if (!cursorInsideSegment && active.selections.length === 1 && active.selection.isEmpty) {
-      const lineVisible = active.visibleRanges.some((range) => anchorPos.line >= range.start.line && anchorPos.line <= range.end.line);
-      if (!lineVisible) {
-        return;
-      }
-      priorSelections = active.selections.map((sel) => new vscode.Selection(sel.start, sel.end));
-      if (!active.selection.isEqual(targetSelection)) {
-        active.selections = [targetSelection];
-        shouldRestoreSelection = true;
-      }
-    }
-
-    const restoreIfNeeded = (): void => {
-      if (!shouldRestoreSelection || !priorSelections) {
-        return;
-      }
-      const latestEditor = vscode.window.activeTextEditor;
-      if (!latestEditor || latestEditor.document.uri.toString() !== docKey) {
-        return;
-      }
-      // Only restore if the temporary target selection is still active.
-      if (latestEditor.selections.length === 1 && latestEditor.selection.isEqual(targetSelection)) {
-        latestEditor.selections = priorSelections;
-      }
-    };
-    void vscode.commands.executeCommand('editor.action.showHover').then(
-      () => restoreIfNeeded(),
-      () => restoreIfNeeded(),
-    );
+    showHoverAtDocumentOffset(active, docKey, anchorOffset, start, end);
   }, Math.max(0, delayMs));
   hoverDelayGates.set(docKey, {
     start,
@@ -287,6 +299,101 @@ function scheduleHoverGateReveal(docKey: string, start: number, end: number, anc
     readyAtMs: Date.now() + Math.max(0, delayMs),
     timer,
   });
+}
+
+function lineFromLikelyGutterMouseSelection(sel: vscode.Selection): number | undefined {
+  // Typical gutter click selects a full line from column 0 to next line column 0.
+  if (!sel.isReversed && sel.start.character === 0 && sel.end.character === 0 && sel.end.line === sel.start.line + 1) {
+    return sel.start.line;
+  }
+  if (sel.isReversed && sel.start.character === 0 && sel.end.character === 0 && sel.start.line === sel.end.line + 1) {
+    return sel.end.line;
+  }
+  // Some themes/settings produce an empty caret-at-column-0 selection after gutter interaction.
+  if (sel.isEmpty && sel.active.character === 0) {
+    return sel.active.line;
+  }
+  return undefined;
+}
+
+function bestContributorAnchorForLine(
+  document: vscode.TextDocument,
+  line: number,
+): { anchorOffset: number; segmentStart: number; segmentEnd: number } | undefined {
+  const key = document.uri.toString();
+  const state = docStates.get(key);
+  if (!state || state.chunks.length === 0) {
+    return undefined;
+  }
+  const text = document.getText();
+  const safeLine = Math.max(0, Math.min(document.lineCount - 1, line));
+  const lineStart = offsetAt(text, new vscode.Position(safeLine, 0));
+  const lineEnd = safeLine < document.lineCount - 1 ? offsetAt(text, new vscode.Position(safeLine + 1, 0)) : text.length;
+  if (lineEnd <= lineStart) {
+    return undefined;
+  }
+  let best:
+    | {
+        mag: number;
+        anchorOffset: number;
+        segmentStart: number;
+        segmentEnd: number;
+      }
+    | undefined;
+  for (const chunk of state.chunks) {
+    for (const row of chunk.rows) {
+      const rowStart = Math.max(0, Math.min(text.length, Number(row.char_start ?? 0)));
+      const rowEnd = Math.max(rowStart, Math.min(text.length, Number(row.char_end ?? rowStart)));
+      if (rowEnd <= rowStart || rowEnd <= lineStart || rowStart >= lineEnd) {
+        continue;
+      }
+      const mag = Math.abs(Number(row.delta_doc_logPPL_if_removed ?? 0));
+      const anchorOffset = Math.max(rowStart, Math.min(rowEnd - 1, lineStart));
+      if (!best || mag > best.mag) {
+        best = {
+          mag,
+          anchorOffset,
+          segmentStart: rowStart,
+          segmentEnd: rowEnd,
+        };
+      }
+    }
+  }
+  if (!best) {
+    return undefined;
+  }
+  return {
+    anchorOffset: best.anchorOffset,
+    segmentStart: best.segmentStart,
+    segmentEnd: best.segmentEnd,
+  };
+}
+
+function maybeRevealHoverFromGutterClick(evt: vscode.TextEditorSelectionChangeEvent): void {
+  if (!isExtensionEnabled()) {
+    return;
+  }
+  if (evt.kind !== vscode.TextEditorSelectionChangeKind.Mouse || evt.selections.length !== 1) {
+    return;
+  }
+  const line = lineFromLikelyGutterMouseSelection(evt.selections[0]);
+  if (typeof line !== 'number') {
+    return;
+  }
+  const anchor = bestContributorAnchorForLine(evt.textEditor.document, line);
+  if (!anchor) {
+    return;
+  }
+  const docKey = evt.textEditor.document.uri.toString();
+  clearHoverDelayGate(docKey);
+  hoverSeenSegments.delete(docKey);
+  scheduleHoverGateReveal(
+    docKey,
+    anchor.segmentStart,
+    anchor.segmentEnd,
+    anchor.anchorOffset,
+    GUTTER_CLICK_HOVER_DELAY_MS,
+  );
 }
 
 // Clear Live Estimate Timer.
@@ -700,6 +807,9 @@ export function activate(context: vscode.ExtensionContext): void {
         if (!isExtensionEnabled()) {
           return undefined;
         }
+        if (!ENABLE_TEXT_SEGMENT_HOVER) {
+          return undefined;
+        }
         const docKey = document.uri.toString();
         const docText = document.getText();
         const charOffset = offsetAt(docText, position);
@@ -758,6 +868,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.window.onDidChangeTextEditorSelection((evt) => {
       if (isExtensionEnabled()) {
+        maybeRevealHoverFromGutterClick(evt);
         void refreshAnalyzeNextContext(evt.textEditor);
         updateStatusForEditor(evt.textEditor);
       }
@@ -2688,7 +2799,7 @@ function applyDecorations(editor: vscode.TextEditor, state: DocumentState): void
     delta: number;
   }> = [];
 
-  const lineContribution = new Map<number, { sign: 'red' | 'green'; mag: number }>();
+  const lineContribution = new Map<number, { sign: 'red' | 'green'; mag: number; anchorOffset: number }>();
 
   for (const chunk of state.chunks) {
     for (const row of chunk.rows) {
@@ -2706,9 +2817,11 @@ function applyDecorations(editor: vscode.TextEditor, state: DocumentState): void
       const mag = Math.abs(delta);
       const sign: 'red' | 'green' = delta >= 0 ? 'red' : 'green';
       for (let line = startLine; line <= endLine; line += 1) {
+        const lineStartOffset = offsetAt(docText, new vscode.Position(line, 0));
+        const anchorOffset = Math.max(start, Math.min(end - 1, Math.min(docText.length - 1, lineStartOffset)));
         const prev = lineContribution.get(line);
         if (!prev || mag > prev.mag) {
-          lineContribution.set(line, { sign, mag });
+          lineContribution.set(line, { sign, mag, anchorOffset });
         }
       }
     }
@@ -2768,9 +2881,10 @@ function applyDecorations(editor: vscode.TextEditor, state: DocumentState): void
     for (const [line, info] of lineContribution) {
       const level = maxMag > 0 ? Math.min(buckets - 1, Math.round((info.mag / maxMag) * (buckets - 1))) : 0;
       const decType = gutterPalette.bucketType(info.sign, level);
-      const lineRange = editor.document.lineAt(line).range;
+      const lineInfo = editor.document.lineAt(line);
+      const lineAnchor = lineInfo.range;
       const arr = grouped.get(decType) ?? [];
-      arr.push({ range: lineRange });
+      arr.push({ range: lineAnchor });
       grouped.set(decType, arr);
     }
     for (const [decType, opts] of grouped) {
@@ -2909,6 +3023,36 @@ function findBestRowMatch(state: DocumentState, charOffset: number): { chunk: Ch
   return bestMatch;
 }
 
+// Find Strongest Row Match For Line.
+function findStrongestRowMatchForLine(
+  state: DocumentState,
+  lineStart: number,
+  lineEnd: number,
+): { chunk: ChunkState; row: ParagraphRow } | undefined {
+  let bestMatch:
+    | {
+        chunk: ChunkState;
+        row: ParagraphRow;
+      }
+    | undefined;
+  let bestMag = -1;
+  for (const chunk of state.chunks) {
+    for (const row of chunk.rows) {
+      const rowStart = Math.max(0, Number(row.char_start ?? 0));
+      const rowEnd = Math.max(rowStart, Number(row.char_end ?? rowStart));
+      if (rowEnd <= lineStart || rowStart >= lineEnd) {
+        continue;
+      }
+      const mag = Math.abs(Number(row.delta_doc_logPPL_if_removed ?? 0));
+      if (!bestMatch || mag > bestMag) {
+        bestMatch = { chunk, row };
+        bestMag = mag;
+      }
+    }
+  }
+  return bestMatch;
+}
+
 // Compute Major Contributor Rows.
 function computeMajorContributorRows(state: DocumentState, topK: number): Set<ParagraphRow> {
   const entries: Array<{ row: ParagraphRow; delta: number }> = [];
@@ -2946,9 +3090,12 @@ function hoverForPosition(document: vscode.TextDocument, position: vscode.Positi
   }
   const text = document.getText();
   const charOffset = offsetAt(text, position);
+  const lineStart = Math.max(0, text.lastIndexOf('\n', Math.max(0, charOffset - 1)) + 1);
+  const rawLineEnd = text.indexOf('\n', Math.max(0, charOffset));
+  const lineEnd = rawLineEnd >= 0 ? rawLineEnd : text.length;
   const topKRaw = vscode.workspace.getConfiguration('binoculars').get<number>('topK', 5);
   const topK = Math.max(1, Math.trunc(Number.isFinite(topKRaw) ? topKRaw : 5));
-  const bestMatch = findBestRowMatch(state, charOffset);
+  const bestMatch = findBestRowMatch(state, charOffset) ?? findStrongestRowMatchForLine(state, lineStart, lineEnd);
   const majorRows = computeMajorContributorRows(state, topK);
   const isMinorContributor = bestMatch ? !majorRows.has(bestMatch.row) : false;
   const rewriteRange = smallestContainingRange(state.rewriteRanges, charOffset);
@@ -3003,15 +3150,10 @@ function hoverForPosition(document: vscode.TextDocument, position: vscode.Positi
   }
   const md = new vscode.MarkdownString(lines.join('  \n'));
   md.isTrusted = false;
-  const lineStart = Math.max(0, text.lastIndexOf('\n', Math.max(0, charOffset - 1)) + 1);
-  const rawLineEnd = text.indexOf('\n', Math.max(0, charOffset));
-  const lineEnd = rawLineEnd >= 0 ? rawLineEnd : text.length;
-  const hoverStart = Math.max(rowStart, lineStart);
-  const hoverEnd = Math.max(hoverStart, Math.min(rowEnd, lineEnd));
-  const range = new vscode.Range(
-    positionAt(text, hoverStart),
-    positionAt(text, hoverEnd > hoverStart ? hoverEnd : rowEnd),
-  );
+  const range =
+    lineEnd > lineStart
+      ? new vscode.Range(positionAt(text, lineStart), positionAt(text, lineEnd))
+      : new vscode.Range(positionAt(text, rowStart), positionAt(text, rowEnd));
   return {
     hover: new vscode.Hover(md, range),
     isMinorContributor,

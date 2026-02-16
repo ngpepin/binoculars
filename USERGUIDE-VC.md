@@ -19,6 +19,7 @@ Main commands:
 
 - `Binoculars: Analyze Chunk`
 - `Binoculars: Analyze Next Chunk`
+- `Binoculars: Analyze All`
 - `Binoculars: Rewrite Selection`
 - `Binoculars: Clear Priors`
 - `Binoculars: Toggle Colorization`
@@ -50,10 +51,15 @@ Where commands appear:
 From repository root:
 
 ```bash
-./refresh-binoculars-vscode.sh --reload
+./refresh-binoculars-vscode.sh
 ```
 
-This compiles, packages, installs, and reloads the current VS Code window.
+This compiles, packages, and force-installs the local VSIX, restarts the VS Code extension host, restarts the Binoculars daemon, and runs a daemon health check.
+
+Optional flags:
+
+- `--reload`: also attempts a VS Code window reload after install.
+- `--no-daemon`: skips daemon restart.
 
 ## 3.3) Verify Settings
 
@@ -80,7 +86,7 @@ Recommended loop:
 3. Review LOW/HIGH segments and gutter bars.
 4. Rewrite selection/line where needed.
 5. Continue editing.
-6. Re-run `Analyze Chunk` (or `Analyze Next Chunk`) for exact updated metrics.
+6. Re-run `Analyze Chunk` (or `Analyze Next Chunk` / `Analyze All`) for exact updated metrics.
 7. Use `Clear Priors` when faint prior backgrounds are no longer useful.
 
 Important:
@@ -100,6 +106,12 @@ Important:
 
 - Continues from contiguous analyzed coverage tail.
 - Remains available while unanalyzed text still exists.
+
+`Analyze All`:
+
+- Iteratively runs chunk analysis from contiguous coverage start to document end.
+- Re-uses the same chunk boundaries and replacement semantics as `Analyze Chunk` / `Analyze Next Chunk`.
+- Prompts for confirmation before launching the full sequence.
 
 Status bar:
 
@@ -165,9 +177,11 @@ Special hover states:
 - Rewritten segment: short instruction to re-analyze for new score.
 - Manually edited segment: note that values may be stale until Analyze.
 
-Minor-contributor hover delay:
+Contributor hover delay:
 
-- Minor hover appears with an additional delay (currently +1 second).
+- Contributor/stale-segment hovers use the same delayed reveal gate for major and minor rows.
+- Current delay is about `1.50s`.
+- The extension avoids an explicit `Loading...` hover state while waiting; the hover appears after the gate opens.
 
 ## 9) Persistence And Sidecar Files
 
@@ -214,14 +228,15 @@ Menus/commands missing after code updates:
 - Run:
 
 ```bash
-./refresh-binoculars-vscode.sh --reload
+./refresh-binoculars-vscode.sh
 ```
 
 ## 11) Quick Reference
 
 - Analyze now: `Ctrl+Alt+B`
 - Analyze next chunk: `Ctrl+Alt+N`
+- Analyze all remaining chunks: `Binoculars: Analyze All`
 - Rewrite selection/line: `Ctrl+Alt+R`
 - Clear prior backgrounds: `Ctrl+Alt+C`
 - Toggle overlays: `Binoculars: Toggle Colorization`
-
+- Restart backend: `Binoculars: Restart Backend`

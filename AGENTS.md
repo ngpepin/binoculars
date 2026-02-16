@@ -45,6 +45,7 @@ Key files:
 - `README.md`: project overview and CLI/GUI reference.
 - `USERGUIDE-GUI.md`: GUI-specific interactive workflow guide.
 - `USERGUIDE-VC.md`: VS Code extension workflow guide.
+- `refresh-binoculars-vscode.sh`: local extension refresh helper (compile/package/install + extension-host and daemon restart).
 - `vscode-extension/src/extension.ts`: extension UI/decoration/command logic.
 - `vscode-extension/src/backendClient.ts`: persistent JSON bridge client.
 - `vscode-extension/python/binoculars_bridge.py`: bridge backend process adapter.
@@ -205,6 +206,9 @@ VS Code extension behavior (current):
 - Toggle colorization:
   - `Toggle Colorization` hides/shows text overlays at runtime.
   - Re-enabling restores overlays from in-memory state (including prior/edited backgrounds when present).
+- Hover behavior:
+  - Contributor/stale hovers use a shared delayed reveal gate for major and minor rows (currently ~1.15s).
+  - Same-segment suppression reduces immediate re-pop in the same segment.
 - Persistence:
   - Sidecar save/load includes chunk state, edited ranges, rewrite ranges, and prior overlay ranges.
   - `priorChunkB` remains in-session and is intentionally not restored from persisted state.

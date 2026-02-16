@@ -152,7 +152,8 @@ Per document (`DocumentState`):
 ## 6.2 Hover Diagnostics
 
 - Each scored row has hover diagnostics.
-- Minor rows use delayed hover to reduce visual noise.
+- Contributor and stale/edit hovers use a shared delayed reveal gate to reduce visual noise (currently ~1.15s).
+- Same-segment suppression prevents immediate hover re-pop in the same segment for a short cooldown window.
 - Rewritten rows show direct rewrite note.
 - Manually edited rows show stale-statistics note.
 
@@ -235,4 +236,3 @@ Command palette also conditionally hides/shows commands by enablement.
 6. User runs `Analyze Next Chunk` or re-analyzes active chunk.
 7. Extension merges/replaces overlapping chunk descriptors and updates status.
 8. Sidecar saved on document save for restart recovery.
-

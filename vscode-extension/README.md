@@ -19,11 +19,19 @@ Implemented:
   - Unscored-region rendering
   - Per-line contribution gutter bars
 - Chunk workflows:
-  - Analyze full document
+  - Analyze current chunk
   - Analyze next chunk
+  - Analyze all remaining chunks (`Analyze All`, with confirmation)
 - Rewrite workflow:
-  - Rewrite selection or active red contributor under cursor
-  - QuickPick chooser with approximate B impact
+  - Rewrite selection or active line
+  - Ranked rewrite chooser with approximate B impact (`approx_B`, `delta_B`)
+- Prior contributor overlays:
+  - Faint prior LOW/HIGH backgrounds for prior major contributors after re-analysis
+  - `Clear Priors` command to clear prior backgrounds only
+- Runtime overlay control:
+  - `Toggle Colorization` hides/shows overlays without dropping analysis state
+- State restore:
+  - Sidecar save/load (`<doc>.json`) for chunk and overlay state
 
 Intentionally out of scope here:
 - Markdown preview pane integration
@@ -47,6 +55,11 @@ Default bindings (users can remap via Keyboard Shortcuts):
 - `Binoculars: Rewrite Selection` -> `Ctrl+Alt+R`
 - `Binoculars: Clear Priors` -> `Ctrl+Alt+C`
 
+Additional commands (no default keybinding):
+- `Binoculars: Analyze All`
+- `Binoculars: Toggle Colorization`
+- `Binoculars: Restart Backend`
+
 ## Settings
 
 Key settings contributed by this extension:
@@ -68,10 +81,11 @@ Notes:
 
 ## Theme Mode
 
-This implementation is tuned for dark mode first.
+This implementation supports both dark and light editor themes.
 
-- Dark palette is primary for LOW/HIGH/unscored overlays and gutter bars.
-- A conservative light-theme palette fallback is included, but full light-mode tuning is a follow-up task.
+- Dark and light palettes are both maintained for LOW/HIGH overlays and neutral minor text.
+- Minor contributors remain neutral (`light gray` in dark themes, `black` in light themes).
+- Gutter bars remain available independently of text colorization.
 
 ## Build / Run (from this folder)
 
@@ -81,6 +95,14 @@ npm run compile
 ```
 
 Then run the extension in VS Code Extension Development Host (F5) from this folder.
+
+For local install into your main VS Code profile (outside Extension Development Host), use:
+
+```bash
+../refresh-binoculars-vscode.sh
+```
+
+That script compiles, packages, force-installs, restarts the extension host, and restarts/health-checks the Binoculars daemon.
 
 ## Shared-Backend Direction (Tk + VS Code)
 

@@ -30,9 +30,18 @@ Current extension capabilities:
 - LOW/HIGH text overlays plus per-line contribution gutter bars.
 - One-click `Clear Priors` plus prior contributor faint backgrounds (major contributors only) after re-analysis.
 - `Toggle Colorization` to hide/show text overlays without losing analysis state.
+- Delayed contributor hover diagnostics (major and minor) with shared gating to reduce redundant popups.
 - Chunk-aware status bar metrics, including `Prior B` when available.
 - Debounced live `Est. B` forecast in status while manually editing analyzed text.
 - Sidecar persistence in `*.json` next to markdown files for restoring analysis state.
+
+For local extension refresh/install during development:
+
+```bash
+./refresh-binoculars-vscode.sh
+```
+
+This compiles, packages, force-installs, restarts extension host processes, and restarts the Binoculars daemon (with health check).
 
 Detailed extension guide:
 
