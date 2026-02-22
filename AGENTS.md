@@ -21,6 +21,8 @@ Status:
 - Core scoring is stable; calibration/classification is not implemented.
 - GUI supports iterative rewrite workflows with approximate impact scoring and explicit full re-analysis.
 - GUI also supports fast synonym-assisted edits, one-level undo for tracked mutations, and transient status messaging that restores metrics automatically.
+- CLI also supports local HTTP API mode via `--api [PORT]` for text-segment scoring (`GET /health`, `POST /score`).
+- A dedicated API demo harness is available (`api_demo_harness.py`) with an auto-launch script (`run_api_demo_harness.sh`) for experimentation.
 - VS Code extension is active and featureful:
   - chunk-aware `Analyze Chunk` / `Analyze Next Chunk`
   - rewrite selection/line with ranked options
@@ -45,6 +47,9 @@ Key files:
 - `README.md`: project overview and CLI/GUI reference.
 - `USERGUIDE-GUI.md`: GUI-specific interactive workflow guide.
 - `USERGUIDE-VC.md`: VS Code extension workflow guide.
+- `USERGUIDE-API.md`: API server + harness walkthrough and request examples.
+- `api_demo_harness.py`: Tkinter API demo client for `/health` and `/score`.
+- `run_api_demo_harness.sh`: helper script that starts API (if needed) and opens the demo harness.
 - `refresh-binoculars-vscode.sh`: local extension refresh helper (compile/package/install + extension-host and daemon restart).
 - `vscode-extension/src/extension.ts`: extension UI/decoration/command logic.
 - `vscode-extension/src/backendClient.ts`: persistent JSON bridge client.
@@ -137,6 +142,16 @@ GUI run:
 venv/bin/python binoculars.py --config fast --gui your_doc.md
 ```
 
+API server run:
+```bash
+venv/bin/python binoculars.py --config fast --api 8765
+```
+
+API harness launcher:
+```bash
+./run_api_demo_harness.sh
+```
+
 ## 7) Output Contract
 
 JSON output includes:
@@ -183,6 +198,19 @@ GUI undo behavior (single level):
 GUI identity details:
 - Window/app name is set to `Binoculars` (including Linux WM class/appname hints).
 - GUI icon is drawn in code (owl with large eyes) via Tk `PhotoImage`.
+
+API mode behavior:
+- `--api [PORT]` runs a local HTTP server bound to `127.0.0.1`.
+- Health endpoints: `GET /`, `GET /health`, `GET /healthz`.
+- Scoring endpoint: `POST /score` with required JSON field `text`.
+- Optional `/score` request fields:
+  - `input_label` (string),
+  - `diagnose_paragraphs` (boolean),
+  - `diagnose_top_k` (integer),
+  - `need_paragraph_profile` (boolean).
+- `/score` response returns:
+  - `{ "ok": true, "result": <standard JSON scoring object> }`,
+  - plus `paragraph_profile` when requested.
 
 VS Code extension behavior (current):
 - Commands:
@@ -415,5 +443,6 @@ Phase 3 (best usability):
 3. Common failures provide direct remediation links/commands.
 4. Documentation is aligned:
 - Root `README.md`
+- `USERGUIDE-API.md`
 - `vscode-extension/README.md`
 - `USERGUIDE-VC.md`

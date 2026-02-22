@@ -106,6 +106,9 @@ Important: This is a scoring signal, not proof of authorship.
 - `binocular.sh`: alias wrapper (`exec binoculars.sh`); `config.binoculars.json`: master profile selector (`default` and `profiles`)
 - `config.binoculars.llm.json`: optional OpenAI-compatible rewrite backend config for GUI rewrite suggestions; `config.llama31.cuda12gb.fast.json`: fast profile (currently `text.max_tokens=4096`)
 - `config.llama31.cuda12gb.long.json`: long profile (currently `text.max_tokens=12288`); `USERGUIDE-GUI.md`: detailed GUI user guide and iterative workflow guidance
+- `USERGUIDE-API.md`: detailed API and harness user guide
+- `api_demo_harness.py`: Tkinter API demo client
+- `run_api_demo_harness.sh`: launcher that starts API (if needed) and opens the demo harness
 - `vscode-extension/`: VS Code extension source, manifest, bridge, and packaging assets
 - `USERGUIDE-VC.md`: detailed VS Code extension user guide
 - `background/2401.12070v3.pdf`: background paper; `samples/`: sample markdown inputs
@@ -384,6 +387,10 @@ Use it to:
 - Run a `GET /health` check against a configured base URL.
 - Send `POST /score` requests with configurable flags.
 - Inspect both a metric summary and full raw JSON response.
+
+Detailed API guide:
+
+- `USERGUIDE-API.md`
 
 ## Heatmap Mode (`--Heatmap`)
 
