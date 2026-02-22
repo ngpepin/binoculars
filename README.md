@@ -269,6 +269,22 @@ Heatmap mode:
 ./binoculars.sh --config fast --input samples/Athens.md --heatmap --diagnose-top-k 10
 ```
 
+API server mode:
+
+```bash
+./binoculars.sh --config fast --api          # default port 8765
+./binoculars.sh --config fast --api 8787     # explicit port
+```
+
+Example scoring request:
+
+```bash
+curl -sS \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"This is a test segment.", "input_label":"snippet-1"}' \
+  http://127.0.0.1:8765/score
+```
+
 Diagnostics:
 
 ```bash
@@ -305,6 +321,7 @@ Alias wrapper:
 - `--json`: emit JSON result object; `--diagnose-paragraphs`: rank low-perplexity hotspot paragraphs
 - `--diagnose-top-k N`: hotspot count (also used by heatmap selection); `--diagnose-print-text`: print full hotspot text segments
 - `--heatmap`: emit console and markdown heatmap output; `--gui FILE`: launch interactive GUI editor/analyzer
+- `--api [PORT]`: run local HTTP scoring API server on optional port (default `8765`)
 
 `--heatmap` cannot be combined with `--json`.
 
@@ -315,6 +332,58 @@ Alias wrapper:
 - `--output`
 - `--json`
 - `--heatmap`
+
+`--api` is mutually exclusive with:
+
+- `--gui`
+- `--input`
+- Positional `INPUT`
+- `--output`
+- `--json`
+- `--heatmap`
+- `--diagnose-print-text`
+
+### API Mode (`--api [PORT]`)
+
+- Server binds to `127.0.0.1` by default.
+- Health endpoints:
+  - `GET /`
+  - `GET /health`
+  - `GET /healthz`
+- Scoring endpoint:
+  - `POST /score`
+  - JSON body must include:
+    - `text` (string, required)
+  - Optional fields:
+    - `input_label` (string)
+    - `diagnose_paragraphs` (boolean)
+    - `diagnose_top_k` (integer)
+    - `need_paragraph_profile` (boolean)
+- Response:
+  - `{ "ok": true, "result": { ... } }`
+  - Includes `paragraph_profile` when `need_paragraph_profile=true`.
+
+### API Demo GUI Harness
+
+A lightweight Tkinter client is included for interactive API testing:
+
+```bash
+venv/bin/python api_demo_harness.py
+```
+
+If you want one command that launches the harness and starts the API automatically:
+
+```bash
+./run_api_demo_harness.sh
+```
+
+`run_api_demo_harness.sh` keeps the API port as a top-level constant (`API_PORT`) and starts `binoculars.sh --api` on that port when needed.
+
+Use it to:
+
+- Run a `GET /health` check against a configured base URL.
+- Send `POST /score` requests with configurable flags.
+- Inspect both a metric summary and full raw JSON response.
 
 ## Heatmap Mode (`--Heatmap`)
 

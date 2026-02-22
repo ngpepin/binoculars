@@ -24,6 +24,8 @@ from datetime import datetime
 import difflib
 import gc
 import hashlib
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import re
@@ -7298,13 +7300,192 @@ def run(
     return 0
 
 
+def run_api_server(
+    cfg_path: str,
+    port: int,
+    text_max_tokens_override: Optional[int] = None,
+    host: str = "127.0.0.1",
+) -> int:
+    """Run local HTTP API server for Binoculars scoring."""
+
+    safe_port = int(port)
+    if safe_port < 1 or safe_port > 65535:
+        raise ValueError(f"--api port must be in range 1..65535 (got {port}).")
+    safe_host = str(host or "127.0.0.1").strip() or "127.0.0.1"
+    max_request_bytes = 8 * 1024 * 1024
+    score_lock = threading.Lock()
+
+    class BinocularsApiHandler(BaseHTTPRequestHandler):
+        """Internal helper: Local API handler."""
+
+        server_version = "BinocularsAPI/1.0"
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            """Internal helper: API log message."""
+
+            msg = fmt % args if args else fmt
+            print(f"[api] {self.address_string()} - {msg}", file=sys.stderr)
+
+        def _send_json(self, status: int, payload: Dict[str, Any]) -> None:
+            """Internal helper: Send json."""
+
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(int(status))
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
+
+        def _send_error_json(self, status: int, message: str) -> None:
+            """Internal helper: Send error json."""
+
+            self._send_json(int(status), {"ok": False, "error": str(message)})
+
+        def _read_json_body(self) -> Dict[str, Any]:
+            """Internal helper: Read json body."""
+
+            raw_len = self.headers.get("Content-Length", "").strip()
+            if not raw_len:
+                raise ValueError("Missing Content-Length header.")
+            try:
+                body_len = int(raw_len)
+            except Exception as exc:
+                raise ValueError("Invalid Content-Length header.") from exc
+            if body_len < 0:
+                raise ValueError("Invalid request body length.")
+            if body_len > max_request_bytes:
+                raise ValueError(f"Request body too large (max {max_request_bytes} bytes).")
+            raw_body = self.rfile.read(body_len)
+            if not raw_body:
+                raise ValueError("Request body is empty.")
+            try:
+                payload = json.loads(raw_body.decode("utf-8"))
+            except Exception as exc:
+                raise ValueError("Request body must be valid UTF-8 JSON.") from exc
+            if not isinstance(payload, dict):
+                raise ValueError("JSON body must be an object.")
+            return payload
+
+        def _route_path(self) -> str:
+            """Internal helper: Route path."""
+
+            parsed = urllib.parse.urlparse(self.path)
+            route = str(parsed.path or "").strip()
+            if not route:
+                return "/"
+            if route != "/" and route.endswith("/"):
+                route = route.rstrip("/")
+            return route or "/"
+
+        def do_OPTIONS(self) -> None:
+            """Handle CORS preflight."""
+
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+
+        def do_GET(self) -> None:
+            """Handle GET requests."""
+
+            route = self._route_path()
+            if route not in {"/", "/health", "/healthz"}:
+                self._send_error_json(HTTPStatus.NOT_FOUND, f"Unknown endpoint: {route}")
+                return
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "service": "binoculars",
+                    "route": route,
+                    "ts_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                },
+            )
+
+        def do_POST(self) -> None:
+            """Handle POST requests."""
+
+            route = self._route_path()
+            if route != "/score":
+                self._send_error_json(HTTPStatus.NOT_FOUND, f"Unknown endpoint: {route}")
+                return
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+
+            text_raw = payload.get("text")
+            if not isinstance(text_raw, str):
+                self._send_error_json(HTTPStatus.BAD_REQUEST, "Field 'text' is required and must be a string.")
+                return
+            text = str(text_raw)
+            if not text.strip():
+                self._send_error_json(HTTPStatus.BAD_REQUEST, "Field 'text' must not be empty.")
+                return
+
+            input_label_raw = payload.get("input_label")
+            input_label = str(input_label_raw).strip() if isinstance(input_label_raw, str) else ""
+            if not input_label:
+                input_label = "<api>"
+
+            diagnose_paragraphs = bool(payload.get("diagnose_paragraphs", False))
+            try:
+                diagnose_top_k = int(payload.get("diagnose_top_k", 10))
+            except Exception:
+                diagnose_top_k = 10
+            diagnose_top_k = max(1, diagnose_top_k)
+            need_paragraph_profile = bool(payload.get("need_paragraph_profile", False))
+
+            try:
+                with score_lock:
+                    result, paragraph_profile = analyze_text_document(
+                        cfg_path=cfg_path,
+                        text=text,
+                        input_label=input_label,
+                        diagnose_paragraphs=diagnose_paragraphs,
+                        diagnose_top_k=diagnose_top_k,
+                        need_paragraph_profile=need_paragraph_profile,
+                        text_max_tokens_override=text_max_tokens_override,
+                    )
+            except Exception as exc:
+                self._send_error_json(HTTPStatus.UNPROCESSABLE_ENTITY, str(exc))
+                return
+
+            response: Dict[str, Any] = {"ok": True, "result": result}
+            if paragraph_profile is not None:
+                response["paragraph_profile"] = paragraph_profile
+            self._send_json(HTTPStatus.OK, response)
+
+    server = ThreadingHTTPServer((safe_host, safe_port), BinocularsApiHandler)
+    server.daemon_threads = True
+    print(f"Binoculars API listening on http://{safe_host}:{safe_port}", file=sys.stderr)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("Binoculars API shutdown requested.", file=sys.stderr)
+    finally:
+        server.server_close()
+    return 0
+
+
 def main() -> int:
     """Main."""
 
     ap = argparse.ArgumentParser(
         description="Binoculars-style scoring for markdown text using two llama.cpp models loaded sequentially.",
         usage=(
-            "%(prog)s [--master-config FILE] [--config PROFILE] [--gui INPUT] [--input INPUT | INPUT] "
+            "%(prog)s [--master-config FILE] [--config PROFILE] [--gui INPUT] [--api [PORT]] [--input INPUT | INPUT] "
             "[--output OUTPUT] [--json] "
             "[--diagnose-paragraphs] [--diagnose-top-k N] [--diagnose-print-text] [--heatmap]"
         ),
@@ -7313,6 +7494,8 @@ def main() -> int:
             "  %(prog)s --config fast samples/Athens.md\n"
             "  %(prog)s --config=long --input samples/Athens.md --heatmap\n"
             "  %(prog)s --config fast --gui samples/Athens.md\n"
+            "  %(prog)s --config fast --api            # start local API on default port\n"
+            "  %(prog)s --config fast --api 8787       # start local API on port 8787\n"
             "  %(prog)s samples/Athens.md   # uses default profile from config.binoculars.json"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
@@ -7331,6 +7514,15 @@ def main() -> int:
         "--gui",
         default=None,
         help="Open interactive GUI editor/analyzer for the provided markdown file.",
+    )
+    ap.add_argument(
+        "--api",
+        nargs="?",
+        type=int,
+        const=8765,
+        default=None,
+        metavar="PORT",
+        help="Run local scoring API server; optional PORT (default: 8765).",
     )
     ap.add_argument("--input", default=None, help="Markdown file to score, or '-' for stdin.")
     ap.add_argument(
@@ -7369,11 +7561,28 @@ def main() -> int:
 
     if args.gui is not None:
         print("Launching GUI...", file=sys.stderr)
+    elif args.api is not None:
+        print("Starting local API server...", file=sys.stderr)
     else:
         print("One moment please, starting...", file=sys.stderr)
 
     try:
         _, cfg_path, text_max_tokens_override = resolve_profile_config(args.master_config, args.config)
+
+        if args.api is not None:
+            if args.gui is not None:
+                raise ValueError("--api cannot be combined with --gui.")
+            if args.input is not None or args.input_positional:
+                raise ValueError("--api does not accept --input or positional INPUT.")
+            if args.output is not None or args.json or args.heatmap:
+                raise ValueError("--api cannot be combined with --output, --json, or --heatmap.")
+            if args.diagnose_print_text:
+                raise ValueError("--api cannot be combined with --diagnose-print-text.")
+            return run_api_server(
+                cfg_path=cfg_path,
+                port=args.api,
+                text_max_tokens_override=text_max_tokens_override,
+            )
 
         if args.gui is not None:
             if args.input is not None or args.input_positional:
