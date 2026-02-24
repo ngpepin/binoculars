@@ -68,6 +68,8 @@ const HOVER_SAME_SEGMENT_SUPPRESS_MS = 900;
 const HOVER_CONTRIBUTOR_DELAY_MS = 1000;
 const GUTTER_CLICK_HOVER_DELAY_MS = 60;
 const ENABLE_TEXT_SEGMENT_HOVER = true;
+const SIDECAR_FILE_EXT = '.binoculars';
+const LEGACY_SIDECAR_FILE_EXT = '.json';
 
 const docStates = new Map<string, DocumentState>();
 const loadedSidecarSignatures = new Map<string, string>();
@@ -662,9 +664,10 @@ class BinocularsControlsProvider implements vscode.TreeDataProvider<BinocularsCo
     const state = key ? docStates.get(key) : undefined;
     const chunkCount = state?.chunks.length ?? 0;
     const nextAvailable = hasNextChunkAvailable(editor);
+    const analyzePrimaryLabel = hasAnalysisForEditor(editor) ? 'Re-Analyze Chunk' : 'Analyze Chunk';
 
     const items: BinocularsControlItem[] = [
-      new BinocularsControlItem('Analyze Chunk', {
+      new BinocularsControlItem(analyzePrimaryLabel, {
         commandId: 'binoculars.analyze',
         icon: new vscode.ThemeIcon('run'),
         description: 'Ctrl+Alt+B',
@@ -1767,10 +1770,31 @@ function isMarkdownSidecarEligible(doc: vscode.TextDocument): boolean {
 }
 
 // Sidecar State Path For Document.
-function sidecarStatePathForDocument(docPath: string): string {
+function sidecarStatePathForDocument(docPath: string, extension = SIDECAR_FILE_EXT, hidden = true): string {
   const abs = path.resolve(docPath);
   const parsed = path.parse(abs);
-  return path.join(parsed.dir, `${parsed.name}.json`);
+  const prefix = hidden ? `.${parsed.name}` : parsed.name;
+  return path.join(parsed.dir, `${prefix}${extension}`);
+}
+
+// Sidecar Candidate Paths For Document.
+function sidecarCandidatePathsForDocument(docPath: string): string[] {
+  const candidates = [
+    sidecarStatePathForDocument(docPath, SIDECAR_FILE_EXT, true),
+    sidecarStatePathForDocument(docPath, SIDECAR_FILE_EXT, false),
+    sidecarStatePathForDocument(docPath, LEGACY_SIDECAR_FILE_EXT, false),
+  ];
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const key = process.platform === 'win32' ? path.resolve(candidate).toLowerCase() : path.resolve(candidate);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(candidate);
+  }
+  return deduped;
 }
 
 // Sha256 Hex.
@@ -2241,7 +2265,14 @@ function maybeLoadStateSidecar(doc: vscode.TextDocument, reason: 'open' | 'activ
   const key = doc.uri.toString();
   const textSnapshot = doc.getText();
   const textHash = sha256Hex(textSnapshot);
-  const sidecarPath = sidecarStatePathForDocument(doc.uri.fsPath);
+  const sidecarCandidates = sidecarCandidatePathsForDocument(doc.uri.fsPath);
+  let sidecarPath = sidecarCandidates[0];
+  for (const candidatePath of sidecarCandidates) {
+    if (fs.existsSync(candidatePath)) {
+      sidecarPath = candidatePath;
+      break;
+    }
+  }
   if (!fs.existsSync(sidecarPath)) {
     return;
   }
@@ -2324,7 +2355,7 @@ function autoSaveStateSidecar(doc: vscode.TextDocument): void {
     }
   }
   const state = docStates.get(key);
-  const sidecarPath = sidecarStatePathForDocument(doc.uri.fsPath);
+  const sidecarPath = sidecarStatePathForDocument(doc.uri.fsPath, SIDECAR_FILE_EXT);
   const payload = buildPersistedSidecarPayload(doc.uri.fsPath, textSnapshot, state);
   const serialized = JSON.stringify(payload, null, 2);
   try {
@@ -2347,7 +2378,9 @@ function stateFromMatchingSidecarOnDisk(
     return undefined;
   }
   const docDir = path.dirname(doc.uri.fsPath);
-  const targetSidecarPath = sidecarStatePathForDocument(doc.uri.fsPath);
+  const targetSidecarPaths = new Set(
+    sidecarCandidatePathsForDocument(doc.uri.fsPath).map((candidate) => path.resolve(candidate)),
+  );
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(docDir, { withFileTypes: true });
@@ -2358,11 +2391,15 @@ function stateFromMatchingSidecarOnDisk(
   let bestState: DocumentState | undefined;
   let bestSavedAtMs = -1;
   for (const ent of entries) {
-    if (!ent.isFile() || path.extname(ent.name).toLowerCase() !== '.json') {
+    if (!ent.isFile()) {
       continue;
     }
-    const sidecarPath = path.join(docDir, ent.name);
-    if (sidecarPath === targetSidecarPath) {
+    const ext = path.extname(ent.name).toLowerCase();
+    if (ext !== SIDECAR_FILE_EXT && ext !== LEGACY_SIDECAR_FILE_EXT) {
+      continue;
+    }
+    const sidecarPath = path.resolve(path.join(docDir, ent.name));
+    if (targetSidecarPaths.has(sidecarPath)) {
       continue;
     }
     let raw: string;

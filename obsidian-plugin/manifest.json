@@ -1,0 +1,9 @@
+{
+  "id": "binoculars-obsidian",
+  "name": "Binoculars",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Binoculars scoring, contribution colorization, chunk analysis, and rewrite workflow in Obsidian.",
+  "author": "npepin",
+  "isDesktopOnly": true
+}

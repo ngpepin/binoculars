@@ -54,6 +54,8 @@ SPELL_WORD_RE = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)*(?:[-/][A-Za-z]+(?:['�
 SYNONYM_TOKEN_RE = re.compile(r"[A-Za-z]+(?:['’-][A-Za-z]+)*$")
 SYNONYM_OPTION_COUNT = 9
 SYNONYM_GRID_COLUMNS = 3
+SIDECAR_FILE_EXT = ".binoculars"
+LEGACY_SIDECAR_FILE_EXT = ".json"
 _ENGLISH_WORDLIST_PATHS = [
     "/usr/share/dict/american-english",
     "/usr/share/dict/british-english",
@@ -3648,22 +3650,23 @@ def launch_gui(
             return False
         doc_abs = os.path.abspath(src_path)
         if os.path.splitext(doc_abs)[1].lower() != ".md":
-            # Non-md source docs still benefit from saving a timestamped md+json pair.
+            # Non-md source docs still benefit from saving a timestamped md+binoculars pair.
             return True
-        sidecar_path = sidecar_state_path_for_document(doc_abs)
-        if not os.path.isfile(sidecar_path):
-            return True
-        try:
-            with open(sidecar_path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-        except Exception:
-            return True
-        if not isinstance(payload, dict) or not bool(payload.get("binoculars_gui_state", False)):
-            return True
-        expected_hash = str(payload.get("text_sha256", "") or "")
-        if not expected_hash:
-            return True
-        return expected_hash != text_sha256(current_text())
+        actual_hash = text_sha256(current_text())
+        for sidecar_path in sidecar_state_candidate_paths_for_document(doc_abs):
+            if not os.path.isfile(sidecar_path):
+                continue
+            try:
+                with open(sidecar_path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+            except Exception:
+                continue
+            if not isinstance(payload, dict) or not bool(payload.get("binoculars_gui_state", False)):
+                continue
+            expected_hash = str(payload.get("text_sha256", "") or "")
+            if expected_hash and expected_hash == actual_hash:
+                return False
+        return True
 
     def sync_save_button_state(enabled_base: bool = True) -> None:
         # Save is enabled when edits exist OR when analyzed state has not yet been
@@ -6372,9 +6375,34 @@ def launch_gui(
             return
         begin_chunk_analysis(start_char, "Performing analysis on next unscored chunk...")
 
-    def sidecar_state_path_for_document(doc_path: str) -> str:
-        stem, _ext = os.path.splitext(os.path.abspath(doc_path))
-        return stem + ".json"
+    def sidecar_state_path_for_document(
+        doc_path: str,
+        use_legacy_ext: bool = False,
+        hidden: bool = True,
+    ) -> str:
+        abs_doc = os.path.abspath(doc_path)
+        doc_dir, doc_name = os.path.split(abs_doc)
+        stem, _ext = os.path.splitext(doc_name)
+        ext = LEGACY_SIDECAR_FILE_EXT if use_legacy_ext else SIDECAR_FILE_EXT
+        sidecar_name = f".{stem}{ext}" if hidden else f"{stem}{ext}"
+        return os.path.join(doc_dir, sidecar_name)
+
+    def sidecar_state_candidate_paths_for_document(doc_path: str) -> List[str]:
+        candidates = [
+            sidecar_state_path_for_document(doc_path, use_legacy_ext=False, hidden=True),
+            sidecar_state_path_for_document(doc_path, use_legacy_ext=False, hidden=False),
+            sidecar_state_path_for_document(doc_path, use_legacy_ext=True, hidden=False),
+            sidecar_state_path_for_document(doc_path, use_legacy_ext=True, hidden=True),
+        ]
+        deduped: List[str] = []
+        seen: Set[str] = set()
+        for candidate in candidates:
+            key = os.path.normcase(os.path.abspath(candidate))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(candidate)
+        return deduped
 
     def text_sha256(text_value: str) -> str:
         raw = str(text_value or "")
@@ -6469,7 +6497,12 @@ def launch_gui(
         doc_abs = os.path.abspath(doc_path)
         if os.path.splitext(doc_abs)[1].lower() != ".md":
             return (None, None, "")
-        sidecar_path = sidecar_state_path_for_document(doc_abs)
+        sidecar_candidates = sidecar_state_candidate_paths_for_document(doc_abs)
+        sidecar_path = sidecar_candidates[0]
+        for candidate in sidecar_candidates:
+            if os.path.isfile(candidate):
+                sidecar_path = candidate
+                break
         if not os.path.isfile(sidecar_path):
             return (None, None, sidecar_path)
         try:

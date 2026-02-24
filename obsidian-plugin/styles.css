@@ -1,0 +1,175 @@
+:root {
+  --binoculars-low: #ff6b6b;
+  --binoculars-high: #3fd28a;
+  --binoculars-low-minor: #dcdcdc;
+  --binoculars-high-minor: #dcdcdc;
+  --binoculars-prior-low: rgba(255, 107, 107, 0.16);
+  --binoculars-prior-high: rgba(63, 210, 138, 0.16);
+  --binoculars-unscored: #a8a8a8;
+  --binoculars-unscored-opacity: 0.75;
+}
+
+.theme-light {
+  --binoculars-low: #b23636;
+  --binoculars-high: #1f8f57;
+  --binoculars-low-minor: #000000;
+  --binoculars-high-minor: #000000;
+  --binoculars-prior-low: rgba(178, 54, 54, 0.14);
+  --binoculars-prior-high: rgba(31, 143, 87, 0.14);
+  --binoculars-unscored: #7d8792;
+  --binoculars-unscored-opacity: 0.72;
+}
+
+.cm-content .binoculars-low-major {
+  color: var(--binoculars-low);
+}
+
+.cm-content .binoculars-high-major {
+  color: var(--binoculars-high);
+}
+
+.cm-content .binoculars-low-minor {
+  color: var(--binoculars-low-minor);
+}
+
+.cm-content .binoculars-high-minor {
+  color: var(--binoculars-high-minor);
+}
+
+.cm-content .binoculars-prior-low {
+  background-color: var(--binoculars-prior-low);
+  border-radius: 2px;
+}
+
+.cm-content .binoculars-prior-high {
+  background-color: var(--binoculars-prior-high);
+  border-radius: 2px;
+}
+
+.cm-content .binoculars-unscored {
+  color: var(--binoculars-unscored);
+  opacity: var(--binoculars-unscored-opacity);
+}
+
+.cm-content .binoculars-edited {
+  background-color: rgba(255, 213, 79, 0.22);
+  border-radius: 2px;
+}
+
+.binoculars-contribution-gutter {
+  width: 22px;
+}
+
+.binoculars-line-number-gutter {
+  min-width: 3.4em;
+  color: var(--text-faint);
+}
+
+.binoculars-line-number {
+  display: inline-block;
+  width: 100%;
+  padding-right: 6px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-monospace);
+}
+
+.binoculars-gutter-bar {
+  display: inline-block;
+  height: 16px;
+  margin-top: 1px;
+  border-radius: 1px;
+  background-color: var(--binoculars-bar-color);
+  width: var(--binoculars-bar-width);
+}
+
+.binoculars-hover-tooltip {
+  color: var(--text-normal);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  max-width: 620px;
+  white-space: normal;
+  line-height: 1.35;
+}
+
+.cm-tooltip.cm-tooltip-hover:has(.binoculars-hover-tooltip) {
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+}
+
+.cm-tooltip.cm-tooltip-hover:has(.binoculars-hover-tooltip) .cm-tooltip-arrow:before {
+  border-top-color: var(--background-primary) !important;
+  border-bottom-color: var(--background-primary) !important;
+}
+
+.binoculars-hover-tooltip strong {
+  color: var(--text-normal);
+}
+
+.binoculars-hover-tooltip em {
+  color: var(--text-muted);
+}
+
+.binoculars-hover-tooltip code {
+  font-family: var(--font-monospace);
+  color: var(--text-normal);
+  background: var(--background-modifier-form-field);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+.binoculars-hover-minor {
+  opacity: 0.92;
+}
+
+.binoculars-modal-actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+}
+
+.binoculars-rewrite-card {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 10px;
+  margin: 10px 0;
+}
+
+.binoculars-rewrite-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+}
+
+.binoculars-rewrite-card pre {
+  margin-top: 10px;
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+.binoculars-controls-title {
+  margin: 0 0 12px;
+}
+
+.binoculars-controls-btn {
+  width: 100%;
+  margin-bottom: 8px;
+}
+
+.binoculars-controls-status {
+  border-top: 1px solid var(--background-modifier-border);
+  margin-top: 12px;
+  padding-top: 10px;
+}
+
+.binoculars-status-bar {
+  font-family: var(--font-interface);
+}

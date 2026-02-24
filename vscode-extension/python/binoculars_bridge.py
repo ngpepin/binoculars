@@ -385,6 +385,63 @@ def _err(request_id: Any, message: str, code: str = "bridge_error", details: Opt
     }
 
 
+_OOM_PATTERNS = [
+    "oom_vram",
+    "out of memory",
+    "cuda out of memory",
+    "cuda error out of memory",
+    "cublas_status_alloc_failed",
+    "cudamalloc",
+    "failed to allocate",
+    "allocation failed",
+    "ggml_backend_cuda",
+    "hiperroroutofmemory",
+    "insufficient memory",
+    "not enough memory",
+    "std::bad_alloc",
+    "vram",
+]
+
+
+def _looks_like_vram_oom(exc: BaseException) -> bool:
+    """Heuristic detector for GPU VRAM allocation failures."""
+
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(pattern in text for pattern in _OOM_PATTERNS)
+
+
+def _classify_exception(exc: BaseException, method: str) -> Tuple[str, str, Dict[str, Any]]:
+    """Map unexpected exceptions into structured bridge error codes/messages."""
+
+    method_name = str(method or "").strip()
+    if _looks_like_vram_oom(exc):
+        return (
+            "oom_vram",
+            "GPU VRAM appears exhausted while running Binoculars.",
+            {
+                "method": method_name,
+                "exception_type": type(exc).__name__,
+                "original_error": str(exc),
+                "retry_hints": [
+                    "Analyze a smaller chunk / use Analyze Next.",
+                    "Lower text.max_tokens (or text_max_tokens_override).",
+                    "Close other GPU-heavy applications/sessions and retry.",
+                ],
+                "traceback": traceback.format_exc(),
+            },
+        )
+
+    return (
+        "unhandled_exception",
+        f"{type(exc).__name__}: {exc}",
+        {
+            "method": method_name,
+            "exception_type": type(exc).__name__,
+            "traceback": traceback.format_exc(),
+        },
+    )
+
+
 def _shift_profile(profile: Optional[Dict[str, Any]], base_offset: int) -> Optional[Dict[str, Any]]:
     """Shift local profile char offsets back into full-document coordinates."""
 
@@ -687,9 +744,14 @@ def _handle_request(
             except Exception as exc:
                 # Keep rewrite UX functional even when local impact scoring cannot
                 # allocate observer model resources in this moment.
-                status_messages.append(
-                    "Impact scoring unavailable right now; returning text-only rewrite options."
-                )
+                if _looks_like_vram_oom(exc):
+                    status_messages.append(
+                        "Impact scoring skipped: GPU VRAM appears exhausted; returning text-only rewrite options."
+                    )
+                else:
+                    status_messages.append(
+                        "Impact scoring unavailable right now; returning text-only rewrite options."
+                    )
                 status_messages.append(f"Impact scoring error: {type(exc).__name__}: {exc}")
                 scored = []
 
@@ -795,14 +857,13 @@ class _DaemonRequestHandler(socketserver.StreamRequestHandler):
                 if should_exit:
                     return
             except Exception as exc:
+                code, message, details = _classify_exception(exc, method)
                 self._send(
                     _err(
                         req.get("id"),
-                        f"Unhandled bridge error: {exc}",
-                        "unhandled_exception",
-                        {
-                            "traceback": traceback.format_exc(),
-                        },
+                        message,
+                        code,
+                        details,
                     )
                 )
 
@@ -873,14 +934,14 @@ def main() -> int:
                 if should_exit:
                     break
             except Exception as exc:
+                method = str(req.get("method", "")).strip()
+                code, message, details = _classify_exception(exc, method)
                 _send(
                     _err(
                         req.get("id"),
-                        f"Unhandled bridge error: {exc}",
-                        "unhandled_exception",
-                        {
-                            "traceback": traceback.format_exc(),
-                        },
+                        message,
+                        code,
+                        details,
                     )
                 )
     finally:

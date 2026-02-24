@@ -33,7 +33,7 @@ Current extension capabilities:
 - Delayed contributor hover diagnostics (major and minor) with shared gating to reduce redundant popups.
 - Chunk-aware status bar metrics, including `Prior B` when available.
 - Debounced live `Est. B` forecast in status while manually editing analyzed text.
-- Sidecar persistence in `*.json` next to markdown files for restoring analysis state.
+- Sidecar persistence in hidden `.*.binoculars` files next to markdown files for restoring analysis state.
 
 For local extension refresh/install during development:
 
@@ -46,6 +46,31 @@ This compiles, packages, force-installs, restarts extension host processes, and 
 Detailed extension guide:
 
 - `USERGUIDE-VC.md`
+
+## Obsidian Plugin
+
+This repository also includes a native Obsidian plugin in `obsidian-plugin/` with parity-focused behavior versus the VS Code extension.
+
+Current plugin capabilities:
+
+- Analyze current chunk, analyze next chunk, and analyze all remaining chunks.
+- Rewrite selection/line with ranked options and approximate B impact.
+- Major LOW/HIGH colorization with minor-contributor neutral rendering.
+- Per-line contribution bars, delayed hover diagnostics, and prior major-contributor backgrounds.
+- Runtime `Toggle Colorization`, `Clear Priors`, and backend restart controls.
+- Sidecar persistence to hidden `.<note>.binoculars`.
+- Shared daemon backend via `vscode-extension/python/binoculars_bridge.py`.
+
+For local plugin deploy during development:
+
+```bash
+./deploy-obsidian-plugin.sh
+```
+
+Detailed plugin docs:
+
+- `USERGUIDE-OBS.md`
+- `obsidian-plugin/ARCHITECTURE.md`
 
 ## What This Does
 
@@ -107,10 +132,13 @@ Important: This is a scoring signal, not proof of authorship.
 - `config.binoculars.llm.json`: optional OpenAI-compatible rewrite backend config for GUI rewrite suggestions; `config.llama31.cuda12gb.fast.json`: fast profile (currently `text.max_tokens=4096`)
 - `config.llama31.cuda12gb.long.json`: long profile (currently `text.max_tokens=12288`); `USERGUIDE-GUI.md`: detailed GUI user guide and iterative workflow guidance
 - `USERGUIDE-API.md`: detailed API and harness user guide
+- `USERGUIDE-OBS.md`: detailed Obsidian plugin user guide
 - `api_demo_harness.py`: Tkinter API demo client
 - `run_api_demo_harness.sh`: launcher that starts API (if needed) and opens the demo harness
+- `deploy-obsidian-plugin.sh`: Obsidian plugin build/deploy helper
 - `vscode-extension/`: VS Code extension source, manifest, bridge, and packaging assets
 - `USERGUIDE-VC.md`: detailed VS Code extension user guide
+- `obsidian-plugin/`: Obsidian plugin source/build assets; `obsidian-plugin/ARCHITECTURE.md`: Obsidian plugin architecture notes
 - `background/2401.12070v3.pdf`: background paper; `samples/`: sample markdown inputs
 - `tests/test_regression_v1_1_x.py`: regression suite; `tests/fixtures/`: fixture docs used by regression tests
 

@@ -1,51 +1,64 @@
-import * as cp from 'node:child_process';
-import * as fs from 'node:fs';
-import * as net from 'node:net';
-import * as os from 'node:os';
-import * as path from 'node:path';
-import * as readline from 'node:readline';
-import * as vscode from 'vscode';
+import * as cp from 'child_process';
+import * as fs from 'fs';
+import * as net from 'net';
+import * as os from 'os';
+import * as path from 'path';
+import * as readline from 'readline';
 import { AnalyzeResult, BridgeRequest, BridgeResponse, RewriteResult } from './types';
 
+// Per-method ceilings are intentionally generous because model load/analyze/rewrite
+// operations may span many seconds on large chunks.
 const BRIDGE_TIMEOUT_MS_DEFAULT = 180000;
 const BRIDGE_TIMEOUT_MS_INITIALIZE = 600000;
 const BRIDGE_TIMEOUT_MS_ANALYZE = 900000;
 const BRIDGE_TIMEOUT_MS_REWRITE = 600000;
 
-/**
- * Manages a single persistent JSON-RPC-like socket connection to the
- * Binoculars Python daemon and exposes typed helper methods for extension code.
- */
-export class BackendClient implements vscode.Disposable {
+export class BridgeRpcError extends Error {
+  public readonly code?: string;
+  public readonly details?: Record<string, unknown>;
+  public readonly method?: string;
+
+  constructor(message: string, opts?: { code?: string; details?: Record<string, unknown>; method?: string }) {
+    super(message);
+    this.name = 'BridgeRpcError';
+    this.code = opts?.code;
+    this.details = opts?.details;
+    this.method = opts?.method;
+  }
+}
+
+export class BackendClient {
   private socket: net.Socket | undefined;
   private rl: readline.Interface | undefined;
   private requestSeq = 1;
-  private pending = new Map<number, { resolve: (value: unknown) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }>();
-  private readonly output: vscode.OutputChannel;
+  private pending = new Map<
+    number,
+    { resolve: (value: unknown) => void; reject: (err: Error) => void; timer: NodeJS.Timeout; method: string }
+  >();
+  private readonly output: (line: string) => void;
   private readyResolver: (() => void) | undefined;
-  private readyRejecter: ((err: Error) => void) | undefined;
   private readySeen = false;
   private startPromise: Promise<void> | undefined;
   private socketPath = '';
   private lastInitializeSignature = '';
 
-  constructor(output: vscode.OutputChannel) {
+  constructor(output: (line: string) => void) {
     this.output = output;
   }
 
-  /** Ensure daemon process + socket connection are available. */
-  public async start(pythonPath: string, bridgeScriptPath: string): Promise<void> {
+  public async start(pythonPath: string, bridgeScriptPath: string, cwd?: string): Promise<void> {
+    // Reuse the existing live socket when possible. If a startup is already in
+    // progress, callers share the same promise to avoid duplicate daemon spawns.
     if (this.socket && !this.socket.destroyed) {
       return;
     }
     if (this.startPromise) {
       return this.startPromise;
     }
-    this.startPromise = this.startInternal(pythonPath, bridgeScriptPath);
+    this.startPromise = this.startInternal(pythonPath, bridgeScriptPath, cwd);
     return this.startPromise;
   }
 
-  /** Push runtime configuration into the daemon state. */
   public async initialize(
     cfgPath: string,
     topK: number,
@@ -54,6 +67,8 @@ export class BackendClient implements vscode.Disposable {
     performerModelPath: string,
     rewriteLlmConfigPath: string,
   ): Promise<void> {
+    // Skip redundant initialize RPC calls when effective config/override values
+    // have not changed for this live socket session.
     const params = {
       cfg_path: cfgPath,
       top_k: topK,
@@ -70,7 +85,6 @@ export class BackendClient implements vscode.Disposable {
     this.lastInitializeSignature = signature;
   }
 
-  /** Analyze a full document in one call. */
   public analyzeDocument(text: string, inputLabel: string): Promise<AnalyzeResult> {
     return this.request<AnalyzeResult>('analyze_document', {
       text,
@@ -78,7 +92,6 @@ export class BackendClient implements vscode.Disposable {
     }, BRIDGE_TIMEOUT_MS_ANALYZE);
   }
 
-  /** Analyze a specific character span (chunk). */
   public analyzeChunk(text: string, inputLabel: string, startChar: number, endChar: number): Promise<AnalyzeResult> {
     return this.request<AnalyzeResult>('analyze_chunk', {
       text,
@@ -88,7 +101,6 @@ export class BackendClient implements vscode.Disposable {
     }, BRIDGE_TIMEOUT_MS_ANALYZE);
   }
 
-  /** Analyze the next available chunk from daemon-maintained chunk cursor. */
   public analyzeNextChunk(text: string, inputLabel: string, startChar?: number): Promise<AnalyzeResult> {
     return this.request<AnalyzeResult>('analyze_next_chunk', {
       text,
@@ -97,7 +109,6 @@ export class BackendClient implements vscode.Disposable {
     }, BRIDGE_TIMEOUT_MS_ANALYZE);
   }
 
-  /** Request observer-only live B estimate for stale edited text. */
   public estimateLiveB(
     text: string,
     inputLabel: string,
@@ -125,7 +136,6 @@ export class BackendClient implements vscode.Disposable {
     );
   }
 
-  /** Request rewrite candidates (and optional approximate scoring) for a span. */
   public rewriteSpan(
     text: string,
     spanStart: number,
@@ -142,7 +152,6 @@ export class BackendClient implements vscode.Disposable {
     }, BRIDGE_TIMEOUT_MS_REWRITE);
   }
 
-  /** Stop current socket session (daemon may keep running). */
   public async shutdown(): Promise<void> {
     if (!this.socket || this.socket.destroyed) {
       this.cleanupConnectionState();
@@ -158,7 +167,6 @@ export class BackendClient implements vscode.Disposable {
     this.cleanupConnectionState();
   }
 
-  /** Ask the shared daemon process to terminate. */
   public async shutdownDaemon(): Promise<void> {
     if (this.socket && !this.socket.destroyed) {
       try {
@@ -172,6 +180,8 @@ export class BackendClient implements vscode.Disposable {
       return;
     }
 
+    // No live socket yet (or already closed): send a one-shot daemon shutdown
+    // request through a temporary connection.
     const socketPath = this.socketPath || BackendClient.defaultSocketPath();
     const tmp = new net.Socket();
     await new Promise<void>((resolve, reject) => {
@@ -201,28 +211,27 @@ export class BackendClient implements vscode.Disposable {
     }).catch(() => undefined);
   }
 
-  /** VS Code disposable contract. */
   public dispose(): void {
     void this.shutdown();
   }
 
-  /** Boot/connect flow with stale socket cleanup and retry spawn strategy. */
-  private async startInternal(pythonPath: string, bridgeScriptPath: string): Promise<void> {
+  private async startInternal(pythonPath: string, bridgeScriptPath: string, cwd?: string): Promise<void> {
     const socketPath = BackendClient.defaultSocketPath();
     this.socketPath = socketPath;
 
+    // First try attaching to an already-running shared daemon.
     const connected = await this.tryConnect(socketPath, 1200);
     if (!connected) {
-      // Best effort: if a stale socket file exists, remove it before spawning.
       try {
         if (fs.existsSync(socketPath)) {
           fs.unlinkSync(socketPath);
         }
       } catch {
-        // ignore; fallback path below retries and will surface a clear error
+        // ignore
       }
 
-      this.spawnDaemonProcess(pythonPath, bridgeScriptPath, socketPath);
+      // Stale socket paths are common after hard exits; unlink and relaunch.
+      this.spawnDaemonProcess(pythonPath, bridgeScriptPath, socketPath, cwd);
       const ready = await this.waitForDaemon(socketPath, 12000);
       if (!ready) {
         this.startPromise = undefined;
@@ -231,7 +240,6 @@ export class BackendClient implements vscode.Disposable {
 
       const retryConnected = await this.waitForConnect(socketPath, 12000, 1200);
       if (!retryConnected) {
-        // One more recovery attempt: clean socket and respawn.
         try {
           if (fs.existsSync(socketPath)) {
             fs.unlinkSync(socketPath);
@@ -239,7 +247,8 @@ export class BackendClient implements vscode.Disposable {
         } catch {
           // ignore
         }
-        this.spawnDaemonProcess(pythonPath, bridgeScriptPath, socketPath);
+        // One additional spawn/connect cycle before surfacing startup failure.
+        this.spawnDaemonProcess(pythonPath, bridgeScriptPath, socketPath, cwd);
         const readyAgain = await this.waitForDaemon(socketPath, 12000);
         const retryConnectedAgain = readyAgain ? await this.waitForConnect(socketPath, 12000, 1200) : false;
         if (!retryConnectedAgain) {
@@ -252,31 +261,29 @@ export class BackendClient implements vscode.Disposable {
     await this.waitForReady();
   }
 
-  /** Stable per-user UNIX domain socket path for the shared daemon. */
   private static defaultSocketPath(): string {
     const uid = typeof process.getuid === 'function' ? String(process.getuid()) : String(process.env.USER ?? 'user');
     return path.join(os.tmpdir(), `binoculars-vscode-${uid}.sock`);
   }
 
-  /** Spawn detached Python daemon process bound to the configured socket path. */
-  private spawnDaemonProcess(pythonPath: string, bridgeScriptPath: string, socketPath: string): void {
+  private spawnDaemonProcess(pythonPath: string, bridgeScriptPath: string, socketPath: string, cwd?: string): void {
     try {
       const socketDir = path.dirname(socketPath);
       fs.mkdirSync(socketDir, { recursive: true });
     } catch {
-      // ignore; python side will fail with actionable error if unusable
+      // ignore
     }
 
+    // Detached daemon: extension host restarts should not terminate the bridge.
     const child = cp.spawn(pythonPath, [bridgeScriptPath, '--daemon', '--socket-path', socketPath], {
       stdio: 'ignore',
       detached: true,
-      cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+      cwd,
       env: process.env,
     });
     child.unref();
   }
 
-  /** Poll for daemon socket file creation. */
   private async waitForDaemon(socketPath: string, timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -288,7 +295,6 @@ export class BackendClient implements vscode.Disposable {
     return fs.existsSync(socketPath);
   }
 
-  /** Repeatedly attempt socket connection until timeout. */
   private async waitForConnect(socketPath: string, totalTimeoutMs: number, perAttemptMs: number): Promise<boolean> {
     const deadline = Date.now() + totalTimeoutMs;
     while (Date.now() < deadline) {
@@ -301,8 +307,8 @@ export class BackendClient implements vscode.Disposable {
     return this.tryConnect(socketPath, perAttemptMs);
   }
 
-  /** Attempt a single connection and attach line/event handlers on success. */
   private async tryConnect(socketPath: string, timeoutMs: number): Promise<boolean> {
+    // Each connection attempt starts from a clean request/pending state.
     this.cleanupConnectionState();
     this.readySeen = false;
 
@@ -336,24 +342,22 @@ export class BackendClient implements vscode.Disposable {
     });
   }
 
-  /** Wire socket + line reader and map process events to extension diagnostics. */
   private attachSocket(sock: net.Socket): void {
     this.socket = sock;
     this.rl = readline.createInterface({ input: sock });
     this.rl.on('line', (line: string) => this.onLine(line));
     sock.on('close', () => {
-      this.output.appendLine('Binoculars daemon connection closed.');
+      this.output('Binoculars daemon connection closed.');
       this.cleanupPending(new Error('Binoculars daemon connection closed.'));
       this.cleanupConnectionState();
     });
     sock.on('error', (err) => {
-      this.output.appendLine(`Binoculars daemon socket error: ${(err as Error).message}`);
+      this.output(`Binoculars daemon socket error: ${(err as Error).message}`);
       this.cleanupPending(new Error('Binoculars daemon socket error.'));
       this.cleanupConnectionState();
     });
   }
 
-  /** Parse one daemon line, dispatch ready/event/result/error to request waiters. */
   private onLine(line: string): void {
     const trimmed = line.trim();
     if (!trimmed) {
@@ -364,26 +368,26 @@ export class BackendClient implements vscode.Disposable {
     try {
       msg = JSON.parse(trimmed) as BridgeResponse;
     } catch {
-      this.output.appendLine(`[bridge:raw] ${trimmed}`);
+      this.output(`[bridge:raw] ${trimmed}`);
       this.cleanupPending(new Error('Invalid JSON from Binoculars daemon.'));
       return;
     }
 
     if (msg.event) {
       if (msg.event === 'ready') {
+        // Ready event is emitted by the daemon once per connection.
         this.readySeen = true;
         this.readyResolver?.();
         this.readyResolver = undefined;
-        this.readyRejecter = undefined;
         return;
       }
-      this.output.appendLine(`[bridge:event:${msg.event}] ${JSON.stringify(msg.payload ?? {})}`);
+      this.output(`[bridge:event:${msg.event}] ${JSON.stringify(msg.payload ?? {})}`);
       return;
     }
 
     const id = msg.id;
     if (typeof id !== 'number') {
-      this.output.appendLine(`[bridge:unmatched] ${trimmed}`);
+      this.output(`[bridge:unmatched] ${trimmed}`);
       return;
     }
 
@@ -395,36 +399,39 @@ export class BackendClient implements vscode.Disposable {
     this.pending.delete(id);
 
     if (msg.error) {
-      pending.reject(new Error(msg.error.message));
+      pending.reject(
+        new BridgeRpcError(msg.error.message, {
+          code: msg.error.code,
+          details: msg.error.details,
+          method: pending.method,
+        }),
+      );
       return;
     }
     pending.resolve(msg.result);
   }
 
-  /** Wait for the daemon `ready` event before allowing request traffic. */
   private waitForReady(timeoutMs = 10000): Promise<void> {
     if (this.readySeen) {
       return Promise.resolve();
     }
     return new Promise((resolve, reject) => {
       this.readyResolver = resolve;
-      this.readyRejecter = reject;
       setTimeout(() => {
         if (this.readyResolver) {
           this.readyResolver = undefined;
-          this.readyRejecter = undefined;
           reject(new Error('Timed out waiting for daemon ready event.'));
         }
       }, timeoutMs);
     });
   }
 
-  /** Send a request and resolve/reject by matching response id. */
   private request<T = unknown>(method: string, params: Record<string, unknown>, timeoutMs = BRIDGE_TIMEOUT_MS_DEFAULT): Promise<T> {
     if (!this.socket || this.socket.destroyed) {
       return Promise.reject(new Error('Binoculars daemon is not connected.'));
     }
 
+    // Monotonic request IDs let us map asynchronous responses back to callers.
     const id = this.requestSeq++;
     const req: BridgeRequest = { id, method, params };
 
@@ -433,7 +440,7 @@ export class BackendClient implements vscode.Disposable {
         this.pending.delete(id);
         reject(new Error(`Bridge request timed out: ${method} (${Math.round(timeoutMs / 1000)}s)`));
       }, timeoutMs);
-      this.pending.set(id, { resolve: (v) => resolve(v as T), reject, timer });
+      this.pending.set(id, { resolve: (v) => resolve(v as T), reject, timer, method });
 
       this.socket?.write(JSON.stringify(req) + '\n', 'utf8', (err) => {
         if (err) {
@@ -445,19 +452,16 @@ export class BackendClient implements vscode.Disposable {
     });
   }
 
-  /** Reset connection/session state fields after close/error. */
   private cleanupConnectionState(): void {
     this.rl?.close();
     this.rl = undefined;
     this.socket = undefined;
     this.startPromise = undefined;
     this.readyResolver = undefined;
-    this.readyRejecter = undefined;
     this.readySeen = false;
     this.lastInitializeSignature = '';
   }
 
-  /** Reject all in-flight requests during connection failure/teardown. */
   private cleanupPending(err: Error): void {
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);

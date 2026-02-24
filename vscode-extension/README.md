@@ -31,7 +31,7 @@ Implemented:
 - Runtime overlay control:
   - `Toggle Colorization` hides/shows overlays without dropping analysis state
 - State restore:
-  - Sidecar save/load (`<doc>.json`) for chunk and overlay state
+  - Sidecar save/load (`.<doc>.binoculars`) for chunk and overlay state
 
 Intentionally out of scope here:
 - Markdown preview pane integration

@@ -29,10 +29,18 @@ Status:
   - colorization + gutter bars + hover diagnostics
   - `Toggle Colorization` runtime command
   - prior contributor faint backgrounds (major contributors only)
-  - sidecar state restore (`<doc>.json`)
+  - sidecar state restore (`.<doc>.binoculars`)
+- Obsidian plugin modality is active and featureful:
+  - right-sidebar controls view + ribbon toggle icon
+  - chunk-aware `Analyze Chunk` / `Analyze Next Chunk` / `Analyze All`
+  - rewrite selection/line with ranked options
+  - major-only colorization, gutter bars, delayed hover diagnostics
+  - prior major-contributor faint backgrounds + `Clear Priors`
+  - sidecar state restore (`.<doc>.binoculars`)
+  - sidecar cleanup on note delete using Obsidian trash settings
 
 Latest known commit at time of this guide update:
-- `225b75e`
+- `2bbfeb6`
 
 ## 3) Repository Map
 
@@ -47,14 +55,19 @@ Key files:
 - `README.md`: project overview and CLI/GUI reference.
 - `USERGUIDE-GUI.md`: GUI-specific interactive workflow guide.
 - `USERGUIDE-VC.md`: VS Code extension workflow guide.
+- `USERGUIDE-OBS.md`: Obsidian plugin workflow guide.
 - `USERGUIDE-API.md`: API server + harness walkthrough and request examples.
 - `api_demo_harness.py`: Tkinter API demo client for `/health` and `/score`.
 - `run_api_demo_harness.sh`: helper script that starts API (if needed) and opens the demo harness.
 - `refresh-binoculars-vscode.sh`: local extension refresh helper (compile/package/install + extension-host and daemon restart).
+- `deploy-obsidian-plugin.sh`: local Obsidian plugin deploy helper.
 - `vscode-extension/src/extension.ts`: extension UI/decoration/command logic.
 - `vscode-extension/src/backendClient.ts`: persistent JSON bridge client.
 - `vscode-extension/python/binoculars_bridge.py`: bridge backend process adapter.
 - `vscode-extension/package.json`: command/menu/settings manifest.
+- `obsidian-plugin/src/main.ts`: Obsidian plugin UI/decoration/command logic.
+- `obsidian-plugin/src/backendClient.ts`: Obsidian persistent JSON bridge client.
+- `obsidian-plugin/ARCHITECTURE.md`: Obsidian plugin architecture notes.
 - `tests/test_regression_v1_1_x.py`: regression checks.
 - `tests/fixtures/Athens.md`: stable fixture copy for regression tests.
 - `initial-scoping.md`: technical scoping and tuning lessons.
@@ -245,6 +258,41 @@ VS Code extension behavior (current):
   - Manual typing in stale analyzed text triggers debounced live forecast (`Est. B`) in status using observer-only chunk-start rescoring with baseline cross term held fixed.
   - Daemon keeps an observer model warm for live-estimate responsiveness and unloads it automatically after idle timeout.
   - Both estimate paths are directional guidance; explicit `Analyze`/`Analyze Next`/`Analyze All` remain authoritative for exact checkpoint metrics.
+
+Obsidian plugin behavior (current):
+- Controls and lifecycle:
+  - Right-sidebar controls view (`Binoculars`) with single-press command wiring.
+  - Ribbon owl icon toggles enable/disable and can focus/open controls when enabling.
+  - Controls reflect active markdown note context; button visibility is state-aware.
+- Commands:
+  - `Binoculars: Enable`
+  - `Binoculars: Disable`
+  - `Binoculars: Analyze Chunk`
+  - `Binoculars: Analyze Next Chunk`
+  - `Binoculars: Analyze All`
+  - `Binoculars: Rewrite Selection`
+  - `Binoculars: Clear Priors`
+  - `Binoculars: Toggle Colorization`
+  - `Binoculars: Restart Backend`
+  - `Binoculars: Show Status Log`
+  - `Binoculars: Copy Status Log Path`
+- Rendering model:
+  - Major LOW/HIGH contributors are colorized.
+  - Minor contributors are neutral (not major red/green colorized).
+  - Prior overlays remain faint red/green backgrounds for prior major contributors only.
+  - Contribution gutter bars remain active independently of text colorization.
+  - Forced line numbers are shown only when Binoculars has analysis for the active source-mode note.
+- Busy-state behavior:
+  - If an analysis is in-flight for another note, controls switch to a blocked state with:
+    - status: `An analysis is already in progress... please refresh or return later.`
+    - `Refresh` action shown while analysis/re-analysis actions are hidden.
+  - Current-note in-flight status remains visible (no immediate blocked-message replacement).
+- Persistence:
+  - Sidecar save/load path is hidden `.<doc>.binoculars` with legacy fallback candidates.
+  - On markdown note delete, matching sidecar files are trashed using Obsidian trash settings.
+- Diagnostics:
+  - Status updates are rendered in controls-panel status region.
+  - `status.log` is capped to most recent 10,000 lines.
 
 ## 8) Lessons Learned / Gotchas
 
@@ -446,3 +494,5 @@ Phase 3 (best usability):
 - `USERGUIDE-API.md`
 - `vscode-extension/README.md`
 - `USERGUIDE-VC.md`
+- `USERGUIDE-OBS.md`
+- `obsidian-plugin/README.md`

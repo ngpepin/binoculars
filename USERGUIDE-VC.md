@@ -11,7 +11,7 @@ Inside VS Code, the extension lets you:
 - Request rewrite options for the current selection/line.
 - Keep prior contributor context with faint backgrounds after re-analysis.
 - Toggle text colorization on/off without losing analysis state.
-- Persist and restore analysis state with sidecar JSON files.
+- Persist and restore analysis state with hidden sidecar `.binoculars` files.
 
 ## 2) Commands And Defaults
 
@@ -185,9 +185,9 @@ Contributor hover delay:
 
 ## 9) Persistence And Sidecar Files
 
-For markdown files, extension state is saved to sidecar JSON:
+For markdown files, extension state is saved to hidden sidecar `.binoculars`:
 
-- Path: `<document-name>.json` in same directory as `.md`
+- Path: `.<document-name>.binoculars` in same directory as `.md`
 
 Saved state includes:
 
@@ -221,7 +221,7 @@ Analyze fails:
 State not restored after reopening:
 
 - Ensure file is markdown (`.md`) for sidecar workflow.
-- Check `<doc>.json` exists and text hash still matches.
+- Check `.<doc>.binoculars` exists and text hash still matches.
 
 Menus/commands missing after code updates:
 

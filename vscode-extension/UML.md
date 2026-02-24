@@ -18,7 +18,7 @@ node "VS Code Window B" as VSB {
   component "Backend Client\n(backendClient.ts)" as ClientB
 }
 
-database "Markdown Sidecar\n<doc>.json" as Sidecar
+database "Markdown Sidecar\n.<doc>.binoculars" as Sidecar
 queue "Unix Socket\n/tmp/binoculars-vscode-<uid>.sock" as Sock
 
 node "Shared Python Daemon\n(binoculars_bridge.py --daemon)" as Daemon {
@@ -178,7 +178,7 @@ participant "Extension Host" as Ext
 participant "BackendClient" as Client
 participant "Daemon" as Daemon
 database "VS Code User Settings" as Settings
-database "Markdown Sidecar\n<doc>.json" as Sidecar
+database "Markdown Sidecar\n.<doc>.binoculars" as Sidecar
 
 User -> Ext : Run "Binoculars: Disable"
 Ext -> Settings : set binoculars.enabled = false (global)
@@ -201,4 +201,3 @@ end note
 
 @enduml
 ```
-

@@ -1,0 +1,23 @@
+{
+  "name": "binoculars-obsidian",
+  "version": "0.1.0",
+  "description": "Binoculars Obsidian plugin",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+  },
+  "author": "npepin",
+  "license": "SEE LICENSE IN ../LICENSE.md",
+  "devDependencies": {
+    "@types/node": "^20.14.12",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.25.2",
+    "obsidian": "latest",
+    "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "@codemirror/state": "6.5.0",
+    "@codemirror/view": "6.38.6"
+  }
+}

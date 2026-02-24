@@ -16,3 +16,7 @@ CHAT.md
 description.md
 .gitignore
 README.json
+**/node_modules/
+obsidian-plugin/status.log
+*.binoculars
+.*.binoculars

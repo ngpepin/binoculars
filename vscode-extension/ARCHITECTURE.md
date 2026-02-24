@@ -7,7 +7,7 @@ This document describes the current architecture of the VS Code extension, inclu
 1. Keep Binoculars scoring faithful to local full-logit computation (`llama-cpp-python`), not API approximations.
 2. Support interactive editing loops in VS Code with chunk-aware analysis and rewrite workflows.
 3. Share one backend daemon across VS Code windows to avoid duplicate heavyweight backend processes.
-4. Preserve analysis state across saves/reopens via sidecar JSON files.
+4. Preserve analysis state across saves/reopens via hidden sidecar `.binoculars` files.
 5. Keep UI responsive with clear status, controlled overlays, and explicit user-triggered analysis.
 
 ## 2) High-Level Component Map
@@ -181,7 +181,7 @@ When extension is disabled, status bar is hidden.
 ## 8.1 Sidecar Contract
 
 For markdown docs, state is persisted to:
-- `<document_basename>.json` in same directory
+- `.<document_basename>.binoculars` in same directory
 
 Includes:
 - chunk descriptors and metrics
