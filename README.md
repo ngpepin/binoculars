@@ -17,6 +17,7 @@ Acknowledgment: The Binoculars paper authors - Abhimanyu Hans, Avi Schwarzschild
 
 <p align="center"> <img src="media/screenshot.png" width="900"> <br/> <em>Screenshot of the tkinter GUI</em> </p>
 <p align="center"> <img src="media/screenshot-vs.png" width="900"> <br/> <em>Screenshot of the VS Code extension</em> </p>
+<p align="center"> <img src="media/screenshot-obs.png" width="900"> <br/> <em>Screenshot of the Obsidian plugin</em> </p>
 
 ## VS Code Extension
 
